@@ -1,0 +1,13 @@
+# Atlas: credentials stay local (charter §4)
+_secrets/
+
+# Local state and migration artefacts that may contain machine details
+_atlas/state.json
+_atlas/state.json.tmp
+_atlas/migrations/*/inventory.*
+_atlas/migrations/*/wiring-backup/
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
+_atlas/cache/

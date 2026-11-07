@@ -1,0 +1,5 @@
+{
+  "notes": [
+    "If this user maintains Atlas (push rights to the life-atlas repository: `atlas.py dev-check`), offer Atlas Dev: `atlas.py dev-setup --execute`."
+  ]
+}

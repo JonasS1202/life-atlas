@@ -1,0 +1,4 @@
+# Search tools (ripgrep, agents' grep) skip these: not authoritative or sensitive
+_secrets/
+_archive/
+_atlas/migrations/

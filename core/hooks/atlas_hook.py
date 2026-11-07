@@ -1,0 +1,900 @@
+"""Atlas hook for Claude Code and Google Antigravity. Python 3 standard library only. Fail-open.
+
+Registered by `atlas.py wire` (project scope: <ROOT>/.claude/settings.json, <ROOT>/.agents/hooks.json):
+  python -I <ROOT>/brain/_atlas/hooks/atlas_hook.py <agent> <event>
+    agent: claude | antigravity
+    event: session  (Claude SessionStart,      Antigravity SessionStart)
+           prompt   (Claude UserPromptSubmit,  Antigravity PreInvocation, first invocation of a turn only)
+           stop     (Claude Stop,              Antigravity Stop)
+
+session: heartbeat `Atlas · ok`; pull the brain from its remote; once a day (settings) a briefing with deadlines,
+         inbox, due maintenance/update checks, things Antigravity's /learn wrote outside Atlas, one question; in other
+         chats only what is overdue or due today.
+prompt:  ROUTING first (project named by name, alias, folder, path, or the chat's folder; once per chat), learning
+         signals ("remember", "from now on", corrections), then knowledge hints with their one-line summary.
+         Prints nothing when nothing matches.
+stop:    daily log line from the `Atlas:` line; auto-commit and push the brain; remind the agent to file what it
+         learned (always after a learning signal, otherwise throttled; settings `reminder`).
+
+Behaviour switches live in brain/settings.md (frontmatter). Any error ends with exit code 0 and no output.
+"""
+import datetime as dt
+import hashlib
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+import time
+
+BRAIN = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+PROBE = bool(os.environ.get("ATLAS_PROBE"))  # set by `atlas.py probe`: run, but change nothing
+STATE = os.path.join(BRAIN, "_atlas", "state.json")
+CACHE = os.path.join(BRAIN, "_atlas", "cache", "index.json")
+SKIP_DIRS = {".git", "_secrets", "_archive", "_atlas", "node_modules", "__pycache__", ".obsidian", ".trash"}
+TEXT_EXTS = {".md", ".txt"}
+CANONICAL = ("areas/", "projects/", "people/", "howto/", "self/", "glossary.md", "INDEX.md")
+MAX_HINTS = 5
+MAX_ROUTES = 3
+INDEX_BUDGET_S = 2.5   # hooks parse at most this long per call; `atlas.py index` builds the full cache
+MAX_DF_SHARE = 0.6
+HEAD_BYTES = 16_000
+UPDATE_DAYS = 30
+PUSH_REMIND_DAYS = 7
+PUSH_RETRY_MIN = 15
+NAG_MINUTES = 15
+LEARN_SUGGEST_TURNS = 20
+MAINT_CHANGES = 50
+DEFAULTS = {"briefing": "daily", "questions": "per-briefing", "maintenance_days": "7", "reminder": "signals",
+            "deadline_days": "30", "daily_log": "on", "inbox_cloud": "", "evening_hour": "18"}
+MARKER = re.compile(r"(?mi)^[\s>*_`-]*atlas\s*\**\s*:")
+MARKER_LINE = re.compile(r"(?mi)^[\s>*_`-]*atlas\s*\**\s*:\s*(.+?)\s*$")
+AUTOMATED = re.compile(r"<task-notification>|\[SYSTEM NOTIFICATION|Subagent hand-back|<side-sessions-event>")
+DATE_ITEM = re.compile(r"^\s*(?:-\s*)?(\[[ xX]\]\s*)?(\d{4}-\d{2}-\d{2})\b\s*[-:–—]?\s*(.*)$")
+TOKEN_ID = re.compile(r"\b(?=[A-Za-z0-9./-]*\d)[A-Za-z0-9][A-Za-z0-9./-]{3,}[A-Za-z0-9]\b")
+NAME_STOP = {"test", "tests", "app", "apps", "demo", "tmp", "temp", "notes", "misc", "code", "project", "projekt",
+             "projects", "projekte", "readme", "main", "src", "docs", "data", "web", "api", "tool", "tools"}
+SIGNAL_EXPLICIT = re.compile(
+    r"(?i)\b(merk dir|merke dir|merk es dir|speicher(?:e)? (?:das|dir|bitte)|notier(?:e)? (?:das|dir)|vergiss nicht|"
+    r"ab jetzt|ab sofort|von nun an|in zukunft|künftig|kuenftig|nie wieder|immer wenn|remember (?:that|this)|"
+    r"don'?t forget|from now on|going forward|never again)\b")
+SIGNAL_CORRECTION = re.compile(
+    r"(?i)(^\s*(nein|nee|falsch|no|wrong)\b[\s,.!]|\b(stimmt nicht|ist falsch|war falsch|nicht so|falsch verstanden|"
+    r"korrigier|that'?s wrong|not like that|you misunderstood)\b)")
+LEARN_HINTS = {"explicit": "keep it now where it belongs (a rule or preference goes to howto/ or brain/settings.md)",
+               "correction": "a correction: fix the page it concerns and keep the lesson in howto/"}
+
+
+# ---------------------------------------------------------------- small helpers
+
+def _state():
+    try:
+        with open(STATE, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=1, sort_keys=True, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def _save_state(st):
+    _save_json(STATE, st)
+
+
+def _now():
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def _now_iso():
+    return _now().replace(microsecond=0).isoformat()
+
+
+def _age_days(iso):
+    try:
+        then = dt.datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+        if then.tzinfo is None:
+            then = then.replace(tzinfo=dt.timezone.utc)
+        return (_now() - then).total_seconds() / 86400
+    except ValueError:
+        return None
+
+
+def _root():
+    root = _state().get("root")
+    return os.path.normpath(root) if root else os.path.dirname(BRAIN)
+
+
+def _norm_path(p):
+    p = os.path.normpath(os.path.expanduser(str(p).strip().strip("\"'")))
+    return p.replace("\\", "/").lower() if os.name == "nt" else p
+
+
+def _norm_text(s):
+    s = s.lower().replace("ä", "ae").replace("ö", "oe").replace("ü", "ue").replace("ß", "ss")
+    return s.replace("\\", "/")
+
+
+def resolve(path):
+    """Project paths may be relative to ROOT (`code/shop`, same on every device) or absolute."""
+    p = os.path.expanduser(str(path).strip())
+    return os.path.normpath(p if os.path.isabs(p) or re.match(r"^[A-Za-z]:", p) else os.path.join(_root(), p))
+
+
+def _show(rel, cwd):
+    """Path for the agent: relative to ROOT when the chat runs there (short), absolute otherwise."""
+    root = _root()
+    full = os.path.join(BRAIN, rel)
+    if cwd and _norm_path(cwd).startswith(_norm_path(root)):
+        return os.path.relpath(full, root).replace("\\", "/")
+    return full.replace("\\", "/")
+
+
+def frontmatter(text):
+    """Small YAML subset: `key: value`, `key: [a, b]` and `key:` followed by `- item` lines."""
+    if not text.startswith("---"):
+        return {}
+    end = text.find("\n---", 3)
+    if end < 0:
+        return {}
+    out, key = {}, None
+    for line in text[3:end].splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        m = re.match(r"^([A-Za-z_][\w-]*)\s*:\s*(.*)$", line)
+        if m and not line.startswith((" ", "\t", "-")):
+            key, val = m.group(1).lower(), re.sub(r"\s+#.*$", "", m.group(2)).strip()
+            if val.startswith("[") and val.endswith("]"):
+                out[key] = [v.strip().strip("\"'") for v in val[1:-1].split(",") if v.strip()]
+            else:
+                out[key] = val.strip("\"'") if val else []
+            continue
+        m = re.match(r"^\s*-\s+(.*)$", line)
+        if m and key is not None:
+            if not isinstance(out.get(key), list):
+                out[key] = [out[key]] if out.get(key) else []
+            out[key].append(m.group(1).strip().strip("\"'"))
+    return out
+
+
+def _as_list(v):
+    return [v] if isinstance(v, str) and v else (v or [])
+
+
+def settings():
+    """brain/settings.md frontmatter over the defaults (charter: rhythms and style are the user's to set)."""
+    out = dict(DEFAULTS)
+    try:
+        with open(os.path.join(BRAIN, "settings.md"), encoding="utf-8") as fh:
+            fm = frontmatter(fh.read(8000))
+    except OSError:
+        fm = {}
+    for k, v in fm.items():
+        if isinstance(v, str):
+            out[k] = v
+    return out
+
+
+def _int(v, default):
+    try:
+        return int(str(v).strip())
+    except ValueError:
+        return default
+
+
+def tag_vocab():
+    """brain/tags.md: {tag: [synonyms]} from rows `| **tag** | meaning | syn1, syn2 |`."""
+    vocab = {}
+    try:
+        with open(os.path.join(BRAIN, "tags.md"), encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        return vocab
+    for line in text.splitlines():
+        if not line.startswith("|") or line.count("|") < 3:
+            continue
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        m = re.match(r"^\*\*([^*]+)\*\*$", cells[0])
+        if m:
+            syn = cells[2] if len(cells) > 2 else ""
+            vocab[m.group(1).strip().lower()] = [s.strip().lower() for s in syn.split(",") if s.strip()]
+    return vocab
+
+
+def _git(*args, timeout=10):
+    return subprocess.run(["git", "-c", "core.quotePath=false", "-C", BRAIN, *args], capture_output=True, text=True,
+                          timeout=timeout, encoding="utf-8", errors="replace")
+
+
+# ---------------------------------------------------------------- cache
+
+def _parse(path, rel):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            text = fh.read() if rel == "glossary.md" else fh.read(HEAD_BYTES)
+    except OSError:
+        return None
+    fm = frontmatter(text)
+    m = re.search(r"(?m)^#\s+(.+)$", text)
+    title = re.sub(r"[`*_]", "", m.group(1)).strip() if m else ""
+    summary = fm.get("summary") if isinstance(fm.get("summary"), str) else ""
+    entry = {"title": title, "summary": summary[:160],
+             "tags": [t.lower() for t in _as_list(fm.get("tags"))],
+             "aliases": [a for a in _as_list(fm.get("aliases")) if len(a) >= 3],
+             "due": _as_list(fm.get("due")),
+             "paths": [p for p in (_as_list(fm.get("paths")) or _as_list(fm.get("path"))) if p and "<" not in p],
+             "status": fm.get("status") if isinstance(fm.get("status"), str) else ""}
+    if rel == "glossary.md":
+        terms = []
+        for line in text.splitlines():
+            cell = line.split("|")[1] if line.startswith("|") and line.count("|") >= 3 else line
+            terms += [t.strip() for t in re.findall(r"\*\*([^*]{3,60})\*\*", cell)]
+        entry["glossary"] = terms
+    return entry
+
+
+def _priority(rel):
+    """Parse order on a cold cache: routing registry first, then definitions, then the rest."""
+    if rel.startswith("projects/") or rel in ("glossary.md", "tags.md", "settings.md"):
+        return 0
+    return 1 if rel.startswith(("people/", "self/")) else 2
+
+
+def load_index(budget=None):
+    """Cached metadata of every page. Only new or changed files are parsed. With `budget` (seconds) parsing stops in
+    time and the partial cache is saved; the next call continues (a huge import never makes the hook time out)."""
+    start = time.monotonic()
+    try:
+        with open(CACHE, encoding="utf-8") as fh:
+            cached = json.load(fh)
+        old = cached.get("files", {}) if cached.get("version") == 2 else {}
+    except (OSError, ValueError):
+        old = {}
+    files, todo = {}, []
+    for dp, dns, fns in os.walk(BRAIN):
+        dns[:] = sorted(d for d in dns if d not in SKIP_DIRS and not d.startswith("."))
+        for fn in fns:
+            if os.path.splitext(fn)[1].lower() not in TEXT_EXTS:
+                continue
+            full = os.path.join(dp, fn)
+            rel = os.path.relpath(full, BRAIN).replace("\\", "/")
+            try:
+                st = os.stat(full)
+            except OSError:
+                continue
+            sig = [int(st.st_mtime), st.st_size]
+            prev = old.get(rel)
+            if prev and prev.get("sig") == sig:
+                files[rel] = prev
+            else:
+                todo.append((_priority(rel), rel, full, sig))
+    changed = len(files) != len(old)
+    for _p, rel, full, sig in sorted(todo):
+        if budget is not None and time.monotonic() - start > budget:
+            break
+        entry = _parse(full, rel)
+        if entry is not None:
+            entry["sig"] = sig
+            files[rel] = entry
+            changed = True
+    if changed:
+        try:
+            _save_json(CACHE, {"version": 2, "files": files})
+        except OSError:
+            pass
+    return files
+
+
+# ---------------------------------------------------------------- output per agent
+
+def emit_context(agent, event, text):
+    if not text:
+        return
+    if agent == "claude":
+        name = "SessionStart" if event == "session" else "UserPromptSubmit"
+        out = {"hookSpecificOutput": {"hookEventName": name, "additionalContext": text}}
+    elif event == "session":
+        out = {"injectSteps": [{"systemMessage": {"systemMessage": text}}]}
+    else:
+        out = {"injectSteps": [{"ephemeralMessage": text}]}
+    sys.stdout.write(json.dumps(out))
+
+
+def emit_continue(agent, reason):
+    decision = "block" if agent == "claude" else "continue"
+    sys.stdout.write(json.dumps({"decision": decision, "reason": reason}))
+
+
+# ---------------------------------------------------------------- session
+
+def deadlines(idx, days=30):
+    today = dt.date.today()
+    items = []
+    for rel, e in idx.items():
+        for raw in e.get("due", []):
+            m = DATE_ITEM.match(raw)
+            if not m or (m.group(1) or "").strip().lower() == "[x]":
+                continue
+            try:
+                when = dt.date.fromisoformat(m.group(2))
+            except ValueError:
+                continue
+            delta = (when - today).days
+            if delta <= days:
+                items.append((when, delta, m.group(3).strip(), rel))
+    return sorted(items)
+
+
+def last_mark(kind):
+    """(date, commit) of the newest commit `atlas: <kind>` (shared by all devices through Git), else None."""
+    res = _git("log", "-1", "--format=%cI %H", f"--grep=^atlas: {kind}")
+    out = res.stdout.strip().split()
+    return (out[0], out[1]) if res.returncode == 0 and len(out) == 2 else None
+
+
+def maintenance_due(s):
+    mark = last_mark("maintenance")
+    if mark:
+        age = _age_days(mark[0]) or 0
+        changed = len(_git("diff", "--name-only", f"{mark[1]}..HEAD").stdout.split())
+    else:
+        first = _git("log", "--reverse", "--format=%cI").stdout.split()
+        age, changed = (_age_days(first[0]) or 0) if first else 0, 0
+    due = age >= _int(s.get("maintenance_days"), 7) or changed >= MAINT_CHANGES
+    return due, int(age), changed
+
+
+def pull():
+    """Multi-device: fetch the newest brain before the chat starts. On conflict abort cleanly and say so."""
+    if not os.path.isdir(os.path.join(BRAIN, ".git")) or not _git("remote").stdout.strip():
+        return ""
+    if _git("status", "--porcelain").stdout.strip():
+        _git("add", "-A")
+        _git("commit", "-q", "-m", "atlas: auto-commit before pull")
+    res = _git("pull", "-q", "--rebase", timeout=8)
+    if res.returncode == 0:
+        return ""
+    _git("rebase", "--abort")
+    return ("Sync: pulling the brain from its remote failed (conflict or offline). Tell the user; if it is a conflict, "
+            "resolve it with them (git -C brain pull --rebase).")
+
+
+def foreign_items(root, user_home=None):
+    """Rules, skills and text that Antigravity's /learn (or anyone) put outside Atlas. Charter: one brain."""
+    out = []
+    skills = set()
+    for base in (os.path.join(BRAIN, "_atlas", "skills"), os.path.join(BRAIN, "skills")):
+        if os.path.isdir(base):
+            skills |= set(os.listdir(base))
+    places = [(os.path.join(root, ".agents", "rules"), "rule", False),
+              (os.path.join(root, ".agents", "skills"), "skill", False)]
+    files = [(os.path.join(root, "GEMINI.md"), False), (os.path.join(root, "AGENTS.md"), False)]
+    if user_home:
+        g = os.path.join(user_home, ".gemini")
+        places += [(os.path.join(g, "config", "rules"), "rule", True), (os.path.join(g, "config", "skills"), "skill", True)]
+        files += [(os.path.join(g, "AGENTS.md"), True), (os.path.join(g, "GEMINI.md"), True)]
+    for folder, kind, glob in places:
+        if not os.path.isdir(folder):
+            continue
+        for name in sorted(os.listdir(folder)):
+            if kind == "rule" and name.endswith(".md") and not name.startswith("atlas-"):
+                out.append({"kind": "rule", "path": os.path.join(folder, name), "global": glob})
+            elif kind == "skill" and os.path.isdir(os.path.join(folder, name)) and name not in skills:
+                out.append({"kind": "skill", "path": os.path.join(folder, name), "global": glob})
+    for path, glob in files:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        a, b = "<!-- atlas:start -->", "<!-- atlas:end -->"
+        rest = (text[: text.index(a)] + text[text.index(b) + len(b):]) if a in text and b in text else text
+        if rest.strip():
+            out.append({"kind": "text", "path": path, "global": glob})
+    st = _state()
+    ignored = set(st.get("adopt_ignored", []))
+    snapshot = set(st.get("gemini_snapshot", []))
+    return [i for i in out if os.path.normcase(i["path"]) not in ignored
+            and not (i["global"] and os.path.normcase(i["path"]) in snapshot)]
+
+
+def session_text(cwd, session):
+    s = settings()
+    st = _state()
+    lines = ["Atlas · ok"]
+    try:
+        msg = "" if PROBE else pull()
+    except Exception:
+        msg = ""
+    if msg:
+        lines.append(msg)
+    idx = load_index(budget=INDEX_BUDGET_S)
+    today = dt.date.today().isoformat()
+    due = deadlines(idx, days=_int(s.get("deadline_days"), 30))
+    mode = s.get("briefing", "daily")
+    last = st.get("last_briefing", "")
+    brief = (mode == "daily" and last != today) or (mode == "weekly" and (not last or (
+        dt.date.today() - dt.date.fromisoformat(last)).days >= 7))
+    if brief:
+        st["last_briefing"] = today
+        parts = []
+        if due:
+            items = []
+            for when, delta, what, rel in due[:8]:
+                tag = f"OVERDUE {-delta} d" if delta < 0 else ("today" if delta == 0 else f"in {delta} d")
+                items.append(f"- {when.isoformat()} ({tag}): {what or '(no note)'}  [{_show(rel, cwd)}]")
+            parts.append("Deadlines:\n" + "\n".join(items))
+        inbox = os.path.join(BRAIN, "inbox")
+        waiting = [f for f in os.listdir(inbox) if not f.startswith(".") and f.lower() != "readme.md"] \
+            if os.path.isdir(inbox) else []
+        cloud = s.get("inbox_cloud", "").strip()
+        cloud_waiting = [f for f in os.listdir(os.path.expanduser(cloud)) if not f.startswith(".")] \
+            if cloud and os.path.isdir(os.path.expanduser(cloud)) else []
+        if waiting or cloud_waiting:
+            parts.append(f"Inbox: {len(waiting)} item(s) in brain/inbox"
+                         + (f", {len(cloud_waiting)} in the cloud inbox {cloud}" if cloud_waiting else "")
+                         + ". Offer /atlas-sort.")
+        mdue, mage, mchanged = maintenance_due(s)
+        if mdue:
+            parts.append(f"Maintenance due ({mage} d, {mchanged} pages changed): after the user's first request run "
+                         "/atlas-maintain (Claude: in a subagent), report in at most 3 lines.")
+        upd = last_mark("update-check")
+        if not upd or (_age_days(upd[0]) or 0) > UPDATE_DAYS:
+            parts.append("Update check is due: offer /atlas-update.")
+        if st.get("remote"):
+            pushed = _age_days(st["last_push"]) if st.get("last_push") else None
+            if pushed is None or pushed > PUSH_REMIND_DAYS:
+                parts.append(f"Backup: last push of the brain is older than {PUSH_REMIND_DAYS} days.")
+        try:
+            foreign = foreign_items(_root(), os.path.expanduser("~"))
+        except Exception:
+            foreign = []
+        if foreign:
+            parts.append(f"{len(foreign)} rule/skill/text item(s) outside Atlas (e.g. from Antigravity /learn): "
+                         "offer `atlas.py adopt` to move them into the brain.")
+        if s.get("questions") == "per-briefing":
+            parts.append("Question: ask the user one short question about a real gap that matters now (a missing "
+                         "notice period, an unknown contact); skip it if nothing matters. Settings may turn this off.")
+        lines.append("Atlas briefing (first chat today): give the user 3-6 short lines, then handle their request."
+                     + ("\n" + "\n".join(parts) if parts else "\nNothing pending; say so in one line."))
+    else:
+        urgent = [d for d in due if d[1] <= 0]
+        if urgent:
+            lines.append("Due today/overdue (mention only if relevant or due today): " + "; ".join(
+                f"{w.isoformat()} {what} [{_show(rel, cwd)}]" for w, _d, what, rel in urgent[:5]))
+    hour = dt.datetime.now().hour
+    if s.get("questions") == "evening-3" and hour >= _int(s.get("evening_hour"), 18) and st.get("last_evening") != today:
+        st["last_evening"] = today
+        lines.append("Evening (settings): offer the user three short diary questions; keep the answers in "
+                     f"journal/{today[:4]}/{today}.md and anything lasting on its page.")
+    if s.get("questions") == "weekly-session" and (_age_days(st.get("last_weekly", "1970-01-01T00:00:00+00:00"))
+                                                   or 99) >= 7:
+        st["last_weekly"] = _now_iso()
+        lines.append("Weekly session (settings): offer a short /atlas-interview round today.")
+    st["last_hook_run"] = _now_iso()
+    if not PROBE:  # `atlas.py probe` must not use up the day's briefing
+        _save_state(st)
+        _sync_antigravity_router(st)
+    return "\n".join(lines)
+
+
+def _sync_antigravity_router(st):
+    """Fallback when file includes do not work for Antigravity: keep a copy of the router between markers."""
+    target = st.get("antigravity_router_copy")
+    if not target or not os.path.isfile(target):
+        return
+    try:
+        with open(os.path.join(BRAIN, "ROUTER.md"), encoding="utf-8") as fh:
+            router = fh.read().strip()
+        with open(target, encoding="utf-8") as fh:
+            current = fh.read()
+    except OSError:
+        return
+    start, end = "<!-- atlas:router:start -->", "<!-- atlas:router:end -->"
+    if start not in current or end not in current:
+        return
+    new = current[: current.index(start)] + f"{start}\n{router}\n{end}" + current[current.index(end) + len(end):]
+    if new != current:
+        with open(target, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(new)
+
+
+# ---------------------------------------------------------------- prompt: routing
+
+def projects(idx):
+    """Registry: one entry per project page (projects/<slug>/README.md or projects/<slug>.md)."""
+    out = []
+    for rel, e in idx.items():
+        parts = rel.split("/")
+        if parts[0] != "projects" or rel == "projects/README.md":
+            continue
+        if len(parts) == 3 and parts[2].lower() == "readme.md":
+            slug = parts[1]
+        elif len(parts) == 2:
+            slug = os.path.splitext(parts[1])[0]
+        else:
+            continue
+        title = re.sub(r"(?i)^(project|projekt)\s*:\s*", "", e.get("title", "")).strip()
+        names = {slug, title, *e.get("aliases", [])}
+        names |= {os.path.basename(os.path.normpath(p)) for p in e.get("paths", [])}
+        out.append({"slug": slug, "page": rel, "title": title or slug, "paths": e.get("paths", []),
+                    "resolved": [resolve(p) for p in e.get("paths", [])], "summary": e.get("summary", ""),
+                    "names": sorted(n for n in names if n), "status": e.get("status", "")})
+    return out
+
+
+def _name_rx(name):
+    tokens = [t for t in re.split(r"[\s_\-./]+", _norm_text(name)) if t]
+    if not tokens or (len(tokens) == 1 and (len(tokens[0]) < 4 or tokens[0] in NAME_STOP)):
+        return None
+    return re.compile(r"(?<![a-z0-9])" + r"[\s_\-./]*".join(map(re.escape, tokens)) + r"(?![a-z0-9])")
+
+
+def route(prompt, cwd, idx):
+    """Projects the message or the working folder points to: [(project, reason)]."""
+    found = {}
+    here = _norm_path(cwd) if cwd else ""
+    text = _norm_text(prompt)
+    for p in projects(idx):
+        for full in p["resolved"]:
+            r = _norm_path(full).rstrip("/")
+            if here and (here == r or here.startswith(r + "/")):
+                found.setdefault(p["slug"], (p, "chat runs in its folder"))
+            if r and r in text:
+                found.setdefault(p["slug"], (p, "path in message"))
+        for name in p["names"]:
+            rx = _name_rx(name)
+            if rx and rx.search(text):
+                found.setdefault(p["slug"], (p, f"'{name}' in message"))
+                break
+    return list(found.values())[:MAX_ROUTES]
+
+
+# ---------------------------------------------------------------- prompt: knowledge hints
+
+def _vocab(idx, skip_pages):
+    terms = {}
+    for t in idx.get("glossary.md", {}).get("glossary", []):
+        terms[t] = "glossary.md"
+    for rel, e in idx.items():
+        if rel in skip_pages or not rel.startswith(("people/", "areas/", "howto/", "projects/", "self/")):
+            continue
+        title = e.get("title", "")
+        if 3 <= len(title) <= 60 and not rel.endswith("README.md"):
+            terms.setdefault(title, rel)
+        if rel.startswith("people/") and title:
+            words = title.split()
+            if len(words) >= 2 and len(words[-1]) >= 4:
+                terms.setdefault(words[-1], rel)
+            if words and len(words[0]) >= 3:
+                terms.setdefault(words[0], rel)
+        for a in e.get("aliases", []):
+            terms.setdefault(a, rel)
+    return terms
+
+
+def _grep_counts(term, word):
+    args = ["grep", "--untracked", "-I", "-i", "-F", "-c"] + (["-w"] if word else [])
+    args += ["-e", term, "--", ".", ":(exclude)_secrets", ":(exclude)_archive", ":(exclude)_atlas"]
+    res = _git(*args, timeout=5)
+    if res.returncode not in (0, 1):
+        raise RuntimeError(res.stderr)
+    out = {}
+    for line in res.stdout.splitlines():
+        path, _, n = line.rpartition(":")
+        if path.endswith((".md", ".txt")) and n.isdigit():
+            out[path] = int(n)
+    return out
+
+
+def hints(prompt, idx, skip_pages):
+    vocab = _vocab(idx, skip_pages)
+    low, comp = _norm_text(prompt), re.sub(r"[^a-z0-9]", "", _norm_text(prompt))
+    cands = {}
+    for t in vocab:
+        tl = _norm_text(t)
+        if re.search(r"(?<![\w-])" + re.escape(tl) + r"(?![\w-])", low):
+            cands[t] = True
+        elif len(re.sub(r"[^a-z0-9]", "", tl)) >= 6 and re.sub(r"[^a-z0-9]", "", tl) in comp:
+            cands[t] = True
+    for m in TOKEN_ID.finditer(prompt):
+        cands.setdefault(m.group(0), False)
+    # Tags (and their synonyms from tags.md) point straight at the pages carrying them; a page that still uses a
+    # synonym as tag counts too (maintenance normalises it later).
+    vocab_tags = tag_vocab()
+    canon = {s: t for t, syns in vocab_tags.items() for s in syns}
+    tag_pages = {}
+    for tag, syns in vocab_tags.items():
+        for word in [tag] + syns:
+            if len(word) >= 3 and re.search(r"(?<![\w-])" + re.escape(_norm_text(word)) + r"(?![\w-])", low):
+                tag_pages[tag] = [r for r, e in idx.items() if r not in skip_pages
+                                  and tag in {canon.get(t, t) for t in e.get("tags", [])}]
+                break
+    if not cands and not tag_pages:
+        return []
+    n = max(len(idx), 1)
+    scores, hits = {}, {}
+    for tag, pages in tag_pages.items():
+        if pages and len(pages) <= MAX_DF_SHARE * n:
+            idf = math.log(1 + n / len(pages))
+            for rel in pages:
+                scores[rel] = scores.get(rel, 0.0) + 1.5 * idf
+                hits.setdefault(rel, set()).add("#" + tag)
+    for term, word in list(cands.items())[:12]:
+        try:
+            counts = _grep_counts(term, word)
+        except Exception:
+            continue
+        counts = {p: c for p, c in counts.items() if p not in skip_pages}
+        if not counts or len(counts) > MAX_DF_SHARE * n:
+            continue
+        idf = math.log(1 + n / len(counts))
+        for rel, c in counts.items():
+            score = idf * (1 + math.log(c)) * (1.3 if rel.startswith(CANONICAL) else 1.0)
+            if vocab.get(term) == rel:
+                score += 2 * idf
+            scores[rel] = scores.get(rel, 0.0) + score
+            hits.setdefault(rel, set()).add(term)
+    ranked = sorted(scores, key=lambda r: (-scores[r], r))[:MAX_HINTS]
+    return [(rel, idx.get(rel, {}).get("summary", ""), sorted(hits[rel], key=str.lower)[:4]) for rel in ranked]
+
+
+def _session(st, session):
+    sessions = st.setdefault("sessions", {})
+    s = sessions.setdefault(session or "unknown", {})
+    s["t"] = _now_iso()
+    if len(sessions) > 200:
+        for old in sorted(sessions, key=lambda k: sessions[k].get("t", ""))[:-200]:
+            sessions.pop(old, None)
+    return s
+
+
+def prompt_text(prompt, cwd, session):
+    idx = load_index(budget=INDEX_BUDGET_S)
+    st = _state()
+    sess = _session(st, session)
+    lines = []
+    routes = route(prompt, cwd, idx)
+    seen = set(sess.get("routed", []))
+    root = _root()
+    for p, why in routes:
+        if p["slug"] in seen:
+            continue
+        where = ", ".join((os.path.relpath(x, root).replace("\\", "/") if _norm_path(x).startswith(_norm_path(root) + "/")
+                           and cwd and _norm_path(cwd).startswith(_norm_path(root)) else x.replace("\\", "/"))
+                          for x in p["resolved"]) or "no folder"
+        lines.append(f"Atlas route -> project '{p['title']}' ({why}). Read {_show(p['page'], cwd)} first, then the "
+                     f"repository's own agent files in {where} (CLAUDE.md, AGENTS.md, GEMINI.md, .claude/rules, "
+                     ".agents/rules) once; after that work there like a normal coding agent.")
+        sess.setdefault("routed", []).append(p["slug"])
+        sess["project"] = p["slug"]
+    kind = "explicit" if SIGNAL_EXPLICIT.search(prompt) else ("correction" if SIGNAL_CORRECTION.search(prompt) else "")
+    if kind:
+        sess["signal"] = kind
+        lines.append(f"Atlas learning signal ({kind}): {LEARN_HINTS[kind]}.")
+    skip = {p["page"] for p, _ in routes}
+    # File paths in the message are routing input, not search terms ("C:/Atlas/code/shop" must not hint "Atlas").
+    plain = re.sub(r"[A-Za-z]:[\\/][^\s\"'`]*|~?/[\w.-]+/[^\s\"'`]*", " ", prompt)
+    found = hints(plain, idx, skip) if len(plain.strip()) >= 3 else []
+    if found:
+        lines.append("Atlas pages for this message (leads; open only what you need):")
+        for rel, summary, terms in found:
+            lines.append(f"- {_show(rel, cwd)}" + (f" — {summary}" if summary else "") + f" [{', '.join(terms)}]")
+    _save_state(st)
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- stop
+
+def autocommit_and_push():
+    if not os.path.isdir(os.path.join(BRAIN, ".git")):
+        return
+    if _git("status", "--porcelain").stdout.strip():
+        _git("add", "-A")
+        _git("commit", "-q", "-m", "atlas: auto-commit at end of turn")
+    if not _git("remote").stdout.strip():
+        return
+    st = _state()
+    # Push after every turn with new commits (other devices should see them soon); only after a failed push (offline)
+    # wait PUSH_RETRY_MIN before trying again, so turns do not keep stalling on a dead network.
+    failed = _age_days(st["push_failed"]) if st.get("push_failed") else None
+    if failed is not None and failed * 1440 < PUSH_RETRY_MIN:
+        return
+    ahead = _git("rev-list", "--count", "@{u}..HEAD")
+    if ahead.returncode == 0 and ahead.stdout.strip() == "0":
+        return
+    branch = _git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip() or "main"
+    ok = _git("push", "-q", "-u", "origin", branch, timeout=12).returncode == 0
+    st = _state()
+    if ok:
+        st["last_push"] = _now_iso()
+        st.pop("push_failed", None)
+    else:
+        st["push_failed"] = _now_iso()
+    _save_state(st)
+
+
+def daily_log(text, context):
+    """Append the `Atlas:` line(s) to journal/<year>/<date>.md (0 tokens: the script writes it)."""
+    # Antigravity transcripts are JSON: cut the line where the JSON string ends ("}, ", ...).
+    found = [re.split(r'(?<!\\)"\s*[,}\]]', m.group(1))[0].strip().strip('"\\')
+             for m in MARKER_LINE.finditer(text or "")]
+    found = [f for f in found if f and not f.lower().startswith("reminder")]
+    if not found:
+        return
+    today = dt.date.today().isoformat()
+    path = os.path.join(BRAIN, "journal", today[:4], f"{today}.md")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            current = fh.read()
+    except OSError:
+        current = (f"---\nsummary: Daily log {today} (written by the stop hook from `Atlas:` lines)\n"
+                   f"tags: [log]\n---\n# {today} · Log\n\n")
+    stamp = dt.datetime.now().strftime("%H:%M")
+    new = [f"- {stamp} · {context} · {f[:300]}" for f in found if f[:300] not in current]
+    if new:
+        body = current.rstrip("\n")
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(body + ("\n\n" if body.endswith("· Log") else "\n") + "\n".join(new) + "\n")
+
+
+IGNORED_TOOLS = re.compile(r"(?i)todo|plan|wrap_up|toolsearch|askuserquestion|read_widget|mark_chapter")
+AG_WORK = re.compile(r"(?i)run_command|write_to_file|replace_file_content|multi_replace|edit_file|create_file|"
+                     r"view_file|read_url|search_web|\"tool_?(?:name|call)s?\"")
+REMINDER = ("Atlas reminder - work was done without an `Atlas:` line. If something lasting came up (a decision, a "
+            "gotcha, how to build or test, a fact about the user's life), file it where it belongs now; then end "
+            "with one line `Atlas: <what changed where>` or `Atlas: nothing new`. Do not repeat the rest of the answer.")
+REMINDER_SIGNAL = ("Atlas reminder - the user gave a learning signal ({kind}) this turn and nothing was filed. Keep it "
+                   "now (correction: fix the page and record the lesson in howto/; 'from now on': a rule in howto/ or "
+                   "brain/settings.md), then end with one line `Atlas: <what changed where>`. Do not repeat the answer.")
+LEARN_SUGGEST = (" This chat has run {n} turns without filing anything: suggest /atlas-learn to the user once.")
+
+
+def _claude_turn_did_work(transcript_path):
+    rows = []
+    with open(transcript_path, encoding="utf-8") as fh:
+        for line in fh:
+            try:
+                rows.append(json.loads(line))
+            except ValueError:
+                continue
+    ids = [r.get("promptId") for r in rows if r.get("type") == "user" and r.get("promptId")]
+    start = 0
+    if ids:
+        start = next(i for i, r in enumerate(rows) if r.get("type") == "user" and r.get("promptId") == ids[-1])
+    for r in rows[start:]:
+        if r.get("type") != "assistant" or r.get("isSidechain"):
+            continue
+        content = (r.get("message") or {}).get("content")
+        for b in content if isinstance(content, list) else []:
+            if b.get("type") == "tool_use" and not IGNORED_TOOLS.search(b.get("name") or ""):
+                return True
+    return False
+
+
+def _decide(session, marker_seen, did_work):
+    """Reminder text or None. Settings `reminder`: signals (default) | every-turn | rare."""
+    s = settings()
+    st = _state()
+    sess = _session(st, session)
+    sess["turns"] = sess.get("turns", 0) + 1
+    signal = sess.pop("signal", "")
+    if marker_seen:
+        sess["last_marker"], sess["since_marker"] = _now_iso(), 0
+        _save_state(st)
+        return None
+    sess["since_marker"] = sess.get("since_marker", 0) + 1
+    mode = s.get("reminder", "signals")
+    reason = None
+    if signal and mode in ("signals", "every-turn", "rare"):
+        reason = REMINDER_SIGNAL.format(kind=signal)
+    elif did_work and mode == "every-turn":
+        reason = REMINDER
+    elif did_work and mode == "signals":
+        last = max(sess.get("last_marker", ""), sess.get("last_nag", ""))
+        if not last or (_age_days(last) or 0) * 1440 >= NAG_MINUTES:
+            reason = REMINDER
+    if reason and sess.get("since_marker", 0) >= LEARN_SUGGEST_TURNS and not sess.get("learn_suggested"):
+        sess["learn_suggested"] = True
+        reason += LEARN_SUGGEST.format(n=sess["since_marker"])
+    if reason:
+        sess["last_nag"] = _now_iso()
+    _save_state(st)
+    return reason
+
+
+def stop(agent, data):
+    if PROBE:
+        return
+    st = _state()
+    s = settings()
+    if agent == "claude":
+        session = str(data.get("session_id") or "")
+        last = data.get("last_assistant_message") or ""
+    else:
+        session = str(data.get("conversationId") or "")
+        last = ""
+        tp, user = data.get("transcriptPath"), (data.get("lastUserInput") or "")
+        if tp and os.path.isfile(tp):
+            with open(tp, "rb") as fh:
+                fh.seek(max(0, os.path.getsize(tp) - 400_000))
+                tail = fh.read().decode("utf-8", errors="replace")
+            anchor = json.dumps(user[:80])[1:-1] if user else ""
+            last = (tail[tail.rfind(anchor):] if anchor and anchor in tail else tail[-60_000:]).replace("\\n", "\n")
+    context = st.get("sessions", {}).get(session, {}).get("project") or "—"
+    if s.get("daily_log", "on") != "off":
+        try:
+            daily_log(last, context)
+        except Exception:
+            pass
+    try:
+        autocommit_and_push()
+    except Exception:
+        pass
+    marker = bool(MARKER.search(last))
+    if agent == "claude":
+        if data.get("stop_hook_active"):
+            return
+        tp = data.get("transcript_path")
+        did_work = bool(tp and os.path.isfile(tp) and _claude_turn_did_work(tp))
+        reason = _decide(session, marker, did_work)
+        if reason:
+            emit_continue(agent, reason)
+        return
+    if data.get("terminationReason") not in (None, "model_stop") or data.get("fullyIdle") is False:
+        return
+    # Antigravity has no stop_hook_active: one reminder per user message at most.
+    key = hashlib.sha256((session + (data.get("lastUserInput") or "")).encode("utf-8")).hexdigest()[:16]
+    if _state().get("antigravity_last_nudge") == key:
+        return
+    reason = _decide(session, marker, bool(AG_WORK.search(last)))
+    if reason:
+        st = _state()
+        st["antigravity_last_nudge"] = key
+        _save_state(st)
+        emit_continue(agent, reason)
+
+
+# ---------------------------------------------------------------- main
+
+def main():
+    agent = sys.argv[1] if len(sys.argv) > 1 else ""
+    event = sys.argv[2] if len(sys.argv) > 2 else ""
+    if agent not in ("claude", "antigravity") or event not in ("session", "prompt", "stop"):
+        return
+    raw = sys.stdin.buffer.read().decode("utf-8", errors="replace") if not sys.stdin.isatty() else ""
+    data = json.loads(raw or "{}")
+    if agent == "antigravity":
+        paths = data.get("workspacePaths") or []
+        cwd, session = (paths[0] if paths else os.getcwd()), str(data.get("conversationId") or "")
+    else:
+        cwd, session = data.get("cwd") or os.getcwd(), str(data.get("session_id") or "")
+    if event == "session":
+        emit_context(agent, event, session_text(cwd, session))
+    elif event == "prompt":
+        if agent == "antigravity":
+            if int(data.get("invocationNum") or 0) != 0:
+                return
+            prompt = data.get("lastUserInput") or ""
+        else:
+            prompt = data.get("prompt") or ""
+        if AUTOMATED.search(prompt):
+            return
+        emit_context(agent, event, prompt_text(prompt, cwd, session))
+    else:
+        stop(agent, data)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        pass
+    sys.exit(0)

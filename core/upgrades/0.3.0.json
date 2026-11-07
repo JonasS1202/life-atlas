@@ -1,0 +1,9 @@
+{
+  "dirs": ["self", "skills"],
+  "skeleton_add": ["settings.md", "tags.md", "self/README.md", "skills/README.md"],
+  "notes": [
+    "INDEX.md: merge the new section 'How to search (cheap first)', the map rows for self/, settings.md, tags.md, skills/ and the frontmatter convention (summary, tags) from the skeleton into the user's INDEX.md, in the user's language, keeping their content.",
+    "Add `summary:` and `tags:` to existing pages (run `atlas.py check`, then work through the list; new tags go into tags.md first).",
+    "Project pages of repositories inside ROOT/code: make `path:` relative (`code/<repo>`) and add `remote:`."
+  ]
+}
