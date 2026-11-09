@@ -2,6 +2,16 @@
 
 Written for users: `/atlas-update` shows the sections between the installed and the new version.
 
+## [0.5.2] - 2026-11-09
+
+- **Fact-Check & Gap Radar (`/atlas-interview`):** Upgraded `procedures/interview.md` and `skills/atlas-interview/SKILL.md`
+  into a structured fact-checker across core life pillars (finances, insurances & contracts with notice periods, housing,
+  projects, key people/birthdays, health). Opens with a crisp 3–5 bullet Gap Radar showing where hard data is missing and
+  why it helps Atlas make better decisions, supports dropping PDFs/screenshots directly into the chat, and files facts
+  plus `due:` deadlines immediately.
+- **All-in `/atlas-deep`:** Clarified that `/atlas-deep` is the Pro-Ultra mode that covers both deep psychological/relational
+  layers and naturally picks up missing surface facts whenever they come up.
+
 ## [0.5.1] - 2026-11-09
 
 - **One-command `/atlas-update` (applies immediately):** `atlas.py core-apply --execute` (and `core-diff` / `core-accept`)

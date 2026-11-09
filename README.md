@@ -96,8 +96,8 @@ to file what was learned (always after a learning signal, otherwise throttled).
 | `/atlas-brief` | what is due, in 3–6 lines |
 | `/atlas-sort` | file the inbox (and the cloud inbox), or bring a messy folder into Atlas |
 | `/atlas-learn` | review this chat: file facts, propose rules and skills |
-| `/atlas-interview` | a short round of questions so Atlas gets to know you |
-| `/atlas-deep` | deep mode, only when you ask |
+| `/atlas-interview` | structured fact-check & gap radar (finances, contracts, insurances, dates, projects) |
+| `/atlas-deep` | Pro-Ultra friend-and-psychologist mode for deep understanding |
 | `/atlas-maintain` | the weekly self-maintenance, on demand |
 | `/atlas-check` | health and token budget |
 | `/atlas-update` | agent changes, core updates, self-healing |

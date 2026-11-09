@@ -10,8 +10,10 @@ decision, recommendation, and priority in daily life fits who they really are.
 Never treat a page that only has facts as "complete". Read `self/README.md` (and subpages), `people/`, `areas/`,
 `projects/`, and recent `journal/` entries. Look at every topic through three layers:
 
-1. **Surface (facts):** Names, roles, numbers, dates ("Brother: Max", "Job: X", "Finances: Y"). *If only this layer
-   exists, the topic is still a blank page for `/atlas-deep`.*
+1. **Surface (facts):** Names, roles, numbers, dates, finances, contracts, insurances, setup ("Brother: Max", "Job: X",
+   "Finances: Y"). *If only this layer exists, the topic is still a blank page for `/atlas-deep` — and if surface facts
+   themselves are missing in an area that comes up, `/atlas-deep` naturally picks those up too alongside the deeper
+   layers (it is the all-in Pro-Ultra mode).*
 2. **Lived reality & dynamics:** How does this actually feel and work in everyday life? What is the real dynamic with
    that brother, partner, colleague, or friend? What gives energy, what quietly drains it? What is the backstory?
 3. **Psychology, drivers & nuances:** Why do they decide the way they do? Where do stated goals and actual behavior
