@@ -2,6 +2,22 @@
 
 Written for users: `/atlas-update` shows the sections between the installed and the new version.
 
+## [0.7.0] - 2026-11-09
+
+- **Native Atlas Sport-Coach (`modules/coach/`, `/atlas-coach`, `atlas.py coach`):**
+  - **Zero-Overhead Coach Architecture:** Added the `coach` module (`modules/coach/`), deterministic Coach Intent Router in `atlas_hook.py` (`macro`, `plan-14d`, `checkin`, `daily`), and canonical `brain/coach/` knowledge hub (`profile.md`, `macro-plan.md`, `power-curve.md`, `activities.md`, `workouts/`). Costs 0 extra tokens in normal chats and loads a mode-specific 3-tier context package when coaching.
+  - **2-Tier Planning Architecture (Macro Planner vs. 14-Day Short Planner):**
+    - `brain/coach/macro-plan.md` manages the season periodization (`Base`, `Build`, `Peak`, `Taper`, `Deload`) anchored to `[goal:A/B]` and multi-day `[blocked]` dates in `brain/calendar/README.md`.
+    - Automatic staleness detection (`> 14` days old or changed `goals_hash` from `[goal]` / `[blocked]` entries) prompts the Coach to update `macro-plan.md` first before writing concrete 14-day workouts into `brain/calendar/README.md`.
+  - **Strava OAuth Loopback Onboarding & 3-Tier Activity Sync (`atlas.py coach auth-strava` & `sync`):**
+    - Local loopback OAuth flow (`127.0.0.1:8766`) stores credentials exclusively in git-ignored `brain/_secrets/strava.env`.
+    - Caches heavy 1Hz raw streams (`watts`, `heartrate`, `cadence`, `velocity_smooth`) in git-ignored `brain/_atlas/cache/strava/streams/` and computes Normalized Power (`NP`), `kJ`, `IF`, `TSS`, aerobic decoupling (`Pw:Hr %`), **3-Epoch Mean Maximal Power (`42d`, `90d`, `365d`)** for both **Fresh (`0 kJ+`)** and **Fatigued (`> 1500 kJ`)** states, plus Running Best Split Paces (`1km`, `3km`, `5km`, `10km`).
+    - Automatically marks completed workouts `[x]` in `brain/calendar/README.md` and flags unannotated rides (`> 15 min` in the last 14 days) as `[feedback: pending]` for a 1-question check-in (`atlas.py coach note`).
+  - **Compact Workout DSL & Zero-Token `.zwo` Compiler (`atlas.py coach zwo`):**
+    - Parses compact interval notation directly from `brain/calendar/README.md` (e.g. `(90m | 15m WU 55-75%, 4x 8m@102% / 4m@55%, 19m Z2@68%, 10m CD 65-50%)`) and compiles explicit decimal `.zwo` XML files (`brain/coach/workouts/`) for Hammerhead Karoo, Zwift, Wahoo, and Elite smart trainers.
+  - **Upgraded Visual Coach Dashboard (`calendar.html`):**
+    - Added Macro Phase & Strava status banner, KW phase badges (`Base`, `Build`, `Peak`, `Taper`, `Deload`), visual interval bar charts inside workout pills & modals, 1-click `.zwo` download button, ride feedback badges (`✓ Notiz` vs. `⚠ Check-in`), and a 3-Epoch Power Curve table (`42d`, `90d`, `365d`, `>1500 kJ`).
+
 ## [0.6.6] - 2026-11-09
 
 - **Fixed `ERR_EMPTY_RESPONSE` on Native Windows (`pythonw.exe` `sys.stderr = None` Crash in `http.server`):**

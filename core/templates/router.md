@@ -49,7 +49,7 @@ If a project name is ambiguous, ask which one.
 - Files outside Atlas move only by written plan with the user's go (`brain/_atlas/procedures/move.md`). Never delete.
   Never open credential stores (browser passwords, keychains, private keys) on your own.
 - Write content in {{LANGUAGE}}; core folder names stay English.
-- Skills: `/atlas-brief` · `/atlas-calendar` · `/atlas-sort` · `/atlas-learn` · `/atlas-interview` · `/atlas-deep` ·
+- Skills: `/atlas-brief` · `/atlas-calendar` · `/atlas-coach` · `/atlas-sort` · `/atlas-learn` · `/atlas-interview` · `/atlas-deep` ·
   `/atlas-maintain` · `/atlas-check` · `/atlas-update` · `/atlas-adopt-repo`. Tool: `python -I brain/_atlas/tools/atlas.py`.
 
 <!-- atlas:core:end -->

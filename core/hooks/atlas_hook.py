@@ -35,7 +35,7 @@ CACHE = os.path.join(BRAIN, "_atlas", "cache", "index.json")
 CAL_HTML = os.path.join(BRAIN, "_atlas", "cache", "calendar.html")
 SKIP_DIRS = {".git", "_secrets", "_archive", "_atlas", "node_modules", "__pycache__", ".obsidian", ".trash"}
 TEXT_EXTS = {".md", ".txt"}
-CANONICAL = ("areas/", "projects/", "people/", "howto/", "self/", "calendar/", "glossary.md", "INDEX.md")
+CANONICAL = ("areas/", "projects/", "people/", "howto/", "self/", "calendar/", "coach/", "glossary.md", "INDEX.md")
 MAX_HINTS = 5
 MAX_ROUTES = 3
 INDEX_BUDGET_S = 2.5   # hooks parse at most this long per call; `atlas.py index` builds the full cache
@@ -248,7 +248,7 @@ def _priority(rel):
     """Parse order on a cold cache: routing registry first, then definitions, then the rest."""
     if rel.startswith("projects/") or rel in ("glossary.md", "tags.md", "settings.md"):
         return 0
-    return 1 if rel.startswith(("people/", "self/", "calendar/")) else 2
+    return 1 if rel.startswith(("people/", "self/", "calendar/", "coach/")) else 2
 
 
 def load_index(budget=None):
@@ -574,14 +574,480 @@ def open_todos(include_done=False):
     return sorted(out, key=lambda x: (x["_r"], x["what"]))
 
 
-def _extract_coach_context(idx):
-    """Extract athlete physiology metrics, training schedule, and macro goals from brain/ (0 LLM tokens)."""
+def _zone_class(p):
+    """Map decimal power factor (e.g. 0.70, 1.02) to Z1..Z6."""
+    if p < 0.56:
+        return "z1"
+    if p <= 0.75:
+        return "z2"
+    if p <= 0.90:
+        return "z3"
+    if p <= 1.05:
+        return "z4"
+    if p <= 1.20:
+        return "z5"
+    return "z6"
+
+
+def _norm_pwr(raw_val, default=0.70):
+    """Parse percentage ('75%', '102') or decimal ('0.75', '1.02') into a float factor (e.g. 0.75)."""
+    if raw_val is None or raw_val == "":
+        return default
+    try:
+        v = float(str(raw_val).replace(",", ".").replace("%", "").strip())
+    except ValueError:
+        return default
+    return round(v / 100.0, 3) if v > 3.0 else round(v, 3)
+
+
+def _dur_sec(val_str, unit_str="m"):
+    try:
+        v = float(str(val_str).replace(",", ".").strip())
+    except ValueError:
+        return 0
+    u = (unit_str or "m").lower()
+    if u.startswith("h"):
+        return int(round(v * 3600))
+    if u.startswith("s"):
+        return int(round(v))
+    return int(round(v * 60))
+
+
+def parse_workout_spec(what_text, subkind="cycling", ftp_watts=275, sport=None):
+    """Deterministically parse a workout description into structured segments and visual blocks (0 LLM tokens).
+
+    Supports both full DSL specs in parentheses:
+      `Threshold 4x8m (90m | 15m WU 55-75%, 4x 8m@102% / 4m@55%, 19m Z2@68%, 10m CD 65-50%)`
+    and shorthand descriptions:
+      `90m SweetSpot (2x20m)` or `120m Zone 2 @ 70%`
+    """
+    if sport:
+        subkind = sport
+    raw = str(what_text or "").strip()
+    clean_raw = re.sub(r"\s*\[(?:strava|feedback):[^\]]+\].*$", "", raw, flags=re.I)
+    clean_raw = re.sub(r"\s*[—–-]\s*Done:.*$", "", clean_raw, flags=re.I).strip()
+
+    # Extract total duration if stated at start or inside parens
+    total_min = None
+    m_tot = re.search(r"\b(\d+)\s*(?:m|min)\b", clean_raw, re.I)
+    if m_tot:
+        total_min = int(m_tot.group(1))
+    else:
+        m_hr = re.search(r"\b(\d+(?:[.,]\d+)?)\s*h\b", clean_raw, re.I)
+        if m_hr:
+            total_min = int(round(float(m_hr.group(1).replace(",", ".")) * 60))
+
+    title = clean_raw
+    spec_body = ""
+    # Look for `( ... | ... )` first
+    m_pipe = re.search(r"\(([^()]*\|[^()]*)\)", clean_raw)
+    if m_pipe:
+        title = (clean_raw[:m_pipe.start()] + clean_raw[m_pipe.end():]).strip()
+        parts = m_pipe.group(1).split("|", 1)
+        m_pipe_dur = re.search(r"(\d+)\s*(?:m|min)\b", parts[0], re.I)
+        if m_pipe_dur:
+            total_min = int(m_pipe_dur.group(1))
+        spec_body = parts[1].strip()
+    else:
+        # Check if there is a top-level pipe `Title | 15m WU ...`
+        if "|" in clean_raw:
+            left, right = clean_raw.split("|", 1)
+            if re.search(r"\d+\s*(?:m|min|s|x)\b", right, re.I):
+                title = left.strip(" ()")
+                spec_body = right.strip(" ()")
+
+    segments = []
+    if spec_body:
+        tokens = [t.strip() for t in re.split(r"[,;]+", spec_body) if t.strip()]
+        for tok in tokens:
+            # 1. Warmup: `15m WU 55-75%` or `10m warmup 0.50->0.75`
+            m_wu = re.match(
+                r"^(\d+(?:[.,]\d+)?)\s*(m|min|s|h)?\s*(?:wu|warm-?up)\s*(?:@\s*)?(\d+(?:[.,]\d+)?)?\s*%?\s*(?:[-–>to/]+\s*(\d+(?:[.,]\d+)?)\s*%?)?$",
+                tok, re.I
+            )
+            if m_wu:
+                sec = _dur_sec(m_wu.group(1), m_wu.group(2) or "m")
+                p_low = _norm_pwr(m_wu.group(3), 0.50)
+                p_high = _norm_pwr(m_wu.group(4), 0.75)
+                segments.append({"type": "warmup", "sec": sec, "p_low": p_low, "p_high": p_high,
+                                 "label": f"{sec // 60}m WU {int(round(p_low * 100))}–{int(round(p_high * 100))}%"})
+                continue
+
+            # 2. Cooldown: `10m CD 65-50%`
+            m_cd = re.match(
+                r"^(\d+(?:[.,]\d+)?)\s*(m|min|s|h)?\s*(?:cd|cool-?down)\s*(?:@\s*)?(\d+(?:[.,]\d+)?)?\s*%?\s*(?:[-–>to/]+\s*(\d+(?:[.,]\d+)?)\s*%?)?$",
+                tok, re.I
+            )
+            if m_cd:
+                sec = _dur_sec(m_cd.group(1), m_cd.group(2) or "m")
+                p_low = _norm_pwr(m_cd.group(3), 0.65)
+                p_high = _norm_pwr(m_cd.group(4), 0.50)
+                segments.append({"type": "cooldown", "sec": sec, "p_low": p_low, "p_high": p_high,
+                                 "label": f"{sec // 60}m CD {int(round(p_low * 100))}–{int(round(p_high * 100))}%"})
+                continue
+
+            # 3. Intervals: `4x 8m@102% / 4m@55%` or `3x15m @ 90% (5m @ 55%)` or `5x4m@112%`
+            m_iv = re.match(
+                r"^(\d+)\s*[x×]\s*(\d+(?:[.,]\d+)?)\s*(m|min|s)?\s*(?:@\s*(\d+(?:[.,]\d+)?)\s*%?)?"
+                r"(?:\s*(?:/|\(|with|rest|pause)\s*(\d+(?:[.,]\d+)?)\s*(m|min|s)?\s*(?:@\s*(\d+(?:[.,]\d+)?)\s*%?)?\s*\)?)?$",
+                tok, re.I
+            )
+            if m_iv:
+                rep = int(m_iv.group(1))
+                on_sec = _dur_sec(m_iv.group(2), m_iv.group(3) or "m")
+                on_p = _norm_pwr(m_iv.group(4), 0.95 if on_sec >= 480 else 1.10)
+                off_sec = _dur_sec(m_iv.group(5), m_iv.group(6) or "m") if m_iv.group(5) else max(60, int(round(on_sec * 0.5)))
+                off_p = _norm_pwr(m_iv.group(7), 0.55)
+                segments.append({
+                    "type": "intervals", "repeat": rep, "on_sec": on_sec, "off_sec": off_sec,
+                    "on_p": on_p, "off_p": off_p,
+                    "label": f"{rep}× {on_sec // 60 if on_sec >= 60 else str(on_sec) + 's'}"
+                             f"{'m' if on_sec >= 60 else ''} @ {int(round(on_p * 100))}% / "
+                             f"{off_sec // 60 if off_sec >= 60 else str(off_sec) + 's'}"
+                             f"{'m' if off_sec >= 60 else ''} @ {int(round(off_p * 100))}%"
+                })
+                continue
+
+            # 4. Ramp: `12m ramp 70-95%`
+            m_rmp = re.match(
+                r"^(\d+(?:[.,]\d+)?)\s*(m|min|s)?\s*ramp\s*(?:@\s*)?(\d+(?:[.,]\d+)?)\s*%?\s*[-–>to/]+\s*(\d+(?:[.,]\d+)?)\s*%?$",
+                tok, re.I
+            )
+            if m_rmp:
+                sec = _dur_sec(m_rmp.group(1), m_rmp.group(2) or "m")
+                p_low = _norm_pwr(m_rmp.group(3), 0.65)
+                p_high = _norm_pwr(m_rmp.group(4), 0.95)
+                segments.append({"type": "ramp", "sec": sec, "p_low": p_low, "p_high": p_high,
+                                 "label": f"{sec // 60}m Ramp {int(round(p_low * 100))}–{int(round(p_high * 100))}%"})
+                continue
+
+            # 5. FreeRide: `15m free`
+            m_fr = re.match(r"^(\d+(?:[.,]\d+)?)\s*(m|min|s|h)?\s*(?:free|freeride)$", tok, re.I)
+            if m_fr:
+                sec = _dur_sec(m_fr.group(1), m_fr.group(2) or "m")
+                segments.append({"type": "freeride", "sec": sec, "label": f"{sec // 60}m FreeRide"})
+                continue
+
+            # 6. SteadyState: `19m Z2@68%` or `45m @ 70%` or `30m Z2`
+            m_st = re.match(
+                r"^(\d+(?:[.,]\d+)?)\s*(m|min|s|h)?\s*(?:[A-Za-z0-9_-]+\s*)?(?:@\s*(\d+(?:[.,]\d+)?)\s*%?)?$",
+                tok, re.I
+            )
+            if m_st:
+                sec = _dur_sec(m_st.group(1), m_st.group(2) or "m")
+                low_tok = tok.lower()
+                def_p = 0.52 if "z1" in low_tok else (0.88 if ("z3" in low_tok or "ss" in low_tok or "tempo" in low_tok)
+                        else (1.00 if "z4" in low_tok else (1.12 if "z5" in low_tok else 0.68)))
+                p = _norm_pwr(m_st.group(3), def_p)
+                segments.append({"type": "steady", "sec": sec, "p": p,
+                                 "label": f"{sec // 60}m @ {int(round(p * 100))}%"})
+                continue
+
+    # Fallback shorthand synthesis for cycling workouts if no pipe DSL was given (e.g. `90m SweetSpot (2x20m)`)
+    if not segments and subkind == "cycling" and total_min and total_min >= 20:
+        low_c = clean_raw.lower()
+        m_sh_iv = re.search(r"\b(\d+)\s*[x×]\s*(\d+)\s*(m|min|s)?(?:\s*@\s*(\d+(?:[.,]\d+)?)\s*%?)?", clean_raw, re.I)
+        wu_sec = min(900, max(300, int(total_min * 60 * 0.15)))
+        cd_sec = min(600, max(300, int(total_min * 60 * 0.10)))
+        segments.append({"type": "warmup", "sec": wu_sec, "p_low": 0.52, "p_high": 0.72,
+                         "label": f"{wu_sec // 60}m WU 52–72%"})
+        used = wu_sec + cd_sec
+        if m_sh_iv:
+            rep = int(m_sh_iv.group(1))
+            on_sec = _dur_sec(m_sh_iv.group(2), m_sh_iv.group(3) or "m")
+            def_iv_p = 0.90 if ("sweet" in low_c or "ss" in low_c or on_sec >= 900) else (1.00 if on_sec >= 420 else 1.12)
+            on_p = _norm_pwr(m_sh_iv.group(4), def_iv_p)
+            off_sec = max(60, min(300, int(round(on_sec * 0.4))))
+            segments.append({"type": "intervals", "repeat": rep, "on_sec": on_sec, "off_sec": off_sec,
+                             "on_p": on_p, "off_p": 0.55,
+                             "label": f"{rep}× {on_sec // 60}m @ {int(round(on_p * 100))}% / {off_sec // 60}m @ 55%"})
+            used += rep * (on_sec + off_sec)
+        rem = max(0, total_min * 60 - used)
+        if rem >= 60:
+            base_p = 0.55 if ("rec" in low_c or "z1" in low_c or "locker" in low_c) else 0.68
+            segments.append({"type": "steady", "sec": rem, "p": base_p,
+                             "label": f"{rem // 60}m Z2 @ {int(round(base_p * 100))}%"})
+        segments.append({"type": "cooldown", "sec": cd_sec, "p_low": 0.65, "p_high": 0.50,
+                         "label": f"{cd_sec // 60}m CD 65–50%"})
+
+    visual_blocks = []
+    calc_sec = 0
+    for seg in segments:
+        st = seg["type"]
+        if st in ("warmup", "cooldown", "ramp"):
+            calc_sec += seg["sec"]
+            mid_p = round((seg["p_low"] + seg["p_high"]) / 2.0, 2)
+            visual_blocks.append({"min": round(seg["sec"] / 60.0, 1), "pct": int(round(mid_p * 100)),
+                                  "zone": _zone_class(mid_p), "label": seg["label"]})
+        elif st == "intervals":
+            for _ in range(seg["repeat"]):
+                calc_sec += seg["on_sec"] + seg["off_sec"]
+                visual_blocks.append({"min": round(seg["on_sec"] / 60.0, 1), "pct": int(round(seg["on_p"] * 100)),
+                                      "zone": _zone_class(seg["on_p"]), "label": f"ON {int(round(seg['on_p'] * 100))}%"})
+                visual_blocks.append({"min": round(seg["off_sec"] / 60.0, 1), "pct": int(round(seg["off_p"] * 100)),
+                                      "zone": _zone_class(seg["off_p"]), "label": f"OFF {int(round(seg['off_p'] * 100))}%"})
+        elif st == "freeride":
+            calc_sec += seg["sec"]
+            visual_blocks.append({"min": round(seg["sec"] / 60.0, 1), "pct": 68, "zone": "z2", "label": seg["label"]})
+        else:
+            calc_sec += seg["sec"]
+            visual_blocks.append({"min": round(seg["sec"] / 60.0, 1), "pct": int(round(seg["p"] * 100)),
+                                  "zone": _zone_class(seg["p"]), "label": seg["label"]})
+
+    if calc_sec > 0 and not total_min:
+        total_min = int(round(calc_sec / 60.0))
+
+    return {
+        "title": title or clean_raw,
+        "raw": clean_raw,
+        "total_min": total_min or 0,
+        "segments": segments,
+        "visual_blocks": visual_blocks,
+        "has_structure": bool(segments),
+        "has_intervals": bool(segments),
+    }
+
+
+def _xml_esc(s):
+    return (str(s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace('"', "&quot;").replace("'", "&apos;"))
+
+
+def compile_zwo_xml(spec_or_title, description="", parsed_spec=None, date_str="", ftp_watts=275, ftp=None, author="Atlas Coach"):
+    """Compile a parsed workout spec into valid Zwift/Hammerhead .zwo XML with explicit decimal power factors."""
+    if isinstance(spec_or_title, dict):
+        parsed_spec = spec_or_title
+        title = parsed_spec.get("title") or "Atlas Workout"
+        if date_str:
+            title = f"{date_str} · {title}"
+        description = parsed_spec.get("raw") or title
+    else:
+        title = str(spec_or_title or "Atlas Workout")
+        parsed_spec = parsed_spec or {}
+    eff_ftp = ftp if ftp is not None else ftp_watts
+    segs = parsed_spec.get("segments") or []
+    if not segs:
+        return ""
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        "<workout_file>",
+        f"  <author>{_xml_esc(author)}</author>",
+        f"  <name>{_xml_esc(title)}</name>",
+        f"  <description>{_xml_esc(description)} (FTP reference: {eff_ftp}W)</description>",
+        "  <sportType>bike</sportType>",
+        "  <tags>",
+        '    <tag name="AtlasCoach"/>',
+        "  </tags>",
+        "  <workout>",
+    ]
+    for s in segs:
+        t = s["type"]
+        if t == "warmup":
+            lines.append(f'    <Warmup Duration="{int(s["sec"])}" PowerLow="{s["p_low"]:.2f}" PowerHigh="{s["p_high"]:.2f}"/>')
+        elif t == "cooldown":
+            lines.append(f'    <Cooldown Duration="{int(s["sec"])}" PowerLow="{s["p_low"]:.2f}" PowerHigh="{s["p_high"]:.2f}"/>')
+        elif t == "ramp":
+            lines.append(f'    <Ramp Duration="{int(s["sec"])}" PowerLow="{s["p_low"]:.2f}" PowerHigh="{s["p_high"]:.2f}"/>')
+        elif t == "intervals":
+            lines.append(
+                f'    <IntervalsT Repeat="{int(s["repeat"])}" OnDuration="{int(s["on_sec"])}" '
+                f'OffDuration="{int(s["off_sec"])}" OnPower="{s["on_p"]:.2f}" OffPower="{s["off_p"]:.2f}"/>'
+            )
+        elif t == "freeride":
+            lines.append(f'    <FreeRide Duration="{int(s["sec"])}" FlatRoad="1"/>')
+        else:
+            lines.append(f'    <SteadyState Duration="{int(s["sec"])}" Power="{s["p"]:.2f}"/>')
+    lines += ["  </workout>", "</workout_file>\n"]
+    return "\n".join(lines)
+
+
+def compute_goals_hash(cal_items=None):
+    """Short deterministic hash of open [goal] and multi-day [blocked] items in the calendar."""
+    if cal_items is None:
+        try:
+            cal_items = calendar_items(load_index(budget=INDEX_BUDGET_S), days=365, past_days=14, include_done=True)
+        except Exception:
+            cal_items = []
+    anchors = []
+    for it in cal_items or []:
+        if it.get("status") != "open" or it.get("delta", 0) < 0:
+            continue
+        if it.get("kind") == "goal":
+            anchors.append(f"G:{it['start']}:{it.get('subkind','')}:{it['what']}")
+        elif it.get("kind") == "blocked" and (it["end"] - it["start"]).days >= 2:
+            anchors.append(f"B:{it['start']}..{it['end']}:{it['what']}")
+    if not anchors:
+        return "none"
+    return hashlib.sha1("\n".join(sorted(anchors)).encode("utf-8")).hexdigest()[:8]
+
+
+def parse_macro_plan(cal_items=None):
+    """Parse brain/coach/macro-plan.md and evaluate its freshness (>14d or goal/blocker drift)."""
+    today = dt.date.today()
+    iso_yr, iso_kw, _ = today.isocalendar()
+    macro_path = os.path.join(BRAIN, "coach", "macro-plan.md")
+    if cal_items is None:
+        try:
+            cal_items = calendar_items(load_index(budget=INDEX_BUDGET_S), days=365, past_days=14, include_done=True)
+        except Exception:
+            cal_items = []
+    cur_hash = compute_goals_hash(cal_items)
+    res = {
+        "exists": os.path.isfile(macro_path),
+        "updated": "1970-01-01",
+        "age_days": 999,
+        "active_phase": "Uninitialized",
+        "goals_hash": "none",
+        "current_goals_hash": cur_hash,
+        "status": "STALE",
+        "stale": True,
+        "stale_reason": "macro-plan.md not initialized yet",
+        "current_week": None,
+        "next_week": None,
+        "weeks": [],
+    }
+    if not res["exists"]:
+        return res
+    try:
+        with open(macro_path, encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except OSError:
+        return res
+
+    fm = frontmatter(text)
+    upd_str = str(fm.get("updated") or "1970-01-01").strip()
+    res["updated"] = upd_str
+    res["active_phase"] = str(fm.get("active_phase") or "Base").strip()
+    res["goals_hash"] = str(fm.get("goals_hash") or "none").strip()
+    try:
+        upd_d = dt.date.fromisoformat(upd_str[:10])
+        res["age_days"] = (today - upd_d).days
+    except ValueError:
+        res["age_days"] = 999
+
+    weeks = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s.startswith("|") or s.count("|") < 5:
+            continue
+        cells = [c.strip() for c in s.strip("|").split("|")]
+        c0 = cells[0].lower()
+        if c0 in ("kw", "---") or set(c0) <= {"-", ":"} or "run `/atlas-coach`" in c0:
+            continue
+        m_kw = re.search(r"\b(\d{1,2})\b", cells[0])
+        if not m_kw:
+            continue
+        kw_num = int(m_kw.group(1))
+        row = {
+            "kw": kw_num,
+            "monday": cells[1] if len(cells) > 1 else "",
+            "range": cells[1] if len(cells) > 1 else "",
+            "phase": _clean_md_inline(cells[2]) if len(cells) > 2 else "",
+            "hours": _clean_md_inline(cells[3]) if len(cells) > 3 else "",
+            "cycling": _clean_md_inline(cells[4]) if len(cells) > 4 else "",
+            "stimulus": _clean_md_inline(cells[4]) if len(cells) > 4 else "",
+            "running_strength": _clean_md_inline(cells[5]) if len(cells) > 5 else "",
+            "notes": _clean_md_inline(cells[6] if len(cells) > 6 else (cells[5] if len(cells) > 5 else "")),
+        }
+        weeks.append(row)
+        if kw_num == iso_kw and res["current_week"] is None:
+            res["current_week"] = row
+        elif kw_num == (iso_kw % 52) + 1 and res["next_week"] is None:
+            res["next_week"] = row
+
+    res["weeks"] = weeks
+    if res["current_week"] and res["current_week"].get("phase"):
+        res["active_phase"] = res["current_week"]["phase"]
+
+    if upd_str == "1970-01-01":
+        res["status"] = "STALE"
+        res["stale"] = True
+        res["stale_reason"] = "Macro plan not updated yet"
+    elif res["age_days"] > 14:
+        res["status"] = "STALE"
+        res["stale"] = True
+        res["stale_reason"] = f"Last updated {res['age_days']} days ago (> 14d cadence)"
+    elif res["goals_hash"] not in ("none", "", cur_hash) or (cur_hash != "none" and res["goals_hash"] != cur_hash):
+        res["status"] = "STALE"
+        res["stale"] = True
+        res["stale_reason"] = f"Calendar goals or blockers changed (hash {res['goals_hash']} -> {cur_hash})"
+    elif not weeks:
+        res["status"] = "STALE"
+        res["stale"] = True
+        res["stale_reason"] = "Macro plan has no weekly periodization rows yet"
+    else:
+        res["status"] = "OK"
+        res["stale"] = False
+        res["stale_reason"] = ""
+    return res
+
+
+def load_coach_state():
+    """Load Strava connection status, synced activities + feedback, and 3-epoch power/pace curves (0 LLM tokens)."""
+    strava_env = os.path.join(BRAIN, "_secrets", "strava.env")
+    strava_connected = False
+    if os.path.isfile(strava_env):
+        try:
+            with open(strava_env, encoding="utf-8", errors="replace") as fh:
+                env_txt = fh.read()
+            strava_connected = bool(
+                re.search(r"(?m)^STRAVA_REFRESH_TOKEN\s*=\s*\S+", env_txt)
+                or re.search(r"(?m)^STRAVA_ACCESS_TOKEN\s*=\s*\S+", env_txt)
+            )
+        except OSError:
+            pass
+
+    act_json_path = os.path.join(BRAIN, "coach", "activities.json")
+    data = {"updated": "", "activities": [], "power_curve": {}, "pace_curve": {}}
+    if os.path.isfile(act_json_path):
+        try:
+            with open(act_json_path, encoding="utf-8", errors="replace") as fh:
+                loaded = json.load(fh)
+            if isinstance(loaded, dict):
+                data.update(loaded)
+            elif isinstance(loaded, list):
+                data["activities"] = loaded
+        except (OSError, ValueError):
+            pass
+
+    today = dt.date.today()
+    cutoff_14d = (today - dt.timedelta(days=14)).isoformat()
+    pending_feedback = []
+    for a in sorted(data.get("activities") or [], key=lambda x: str(x.get("date", "")), reverse=True):
+        if not isinstance(a, dict):
+            continue
+        d_str = str(a.get("date") or "")[:10]
+        dur_min = int(a.get("duration_min") or round((a.get("moving_time") or 0) / 60.0))
+        fb = str(a.get("feedback") or "").strip()
+        if d_str >= cutoff_14d and dur_min >= 15 and (not fb or fb.lower() == "pending"):
+            pending_feedback.append({
+                "id": a.get("id"),
+                "date": d_str,
+                "name": a.get("name") or "Activity",
+                "sport": a.get("sport") or "cycling",
+                "duration_min": dur_min,
+                "np_w": a.get("np_w") or a.get("np_watts") or a.get("avg_w") or 0,
+                "avg_hr": a.get("avg_hr") or 0,
+            })
+
+    return {
+        "strava_connected": strava_connected,
+        "activities": data.get("activities") or [],
+        "pending_feedback": pending_feedback,
+        "power_curve": data.get("power_curve") or {},
+        "pace_curve": data.get("pace_curve") or {},
+    }
+
+
+def _extract_coach_context(idx, cal_items=None):
+    """Extract athlete physiology metrics, training schedule, macro plan, Strava state & power curves (0 LLM tokens)."""
     metrics, macro_goals, schedule = [], [], ""
     seen_m, seen_g = set(), set()
+    ftp_watts = 300
 
     def _add_m(label, val, icon=""):
         val = _clean_md_inline(val)
-        if not val or label in seen_m:
+        if not val or val in ("—", "-") or label in seen_m:
             return
         seen_m.add(label)
         metrics.append({"label": label, "value": val, "icon": icon})
@@ -596,9 +1062,14 @@ def _extract_coach_context(idx):
 
     sport_tags = {"radsport", "sport", "cycling", "running", "gesundheit", "health", "training", "fitness"}
     cand_rels = []
+    # Prioritize brain/coach/profile.md first so canonical coach thresholds take precedence
+    if os.path.isfile(os.path.join(BRAIN, "coach", "profile.md")):
+        cand_rels.append("coach/profile.md")
     for rel, e in sorted(idx.items()):
+        if rel in cand_rels:
+            continue
         tset = set(e.get("tags", []))
-        if rel.startswith("self/") or (tset & sport_tags) or any(w in rel.lower() for w in ("radsport", "sport", "training", "physiologie")):
+        if rel.startswith(("self/", "coach/")) or (tset & sport_tags) or any(w in rel.lower() for w in ("radsport", "sport", "training", "physiologie")):
             cand_rels.append(rel)
 
     for rel in cand_rels:
@@ -617,17 +1088,26 @@ def _extract_coach_context(idx):
                 if "ftp" in k_low:
                     short_v = re.sub(r"\s*/\s*~?[\d,.]+\s*W/kg\s+auf.*$", ")", val)
                     _add_m("FTP", short_v, "⚡")
+                    m_w = re.search(r"(\d{2,3})\s*W\b", short_v, re.I)
+                    if m_w:
+                        ftp_watts = int(m_w.group(1))
                 elif "vo2max" in k_low:
                     _add_m("VO₂max", val, "🫁")
-                elif "hauptsport" in k_low or "volumen" in k_low or "umfang" in k_low:
+                elif "hauptsport" in k_low or "volumen" in k_low or "umfang" in k_low or "weekly time budget" in k_low:
                     _add_m("Volumen", val, "🚴")
                 elif "all-out" in k_low or "peaks" in k_low or "mmp" in k_low:
                     _add_m("MMP Peaks", val.replace("\\|", "·"), "🔥")
                 elif "krafttraining" in k_low or "hypertrophie" in k_low:
                     _add_m("Athletik & Kraft", val, "🏋️")
-                elif "körpermaße" in k_low or "biometrie" in k_low:
+                elif "körpermaße" in k_low or "biometrie" in k_low or "height & weight" in k_low:
                     _add_m("Biometrie", val, "⚖️")
-            if not schedule and re.search(r"\d{2}:\d{2}\s*[–-]\s*\d{2}:\d{2}.*(?:Vitalitäts|Rennrad|Workout|Training)", s, re.I):
+                elif "max hr" in k_low:
+                    _add_m("Herzfrequenz", val, "❤️")
+            if not schedule and re.search(r"\d{2}:\d{2}\s*[–-]\s*\d{2}:\d{2}.*(?:Vitalitäts|Rennrad|Workout|Training|Weekday Window)", s, re.I):
+                m_sch = re.search(r"(\d{2}:\d{2}\s*[–-]\s*\d{2}:\d{2})", s)
+                if m_sch:
+                    schedule = f"{m_sch.group(1)} Uhr (Mo–Fr)"
+            elif not schedule and "Weekday Window" in s:
                 m_sch = re.search(r"(\d{2}:\d{2}\s*[–-]\s*\d{2}:\d{2})", s)
                 if m_sch:
                     schedule = f"{m_sch.group(1)} Uhr (Mo–Fr)"
@@ -641,7 +1121,21 @@ def _extract_coach_context(idx):
                     _add_g(parts[0], parts[1], "Physiologie-Säule", rel)
             elif "Münsterland Giro" in s or ("Events & Ziele" in text and s.startswith("- **") and "Enge " not in s and "Indoor" not in s):
                 _add_g("Ziel-Events & Wettkämpfe", s.lstrip("-* "), "Wettkämpfe", rel)
-    return {"metrics": metrics, "macro_goals": macro_goals, "schedule": schedule or "17:00 – 20:00 Uhr"}
+
+    macro = parse_macro_plan(cal_items=cal_items)
+    c_state = load_coach_state()
+    return {
+        "metrics": metrics,
+        "ftp_watts": ftp_watts,
+        "macro_goals": macro_goals,
+        "schedule": schedule or "17:00 – 20:00 Uhr",
+        "macro": macro,
+        "strava_connected": c_state["strava_connected"],
+        "pending_feedback": c_state["pending_feedback"],
+        "power_curve": c_state["power_curve"],
+        "pace_curve": c_state["pace_curve"],
+        "activities_count": len(c_state["activities"]),
+    }
 
 
 def deadlines(idx, days=30):
@@ -734,6 +1228,18 @@ body{background-image:radial-gradient(ellipse 80% 35% at 50% -10%,rgba(56,189,24
 .phys-chip{background:rgba(15,23,42,0.85);border:1px solid rgba(255,255,255,0.09);border-radius:7px;padding:4px 9px;font-size:.74rem;display:inline-flex;align-items:center;gap:6px}
 .phys-chip span.k{color:var(--muted-hi);font-weight:500}
 .phys-chip strong.v{color:var(--text);font-weight:700}
+.macro-banner{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px;padding:7px 10px;border-radius:8px;background:rgba(15,23,42,0.75);border:1px solid rgba(56,189,248,0.2);font-size:.74rem}
+.macro-badges{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.kw-phase{font-size:.54rem;font-weight:700;text-transform:uppercase;padding:1px 4px;border-radius:3px;background:rgba(56,189,248,0.16);color:var(--accent);margin-top:3px;letter-spacing:.03em;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.wko-bars{display:flex;align-items:flex-end;gap:1.5px;height:12px;margin-top:3px;padding:1px 2px;background:rgba(0,0,0,0.25);border-radius:3px;overflow:hidden}
+.wko-bar{min-width:2px;border-radius:1px 1px 0 0;opacity:.92}
+.fb-badge{font-size:.58rem;font-weight:700;padding:0 4px;border-radius:3px;margin-left:auto;flex-shrink:0}
+.fb-badge.ok{background:rgba(16,185,129,0.2);color:#6ee7b7}
+.fb-badge.warn{background:rgba(245,158,11,0.22);color:#fde68a}
+.pcurve-tbl{width:100%;border-collapse:collapse;font-size:.71rem;margin-top:4px}
+.pcurve-tbl th,.pcurve-tbl td{padding:4px 6px;text-align:right;border-bottom:1px solid var(--border)}
+.pcurve-tbl th:first-child,.pcurve-tbl td:first-child{text-align:left;font-weight:700;color:var(--muted-hi)}
+.pcurve-tbl th{font-size:.64rem;text-transform:uppercase;color:var(--muted)}
 
 /* Main Workspace Layout */
 .workspace{display:grid;grid-template-columns:minmax(0,1fr) 360px;gap:14px;align-items:start}
@@ -753,7 +1259,7 @@ body{background-image:radial-gradient(ellipse 80% 35% at 50% -10%,rgba(56,189,24
   .dow-row,.month-grid{grid-template-columns:24px repeat(7,minmax(0,1fr))}
   .month-grid{grid-auto-rows:minmax(92px,auto)}
 }
-.kw-cell{border-right:1px solid var(--border);border-bottom:1px solid var(--border);background:rgba(15,21,32,0.6);display:flex;align-items:flex-start;justify-content:center;padding-top:8px;font-size:.66rem;font-weight:600;color:var(--muted);cursor:pointer;user-select:none;transition:color .15s,background .15s}
+.kw-cell{border-right:1px solid var(--border);border-bottom:1px solid var(--border);background:rgba(15,21,32,0.6);display:flex;flex-direction:column;align-items:center;justify-content:flex-start;padding:7px 2px 4px;font-size:.66rem;font-weight:600;color:var(--muted);cursor:pointer;user-select:none;transition:color .15s,background .15s}
 .kw-cell:hover{color:var(--accent);background:rgba(56,189,248,0.07)}
 
 .day{min-width:0;overflow:hidden;border-right:1px solid var(--border);border-bottom:1px solid var(--border);padding:6px;display:flex;flex-direction:column;gap:4px;position:relative;background:var(--surface);transition:background .12s ease;cursor:pointer}
@@ -895,6 +1401,7 @@ body{background-image:radial-gradient(ellipse 80% 35% at 50% -10%,rgba(56,189,24
       <div class="coach-title">⚡ Athleten-Telemetrie & Physiologie-Profil (aus Brain)</div>
       <div style="font-size:.72rem;color:var(--muted-hi)" id="coach-sched"></div>
     </div>
+    <div class="macro-banner" id="macro-banner"></div>
     <div class="phys-chips" id="phys-chips"></div>
   </section>
 
@@ -1024,6 +1531,44 @@ function openWeekOf(dateStr){
   cur = parseIso(dateStr);
   setLayout('week');
 }
+function zoneColor(z){
+  if(z<=1) return '#64748b';
+  if(z===2) return '#38bdf8';
+  if(z===3) return '#10b981';
+  if(z===4) return '#f59e0b';
+  if(z===5) return '#f43f5e';
+  return '#a855f7';
+}
+function renderWkoBars(it, tall=false){
+  const blks = it.visual_blocks || [];
+  if(!blks.length) return '';
+  const tot = blks.reduce((s,b)=>s+(b.sec||60), 0) || 1;
+  const h = tall ? 28 : 11;
+  return `<div class="wko-bars" style="height:${h}px" title="Intervall-Struktur (${it.total_min||0} min)">` +
+    blks.map(b => {
+      const wPct = Math.max(2, (b.sec/tot)*100);
+      const hPct = Math.min(100, Math.max(22, Math.round((b.pct||0.65)*78)));
+      return `<div class="wko-bar" style="width:${wPct.toFixed(1)}%;height:${hPct}%;background:${zoneColor(b.zone||2)}" title="${esc(b.label||'Block')}"></div>`;
+    }).join('') + `</div>`;
+}
+function downloadZwo(idx){
+  const it = DATA.items[idx];
+  if(!it || !it.zwo_xml) return;
+  const blob = new Blob([it.zwo_xml], {type: 'application/xml'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = it.zwo_filename || `${it.start}_workout.zwo`;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(()=>{ document.body.removeChild(a); URL.revokeObjectURL(url); }, 150);
+}
+function kwPhaseMap(){
+  const m = (DATA.coach && DATA.coach.macro && DATA.coach.macro.weeks) || [];
+  const out = {};
+  for(const w of m){ out[String(w.kw).replace(/^0+/,'')] = w; }
+  return out;
+}
 function showItemModal(idx){
   const it = DATA.items[idx];
   if(!it) return;
@@ -1036,9 +1581,24 @@ function showItemModal(idx){
     <span class="tag">${esc(fmtDateDE(it.start))}${it.end!==it.start?' – '+esc(fmtDateDE(it.end)):''} · KW ${kw}</span>
     ${it.time?`<span class="tag">🕒 ${esc(it.time)}</span>`:''}
     <span class="tag ${it.delta<0?'overdue':'ok'}">${esc(deltaLabel(it.delta))} (${(it.delta/7).toFixed(1)}w)</span>
+    ${it.np_w?`<span class="tag ok">⚡ NP ${it.np_w} W</span>`:''}
+    ${it.avg_hr?`<span class="tag">❤️ ${it.avg_hr} bpm</span>`:''}
   `;
+  let extra = '';
+  if(it.visual_blocks && it.visual_blocks.length){
+    extra += `<div><strong>Intervall-Struktur (${it.total_min||0} min):</strong>${renderWkoBars(it, true)}</div>`;
+  }
+  if(it.feedback){
+    extra += `<div><strong>Athleten-Feedback:</strong><br><span style="color:#6ee7b7">${esc(it.feedback)}</span></div>`;
+  } else if(it.feedback_pending){
+    extra += `<div style="color:#fde68a"><strong>⚠ Check-in offen:</strong> Noch keine subjektive Notiz (RPE / Beine) hinterlegt.<br><code>atlas.py coach note --date ${esc(it.start)} --text "..."</code></div>`;
+  }
+  if(it.zwo_xml){
+    extra += `<div style="margin-top:4px"><button class="btn-act" style="border-color:var(--workout);color:#6ee7b7" onclick="downloadZwo(${idx})">⬇ .zwo Workout herunterladen (${esc(it.zwo_filename||'workout.zwo')})</button></div>`;
+  }
   document.getElementById('m-body').innerHTML = `
     <div><strong>Beschreibung:</strong><br>${esc(it.what)}</div>
+    ${extra}
     <div style="color:var(--muted-hi);font-size:.76rem"><strong>Quelle im Brain:</strong> <code>${esc(it.rel)}</code></div>
   `;
   const copyBtn = document.getElementById('m-copy');
@@ -1091,10 +1651,21 @@ function renderKPIs(){
   if(filter==='coach'){
     coachRib.classList.add('show');
     document.getElementById('coach-sched').textContent = coach.schedule ? `🕒 Primäres Trainingsfenster: ${coach.schedule}` : '';
+    const mBanner = document.getElementById('macro-banner');
+    const mp = coach.macro || {active_phase:'Off-Season', stale:true, stale_reason:'Initialisierung offen', updated:''};
+    const fbPend = (coach.pending_feedback||[]).length;
+    mBanner.innerHTML = `
+      <div><strong>🧭 Makro-Phase:</strong> <span style="color:var(--accent);font-weight:700">${esc(mp.active_phase||'Base')}</span> ${mp.updated?`<span style="color:var(--muted-hi)">(Stand ${esc(mp.updated)})</span>`:''}</div>
+      <div class="macro-badges">
+        <span class="tag ${mp.stale?'med':'ok'}">${mp.stale?'⚠ Makroplan fällig ('+esc(mp.stale_reason)+')':'✓ Makroplan aktuell'}</span>
+        <span class="tag ${coach.strava_connected?'ok':'low'}">${coach.strava_connected?'✓ Strava verbunden':'⚡ Strava via atlas.py coach auth-strava'}</span>
+        ${fbPend?`<span class="tag med">💬 ${fbPend} Ride-Check-in(s) offen</span>`:''}
+      </div>
+    `;
     const chips = document.getElementById('phys-chips');
     chips.innerHTML = (coach.metrics && coach.metrics.length) ? coach.metrics.map(m =>
       `<div class="phys-chip"><span>${esc(m.icon||'⚡')}</span><span class="k">${esc(m.label)}:</span><strong class="v">${esc(m.value)}</strong></div>`
-    ).join('') : '<div class="phys-chip"><span class="k">Tipp:</span><strong class="v">Leistungsdaten in self/ oder radsport/ hinterlegen</strong></div>';
+    ).join('') : '<div class="phys-chip"><span class="k">Tipp:</span><strong class="v">Leistungsdaten in coach/profile.md hinterlegen</strong></div>';
   } else {
     coachRib.classList.remove('show');
   }
@@ -1202,13 +1773,16 @@ function renderMain(){
       DOWS.map((d,i)=>`<div class="dow-cell${i>=5?' wknd':''}">${d}</div>`).join('') +
       `</div><div class="month-grid">`;
 
+    const kwMap = kwPhaseMap();
     for(let i=0;i<totalCells;i++){
       const d = new Date(start.getFullYear(), start.getMonth(), start.getDate()+i);
       const ds = iso(d);
       const dowIdx = i % 7;
       if(dowIdx === 0){
         const kw = getKW(d);
-        html += `<div class="kw-cell" onclick="openWeekOf('${ds}')" title="Wochenansicht KW ${kw} öffnen">${kw}</div>`;
+        const mw = filter==='coach' ? kwMap[String(kw)] : null;
+        const phBadge = mw && mw.phase ? `<span class="kw-phase" title="${esc(mw.focus||mw.phase)}">${esc(mw.phase.slice(0,6))}</span>` : '';
+        html += `<div class="kw-cell" onclick="openWeekOf('${ds}')" title="Wochenansicht KW ${kw} öffnen"><span>${kw}</span>${phBadge}</div>`;
       }
       const isOther = d.getMonth() !== m;
       const isToday = ds === DATA.today;
@@ -1226,13 +1800,16 @@ function renderMain(){
       for(const {it, idx} of shown){
         const c = compactTitle(it.what);
         const spanInfo = it.start !== it.end ? ` (${it.start.slice(8)}–${it.end.slice(8)})` : '';
+        const fbBadge = it.kind==='workout' && it.status==='done' ? (it.feedback ? `<span class="fb-badge ok" title="${esc(it.feedback)}">✓</span>` : (it.feedback_pending ? `<span class="fb-badge warn" title="Check-in Feedback fehlt">⚠</span>` : '')) : '';
         html += `<div class="${pillClass(it)}" onclick="event.stopPropagation();showItemModal(${idx})" title="${esc(it.what)} (${esc(it.rel)})">
           <div class="pill-top">
             <span class="pill-ico">${icon(it)}</span>
             ${it.time?`<span class="pill-time">${esc(it.time)}</span>`:''}
             <span class="pill-txt">${esc(c.main)}${esc(spanInfo)}</span>
+            ${fbBadge}
           </div>
           ${c.meta?`<div class="pill-meta">${esc(c.meta)}</div>`:''}
+          ${it.kind==='workout' ? renderWkoBars(it, false) : ''}
         </div>`;
       }
       if(more > 0){
@@ -1360,7 +1937,12 @@ function renderSidebar(){
       <div class="row" onclick="showItemModal(${idx})">
         <div class="row-main">
           <div class="row-title">${icon(it)} ${esc(it.what)}</div>
-          <div class="row-sub">${fmtDateDE(it.start)} · ${esc(it.subkind||'workout')}</div>
+          <div class="row-sub">
+            <span>${fmtDateDE(it.start)} · ${esc(it.subkind||'workout')}</span>
+            ${it.zwo_xml?`<span class="tag low" onclick="event.stopPropagation();downloadZwo(${idx})" title=".zwo herunterladen">⬇ .zwo</span>`:''}
+            ${it.feedback?`<span class="tag ok" title="${esc(it.feedback)}">✓ Notiz</span>`:(it.feedback_pending?`<span class="tag med">⚠ Check-in</span>`:'')}
+          </div>
+          ${renderWkoBars(it, false)}
         </div>
         <span class="tag ${it.status==='done'?'ok':''}">${it.status==='done'?'✓ erledigt':deltaLabel(it.delta)}</span>
       </div>
@@ -1369,11 +1951,23 @@ function renderSidebar(){
       <div class="code-hint" onclick="navigator.clipboard.writeText('- [ ] ${DATA.today} [workout:cycling] 90m Zone 2 / SweetSpot')">📋 Workout-Zeile kopieren</div>
     </div>`;
 
-    // Card 3: Blockers & Busy Windows (28d)
+    // Card 3: 3-Epoch Power Curve & Blockers (28d)
     const blk = DATA.items.map((it,idx)=>({it,idx})).filter(x => x.it.delta>=0 && x.it.delta<=28 && x.it.status==='open' && (x.it.kind==='blocked' || (x.it.kind==='event' && x.it.time)));
-    s3T.textContent = '🚫 Blocker & Zeitfenster (28d)';
-    s3C.textContent = blk.length;
-    s3L.innerHTML = blk.length ? blk.map(({it,idx}) => `
+    const pc = (coach.power_curve && coach.power_curve.fresh) || {};
+    const pcf = (coach.power_curve && coach.power_curve.fatigued) || {};
+    const durs = ['5s','1m','5m','20m','60m'].filter(d => pc[d]);
+    s3T.textContent = '⚡ 3-Epochen Power Curve & Blocker';
+    s3C.textContent = blk.length ? `${blk.length} Blocker` : 'MMP';
+    let c3Html = '';
+    if(durs.length){
+      c3Html += `<table class="pcurve-tbl"><thead><tr><th>Dauer</th><th>42d</th><th>90d</th><th>365d</th><th>&gt;1500kJ</th></tr></thead><tbody>` +
+        durs.map(d => {
+          const r = pc[d] || {};
+          const rf = pcf[d] || {};
+          return `<tr><td>${d}</td><td>${esc(r['42d']||'—')}</td><td>${esc(r['90d']||'—')}</td><td>${esc(r['365d']||'—')}</td><td>${esc(rf['42d']||rf['90d']||'—')}</td></tr>`;
+        }).join('') + `</tbody></table>`;
+    }
+    c3Html += blk.length ? blk.map(({it,idx}) => `
       <div class="row" onclick="showItemModal(${idx})">
         <div class="row-main">
           <div class="row-title">${icon(it)} ${it.time?esc(it.time)+' ':''}${esc(it.what)}</div>
@@ -1381,7 +1975,8 @@ function renderSidebar(){
         </div>
         <span class="tag high">${deltaLabel(it.delta)}</span>
       </div>
-    `).join('') : `<div class="empty-box" style="border-color:rgba(16,185,129,0.3);color:#a7f3d0">✅ 100 % freie Trainingsverfügbarkeit in den nächsten 28 Tagen (keine Sperrtermine).</div>`;
+    `).join('') : `<div class="empty-box" style="border-color:rgba(16,185,129,0.3);color:#a7f3d0">✅ 100 % freie Trainingsverfügbarkeit in den nächsten 28 Tagen.</div>`;
+    s3L.innerHTML = c3Html;
   } else if(filter==='todo'){
     // Card 1: Open Backlog To-Dos
     s1T.textContent = '☑️ Offene To-Dos (Backlog)';
@@ -1627,9 +2222,47 @@ def render_calendar_html(idx=None, start_server=False):
     todos = [{"status": t["status"], "prio": t["prio"], "what": t["what"], "rel": t["rel"]}
              for t in open_todos(include_done=False)]
     try:
-        coach = _extract_coach_context(idx)
+        coach = _extract_coach_context(idx, cal_items=raw_items)
+        c_state = load_coach_state()
     except Exception:
-        coach = {"metrics": [], "macro_goals": [], "schedule": ""}
+        coach = {"metrics": [], "ftp_watts": 275, "macro_goals": [], "schedule": ""}
+        c_state = {"activities": []}
+    ftp_w = coach.get("ftp_watts", 275) or 275
+    acts_by_date = {}
+    for a in c_state.get("activities", []):
+        if isinstance(a, dict) and a.get("date"):
+            acts_by_date.setdefault(a["date"], []).append(a)
+    for it in serial:
+        if it.get("kind") != "workout":
+            continue
+        sport = it.get("subkind") or "cycling"
+        spec = parse_workout_spec(it.get("what", ""), ftp_watts=ftp_w, sport=sport)
+        it["visual_blocks"] = spec.get("visual_blocks", [])
+        it["total_min"] = spec.get("total_min", 0)
+        if sport == "cycling" and spec.get("has_intervals"):
+            it["zwo_xml"] = compile_zwo_xml(spec, date_str=it["start"], ftp_watts=ftp_w)
+            slug = re.sub(r"[^a-z0-9]+", "-", spec.get("title", "workout").lower()).strip("-") or "workout"
+            it["zwo_filename"] = f"{it['start']}_{slug}.zwo"
+        m_fb = re.search(r"\[feedback:\s*([^\]]+)\]", it.get("what", ""), re.I)
+        if m_fb:
+            fb_val = m_fb.group(1).strip()
+            if fb_val.lower() == "pending":
+                it["feedback_pending"] = True
+            else:
+                it["feedback"] = fb_val
+        day_acts = acts_by_date.get(it["start"], [])
+        if day_acts:
+            act = day_acts[0]
+            it["strava_id"] = act.get("id")
+            if act.get("np_w"):
+                it["np_w"] = act.get("np_w")
+            if act.get("avg_hr"):
+                it["avg_hr"] = act.get("avg_hr")
+            if act.get("feedback") and str(act["feedback"]).lower() != "pending":
+                it["feedback"] = str(act["feedback"]).strip()
+                it["feedback_pending"] = False
+            elif it.get("status") == "done" and not it.get("feedback"):
+                it["feedback_pending"] = True
     payload = {"today": dt.date.today().isoformat(), "items": serial, "todos": todos, "coach": coach}
     html = CAL_TEMPLATE.replace("__DATA_JSON__", json.dumps(payload, ensure_ascii=False))
     cache_dir = os.path.dirname(CAL_HTML)
@@ -1751,6 +2384,15 @@ def session_text(cwd, session):
                 parts.append(f"Visual calendar: [📅 Kalender öffnen]({cal_uri}) (include this clickable link in the briefing)")
             except Exception:
                 pass
+        try:
+            if "coach" in st.get("modules", []) or os.path.isdir(os.path.join(BRAIN, "coach")):
+                c_state = load_coach_state()
+                pend = c_state.get("pending_feedback", [])
+                if pend:
+                    p0 = pend[0]
+                    parts.append(f"Coach check-in: Ride '{p0.get('name', 'Workout')}' on {p0.get('date')} ({p0.get('duration_min', 0)}m, NP {p0.get('np_w') or '—'}W) has no athlete feedback note yet. Ask 1 short question how it felt (RPE/legs) and save via `atlas.py coach note --date {p0.get('date')} --text \"...\"`.")
+        except Exception:
+            pass
         inbox = os.path.join(BRAIN, "inbox")
         waiting = [f for f in os.listdir(inbox) if not f.startswith(".") and f.lower() != "readme.md"] \
             if os.path.isdir(inbox) else []
@@ -1981,6 +2623,45 @@ def _session(st, session):
     return s
 
 
+COACH_RX_EXPLICIT = re.compile(r"(?i)(?:^|\s)/atlas-coach\b|\b(?:sport-?coach|atlas\s+coach)\b|^\s*coach\b")
+COACH_RX_MACRO = re.compile(
+    r"(?i)\b(?:makro-?plan\w*|macro\s*plan\w*|saison-?plan\w*|jahres-?plan\w*|periodisier\w*|"
+    r"trainings-?phas\w*|saison-?ziel\w*|bis\s+zum\s+(?:giro|rennen|event|wettkampf))\b"
+)
+COACH_RX_PLAN14 = re.compile(
+    r"(?i)\b(?:2-?wochen-?plan\w*|zwei-?wochen\w*|14-?\s*tage\w*|14d\b|n[aä]chsten?\s+(?:zwei\s+)?wochen?\s+(?:planen|train\w*|workouts?)|"
+    r"trainingsplan\s+(?:f[uü]r|schreiben|erstellen|planen)|workouts?\s+(?:planen|erstellen|schreiben)|wochenplan\s+training)\b"
+)
+COACH_RX_CHECKIN = re.compile(
+    r"(?i)\b(?:rpe\s*\d|beine\s+waren|puls\s+war|strava\s+sync\w*|ride\s+check-?in|feedback\s+zum\s+(?:ride|training|workout)|"
+    r"training\s+gestern\s+war|einheit\s+gestern)\b"
+)
+COACH_RX_DAILY = re.compile(
+    r"(?i)\b(?:mein\s+workout|workout\s+heute|workout\s+morgen|was\s+trainier\w+\s+ich|heutiges?\s+(?:workout|training)|"
+    r"training\s+heute|training\s+morgen|intervall-?training|\.zwo\b|karoo\s+workout|ftp\s+test|sweet\s*spot\s+workout)\b"
+)
+
+
+def detect_coach_mode(prompt, idx=None):
+    """Return (mode, reason, macro_info) when prompt requests the Sport-Coach, else (None, '', None)."""
+    low = prompt.strip()
+    if not low:
+        return None, "", None
+    explicit = bool(COACH_RX_EXPLICIT.search(low))
+    if COACH_RX_MACRO.search(low):
+        mode, why = "macro", "macro periodization request"
+    elif COACH_RX_PLAN14.search(low):
+        mode, why = "plan-14d", "14-day workout planning request"
+    elif COACH_RX_CHECKIN.search(low):
+        mode, why = "checkin", "ride feedback / Strava check-in"
+    elif COACH_RX_DAILY.search(low) or explicit:
+        mode, why = "daily", ("explicit /atlas-coach" if explicit else "daily workout / adaptation request")
+    else:
+        return None, "", None
+    macro = parse_macro_plan()
+    return mode, why, macro
+
+
 def prompt_text(prompt, cwd, session):
     idx = load_index(budget=INDEX_BUDGET_S)
     st = _state()
@@ -2000,6 +2681,18 @@ def prompt_text(prompt, cwd, session):
                      ".agents/rules) once; after that work there like a normal coding agent.")
         sess.setdefault("routed", []).append(p["slug"])
         sess["project"] = p["slug"]
+    coach_enabled = "coach" in st.get("modules", []) or os.path.isdir(os.path.join(BRAIN, "coach"))
+    if (coach_enabled or COACH_RX_EXPLICIT.search(prompt)) and not routes:
+        c_mode, c_why, c_macro = detect_coach_mode(prompt, idx)
+        if c_mode:
+            stale_note = ""
+            if c_macro and c_macro.get("stale") and c_mode in ("plan-14d", "macro"):
+                stale_note = f" Macro plan is STALE ({c_macro.get('stale_reason')}) -> update brain/coach/macro-plan.md FIRST before writing 14d workouts."
+            lines.append(
+                f"Atlas coach -> mode '{c_mode}' ({c_why}). Run `python -I {_show('_atlas/tools/atlas.py', cwd)} coach context --mode {c_mode}` "
+                f"and follow {_show('_atlas/procedures/coach.md', cwd)}.{stale_note}"
+            )
+            sess["coach_mode"] = c_mode
     kind = "explicit" if SIGNAL_EXPLICIT.search(prompt) else ("correction" if SIGNAL_CORRECTION.search(prompt) else "")
     if kind:
         sess["signal"] = kind

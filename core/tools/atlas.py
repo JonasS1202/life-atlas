@@ -291,6 +291,9 @@ def cmd_init(args):
     for d in ("inbox", "journal", "people", "areas", "projects", "howto", "self", "calendar", "skills", "_secrets",
               "_archive", os.path.join("_atlas", "memory"), os.path.join("_atlas", "migrations")):
         os.makedirs(os.path.join(brain, d), exist_ok=True)
+    if "coach" in modules:
+        os.makedirs(os.path.join(brain, "coach", "workouts"), exist_ok=True)
+        _ensure_coach_index_link(brain, execute=True)
     os.makedirs(os.path.join(root, "code"), exist_ok=True)
     mem = os.path.join(brain, "_atlas", "memory", "MEMORY.md")
     if not os.path.exists(mem):
@@ -752,7 +755,7 @@ def cmd_probe(args):
 # ================================================================= check
 
 LINK_RX = re.compile(r"\[[^\]]*\]\(([^)\s]+)\)")
-TICK_RX = re.compile(r"`((?:areas|projects|people|howto|journal|inbox|self|skills|calendar|_atlas)/[^`\s]+\.md)`")
+TICK_RX = re.compile(r"`((?:areas|projects|people|howto|journal|inbox|self|skills|calendar|coach|_atlas)/[^`\s]+\.md)`")
 HUB_SKIP = ("journal/", "inbox/", "_archive/", "_secrets/", "_atlas/")
 
 
@@ -861,7 +864,7 @@ def cmd_check(args):
     idx = hk.load_index()
     vocab = hk.tag_vocab()
     canon = {s: t for t, syns in vocab.items() for s in syns}
-    content = [r for r in idx if r.startswith(("areas/", "people/", "projects/", "howto/", "self/"))
+    content = [r for r in idx if r.startswith(("areas/", "people/", "projects/", "howto/", "self/", "coach/"))
                and not r.endswith("README.md")]
     no_sum = [r for r in content if not idx[r].get("summary")]
     no_tag = [r for r in content if not idx[r].get("tags")]
@@ -1319,6 +1322,1139 @@ def cmd_calendar(args):
     if args.ics:
         _write_ics(args.ics, _deadlines(brain, None if args.all else args.days))
     _open_visual_calendar(hk, idx, getattr(args, "open", False))
+
+
+# ================================================================= coach (Cycling, Running & Strength)
+
+COACH_DURATIONS = (
+    ("5s", 5), ("15s", 15), ("30s", 30), ("1m", 60), ("3m", 180),
+    ("5m", 300), ("8m", 480), ("12m", 720), ("20m", 1200), ("30m", 1800), ("60m", 3600),
+)
+
+COACH_DEFAULT_README = """---
+summary: Atlas Sport-Coach hub: athlete profile, thresholds, macro periodization, 3-epoch power curve, and activity log
+tags: [atlas, sport]
+aliases: [Sport Coach, Trainingssteuerung, Radsport Coach, Lauf Coach]
+---
+# Atlas · Sport-Coach Hub
+
+Stand: {{DATE}}. Native training and physiology hub for {{USER_NAME}} (Cycling, Running & Strength).
+
+## Architecture & Pages
+
+| Page | Purpose |
+|---|---|
+| [profile.md](profile.md) | Athlete biometrics, cycling & running thresholds (FTP, zones, HRmax), weekly time budget, learned bio-rules |
+| [macro-plan.md](macro-plan.md) | Season macro periodization (Base, Build, Peak, Taper, Deload) anchored to `[goal]` and `[blocked]` in [../calendar/README.md](../calendar/README.md) |
+| [power-curve.md](power-curve.md) | 3-Epoch Mean Maximal Power (`42d` · `90d` · `365d`, Fresh vs. Fatigued `> 1500 kJ`) & Running Best Paces |
+| [activities.md](activities.md) | 3-Tier Strava activity log, interval compliance, and subjective athlete feedback (`RPE` / feel) |
+| `workouts/` | Deterministically generated `.zwo` workout files for Hammerhead Karoo / Zwift / Wahoo / Elite trainers |
+"""
+
+COACH_DEFAULT_PROFILE = """---
+summary: Athlete physiology profile: biometrics, cycling FTP & power zones, running threshold & paces, weekly time budget, bio-rules
+tags: [self, sport]
+aliases: [Athletenprofil, FTP, Trainingszonen, Leistungsdaten, Schwellenwerte]
+---
+# Athlete Profile & Thresholds
+
+Stand: {{DATE}}. Central physiological parameters and scheduling rules for {{USER_NAME}}.
+
+## 1. Biometrics & Core Thresholds
+
+| Metric | Value | Notes / Source |
+|---|---|---|
+| **Biometrie** | {biometrie} | Height & Current Weight |
+| **FTP (Cycling)** | {ftp} | Functional Threshold Power |
+| **Max HR / Rest HR** | {hr} | Heart rate anchors |
+| **VO₂max (est.)** | {vo2max} | Aerobic ceiling |
+| **Running Threshold** | — min/km | 10k / LT2 pace anchor |
+| **Weekly Time Budget** | {volumen} | Target endurance + strength budget |
+| **Athletik & Kraft** | {kraft} | Upper body / core / injury prevention |
+
+## 2. Schedule & Time Windows
+
+- **Weekday Window (Mo–Fr):** {schedule} (Indoor Smart-Trainer / Evening Run / Strength)
+- **Weekend Window (Sa–So):** Flexible for long outdoor endurance rides (`2.5–4.5h`) or key race-pace sessions
+- **Hard Rule:** Multi-day `[blocked]` entries and timed `[event]` entries in [../calendar/README.md](../calendar/README.md) are strict constraints.
+
+## 3. Learned Coaching Rules & Bio-Feedback
+
+- Document lasting physiological insights here (e.g., indoor cooling limits, nutrition per hour, recovery needs after `> 1500 kJ` rides, muscular vs. central fatigue patterns).
+"""
+
+COACH_DEFAULT_MACRO = """---
+summary: Season macro periodization: weekly training phases (Base, Build, Peak, Taper, Deload) and target volume up to A/B goals
+tags: [sport, planung]
+updated: {{DATE}}
+active_phase: Base
+goals_hash: {goals_hash}
+---
+# Macro Periodization Plan
+
+Stand: {{DATE}}. High-level season roadmap for {{USER_NAME}}, linking `[goal:A/B]` and `[blocked]` dates from [../calendar/README.md](../calendar/README.md) to weekly training blocks.
+
+> **Staleness Contract:** The Coach automatically checks this file before every 14-day workout planning run. If `updated:` is older than `14` days or `goals_hash:` no longer matches the active `[goal]` and multi-day `[blocked]` entries in [../calendar/README.md](../calendar/README.md), the Macro Planner updates this roadmap first.
+
+## 1. Season Goals & Anchors
+
+- Synced with `[goal:A]` and `[goal:B]` in [../calendar/README.md](../calendar/README.md).
+
+## 2. Weekly Periodization Table
+
+| KW | Monday | Phase | Target Volume | Cycling Focus | Running / Strength Focus | Blockers & Notes |
+|---|---|---|---|---|---|---|
+"""
+
+COACH_DEFAULT_PCURVE = """---
+summary: 3-Epoch Cycling Power Curve (42d Current, 90d Meso, 365d Season; Fresh vs. Fatigued >1500 kJ) and Running Best Paces
+tags: [sport]
+updated: {{DATE}}
+---
+# 3-Epoch Power & Pace Curve
+
+Stand: {{DATE}}. Precomputed peak performance matrix across 3 time horizons (`42d` Current Form · `90d` Meso Block · `365d` Season/All-Time) from Strava 1Hz streams.
+
+## 1. Cycling Mean Maximal Power — Fresh (0 kJ+)
+
+| Duration | 42d (Current) | 90d (Meso) | 365d (Season) | W/kg (42d) |
+|---|---|---|---|---|
+| **5s** | — | — | — | — |
+| **15s** | — | — | — | — |
+| **30s** | — | — | — | — |
+| **1m** | — | — | — | — |
+| **3m** | — | — | — | — |
+| **5m** | — | — | — | — |
+| **8m** | — | — | — | — |
+| **12m** | — | — | — | — |
+| **20m** | — | — | — | — |
+| **30m** | — | — | — | — |
+| **60m** | — | — | — | — |
+
+## 2. Cycling Durability — Fatigued (`> 1500 kJ` Prior Work)
+
+| Duration | 42d (`>1500 kJ`) | 90d (`>1500 kJ`) | 365d (`>1500 kJ`) | Retention vs. Fresh |
+|---|---|---|---|---|
+| **5s** | — | — | — | — |
+| **1m** | — | — | — | — |
+| **5m** | — | — | — | — |
+| **20m** | — | — | — | — |
+
+## 3. Running Best Split Paces
+
+| Distance | 42d (Current) | 90d (Meso) | 365d (Season) |
+|---|---|---|---|
+| **1 km** | — | — | — |
+| **3 km** | — | — | — |
+| **5 km** | — | — | — |
+| **10 km** | — | — | — |
+"""
+
+COACH_DEFAULT_ACTIVITIES = """---
+summary: 3-Tier Strava activity log, physiological telemetry (NP, IF, HR, kJ, MMP peaks), and athlete ride feedback
+tags: [sport]
+updated: {{DATE}}
+---
+# Activity & Feedback Log (3-Tier History)
+
+Stand: {{DATE}}. Synced via `atlas.py coach sync` and annotated via `atlas.py coach note`.
+
+## Tier 1 · Recent Activities (Last 21 Days — Full Telemetry & Feedback)
+
+*(No synced activities in the last 21 days yet. Run `atlas.py coach sync --execute` after connecting Strava.)*
+
+## Tier 2 · Meso History (Weeks 4–12 — Compact Log)
+
+| Date | Sport | Activity | Duration | Load / NP | HR (Avg/Max) | Feedback |
+|---|---|---|---|---|---|---|
+
+## Tier 3 · Macro Block Totals (Weeks 13–52)
+
+| Month / Block | Rides / Runs | Total Hours | Total Work (kJ) | Key Highlights |
+|---|---|---|---|---|
+"""
+
+
+def _strava_env_path(brain):
+    return os.path.join(brain, "_secrets", "strava.env")
+
+
+def _load_strava_env(brain):
+    p = _strava_env_path(brain)
+    out = {}
+    if not os.path.isfile(p):
+        return out
+    for line in read(p).splitlines():
+        s = line.strip()
+        if not s or s.startswith("#") or "=" not in s:
+            continue
+        k, _, v = s.partition("=")
+        out[k.strip()] = v.strip().strip("\"'")
+    return out
+
+
+def _save_strava_env(brain, env_dict):
+    p = _strava_env_path(brain)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    lines = ["# Strava API credentials & OAuth tokens (local only, git-ignored in _secrets/)"]
+    for k in ("STRAVA_CLIENT_ID", "STRAVA_CLIENT_SECRET", "STRAVA_ACCESS_TOKEN",
+              "STRAVA_REFRESH_TOKEN", "STRAVA_EXPIRES_AT", "STRAVA_ATHLETE_ID"):
+        if env_dict.get(k):
+            lines.append(f"{k}={env_dict[k]}")
+    for k, v in sorted(env_dict.items()):
+        if k not in ("STRAVA_CLIENT_ID", "STRAVA_CLIENT_SECRET", "STRAVA_ACCESS_TOKEN",
+                     "STRAVA_REFRESH_TOKEN", "STRAVA_EXPIRES_AT", "STRAVA_ATHLETE_ID") and v:
+            lines.append(f"{k}={v}")
+    write(p, "\n".join(lines) + "\n")
+    if os.name != "nt":
+        try:
+            os.chmod(p, 0o600)
+        except OSError:
+            pass
+
+
+def _coach_init(root, brain, hk, execute=True, quiet=False):
+    """Scaffold brain/coach/ files, harvest existing athlete thresholds from brain/self/ or areas/, and link INDEX.md."""
+    values = _router_values(brain, root)
+    coach_dir = os.path.join(brain, "coach")
+    workouts_dir = os.path.join(coach_dir, "workouts")
+    idx = hk.load_index()
+    idx_no_prof = {k: v for k, v in idx.items() if k != "coach/profile.md"}
+    prof_path = os.path.join(brain, "coach", "profile.md")
+    prof_is_skeleton = (not os.path.isfile(prof_path)) or any(
+        s in read(prof_path) for s in ("186 cm", "75.0 kg", "180 cm", "— cm · — kg")
+    )
+    if prof_is_skeleton and os.path.isfile(prof_path):
+        # Temporarily hide skeleton profile.md so _extract_coach_context harvests from self/ and areas/
+        tmp_p = prof_path + ".tmp_init"
+        os.replace(prof_path, tmp_p)
+        try:
+            ctx = hk._extract_coach_context(idx_no_prof)
+        finally:
+            os.replace(tmp_p, prof_path)
+    else:
+        ctx = hk._extract_coach_context(idx_no_prof if not os.path.isfile(prof_path) else idx)
+    m_map = {m["label"]: m["value"] for m in ctx.get("metrics", [])}
+    ghash = hk.compute_goals_hash()
+
+    prof_filled = render(COACH_DEFAULT_PROFILE, values).format(
+        biometrie=m_map.get("Biometrie", "— cm · — kg"),
+        ftp=m_map.get("FTP", "275 W"),
+        hr=m_map.get("Herzfrequenz", "— bpm"),
+        vo2max=m_map.get("VO₂max", "— ml/kg/min"),
+        volumen=m_map.get("Volumen", "8–10 h/week"),
+        kraft=m_map.get("Athletik & Kraft", "1–3x/week"),
+        schedule=ctx.get("schedule", "17:00 – 20:00 Uhr"),
+    )
+    macro_filled = render(COACH_DEFAULT_MACRO, values).format(goals_hash=ghash)
+    files = [
+        ("coach/README.md", render(COACH_DEFAULT_README, values)),
+        ("coach/profile.md", prof_filled),
+        ("coach/macro-plan.md", macro_filled),
+        ("coach/power-curve.md", render(COACH_DEFAULT_PCURVE, values)),
+        ("coach/activities.md", render(COACH_DEFAULT_ACTIVITIES, values)),
+    ]
+    created = []
+    if execute:
+        os.makedirs(workouts_dir, exist_ok=True)
+    for rel, content in files:
+        dst = os.path.join(brain, rel)
+        if not os.path.isfile(dst) or (not quiet and rel == "coach/profile.md" and prof_is_skeleton and m_map):
+            created.append(rel)
+            if execute:
+                write(dst, content)
+    macro_dst = os.path.join(brain, "coach", "macro-plan.md")
+    if execute and not quiet and os.path.isfile(macro_dst):
+        m_txt = read(macro_dst)
+        if "goals_hash: none" in m_txt and ghash != "none":
+            write(macro_dst, m_txt.replace("goals_hash: none", f"goals_hash: {ghash}", 1))
+    linked = _ensure_coach_index_link(brain, execute=execute)
+    st = get_state(brain)
+    mods = list(st.get("modules", []))
+    mod_added = False
+    if "coach" not in mods:
+        mod_added = True
+        if execute:
+            mods.append("coach")
+            set_state(brain, modules=mods)
+    if execute:
+        hk.load_index()
+    if not quiet:
+        say(f"coach init ({'applied' if execute else 'dry-run'}): "
+            f"{len(created)} file(s) created ({', '.join(created) or 'already present'}), "
+            f"INDEX.md {'linked' if linked else 'ok'}, "
+            f"module {'enabled' if mod_added else 'already active'}.")
+    return created
+
+
+def _extract_profile_numbers(brain, hk):
+    """Return (ftp_watts, weight_kg) from brain/coach/profile.md or _extract_coach_context."""
+    ftp_w = 275
+    weight_kg = 67.0
+    prof_path = os.path.join(brain, "coach", "profile.md")
+    text = read(prof_path) if os.path.isfile(prof_path) else ""
+    if text:
+        for line in text.splitlines():
+            low = line.lower()
+            if "ftp" in low and "|" in line:
+                m = re.search(r"(\d{2,3})\s*w\b", low)
+                if m:
+                    ftp_w = int(m.group(1))
+            if ("biometrie" in low or "weight" in low or "körpermaße" in low) and "|" in line:
+                m_kg = re.search(r"(\d{2,3}(?:[.,]\d)?)\s*kg\b", low)
+                if m_kg:
+                    weight_kg = float(m_kg.group(1).replace(",", "."))
+    return ftp_w, weight_kg
+
+
+def _mmp_from_watts(watts):
+    """Compute Mean Maximal Power dict for COACH_DURATIONS in O(N) using prefix sums."""
+    n = len(watts)
+    if not n:
+        return {}
+    pref = [0.0] * (n + 1)
+    for i, w in enumerate(watts):
+        pref[i + 1] = pref[i] + max(0.0, float(w or 0.0))
+    peaks = {}
+    for label, sec in COACH_DURATIONS:
+        if n < sec:
+            continue
+        best = 0.0
+        for i in range(n - sec + 1):
+            avg = (pref[i + sec] - pref[i]) / sec
+            if avg > best:
+                best = avg
+        if best > 0:
+            peaks[label] = int(round(best))
+    return peaks
+
+
+def _compute_stream_metrics(streams, ftp_watts=275, weight_kg=67.0, sport="cycling"):
+    """Compute NP, work_kj, IF, TSS, Fresh MMP, Fatigued MMP (>1500 kJ), Pw:Hr decoupling, and running split paces."""
+    watts = [float(x or 0.0) for x in (streams.get("watts") or [])]
+    hr = [float(x or 0.0) for x in (streams.get("heartrate") or [])]
+    vel = [float(x or 0.0) for x in (streams.get("velocity_smooth") or [])]
+    out = {}
+    if watts:
+        n = len(watts)
+        joules = sum(max(0.0, w) for w in watts)
+        out["work_kj"] = int(round(joules / 1000.0))
+        out["avg_w"] = int(round(joules / n))
+        # 30-second rolling average for Normalized Power (NP)
+        if n >= 30:
+            w_sum = sum(watts[:30])
+            fourth_sum = (w_sum / 30.0) ** 4
+            cnt = 1
+            for i in range(30, n):
+                w_sum += watts[i] - watts[i - 30]
+                fourth_sum += (max(0.0, w_sum) / 30.0) ** 4
+                cnt += 1
+            np_w = int(round((fourth_sum / cnt) ** 0.25))
+        else:
+            np_w = out["avg_w"]
+        out["np_w"] = np_w
+        if ftp_watts > 0:
+            if_val = round(np_w / float(ftp_watts), 2)
+            out["if"] = if_val
+            out["tss"] = int(round((n * np_w * if_val) / (ftp_watts * 3600.0) * 100.0))
+        out["peaks_fresh"] = _mmp_from_watts(watts)
+        # Fatigued MMP after accumulating 1,500,000 Joules (1500 kJ)
+        cum_j = 0.0
+        idx_1500 = None
+        for i, w in enumerate(watts):
+            cum_j += max(0.0, w)
+            if cum_j >= 1_500_000.0:
+                idx_1500 = i + 1
+                break
+        if idx_1500 is not None and idx_1500 < n:
+            out["peaks_fatigued"] = _mmp_from_watts(watts[idx_1500:])
+        else:
+            out["peaks_fatigued"] = {}
+        # Aerobic Decoupling (Pw:Hr %) between 1st half and 2nd half (after warmup 10m)
+        if n >= 1200 and len(hr) == n:
+            start_i = 600 if n >= 2400 else 0
+            mid_i = start_i + (n - start_i) // 2
+            w1 = sum(watts[start_i:mid_i]) / max(1, mid_i - start_i)
+            h1 = sum(hr[start_i:mid_i]) / max(1, mid_i - start_i)
+            w2 = sum(watts[mid_i:n]) / max(1, n - mid_i)
+            h2 = sum(hr[mid_i:n]) / max(1, n - mid_i)
+            if h1 > 80 and h2 > 80 and w1 > 50:
+                ef1 = w1 / h1
+                ef2 = w2 / h2
+                out["decoupling_pct"] = round(((ef1 - ef2) / ef1) * 100.0, 1)
+    if hr:
+        valid_hr = [x for x in hr if x > 30]
+        if valid_hr:
+            out["avg_hr"] = int(round(sum(valid_hr) / len(valid_hr)))
+            out["max_hr"] = int(round(max(valid_hr)))
+    if sport == "running" and vel:
+        # Compute best split paces (1km, 3km, 5km, 10km) from 1Hz velocity_smooth (m/s)
+        n_v = len(vel)
+        pref_d = [0.0] * (n_v + 1)
+        for i, v in enumerate(vel):
+            pref_d[i + 1] = pref_d[i] + max(0.0, v)
+        best_paces = {}
+        for d_lbl, dist_m in (("1km", 1000.0), ("3km", 3000.0), ("5km", 5000.0), ("10km", 10000.0)):
+            if pref_d[-1] < dist_m:
+                continue
+            best_sec = None
+            j = 0
+            for i in range(n_v):
+                while j < n_v and (pref_d[j] - pref_d[i]) < dist_m:
+                    j += 1
+                if (pref_d[j] - pref_d[i]) >= dist_m:
+                    sec = j - i
+                    if best_sec is None or sec < best_sec:
+                        best_sec = sec
+            if best_sec and best_sec > 0:
+                sec_per_km = best_sec / (dist_m / 1000.0)
+                mm = int(sec_per_km // 60)
+                ss = int(round(sec_per_km % 60))
+                if ss == 60:
+                    mm += 1
+                    ss = 0
+                best_paces[d_lbl] = {"sec_per_km": round(sec_per_km, 1), "fmt": f"{mm}:{ss:02d}/km"}
+        if best_paces:
+            out["best_paces"] = best_paces
+    return out
+
+
+def _rebuild_coach_markdown_files(brain, activities, ftp_watts=275, weight_kg=67.0):
+    """Deterministically regenerate brain/coach/power-curve.md and brain/coach/activities.md from activities list."""
+    today = dt.date.today()
+    # Sort newest first
+    acts = sorted(
+        [a for a in activities if isinstance(a, dict) and a.get("date")],
+        key=lambda x: (x.get("date", ""), x.get("id", 0)),
+        reverse=True,
+    )
+    # 1. Compute 3-Epoch Power Curve (42d, 90d, 365d) Fresh & Fatigued (>1500 kJ) + Running Best Paces
+    epochs = (("42d", 42), ("90d", 90), ("365d", 365))
+    fresh_ep = {lbl: {} for lbl, _ in COACH_DURATIONS}
+    fatig_ep = {lbl: {} for lbl, _ in COACH_DURATIONS}
+    run_ep = {d: {} for d in ("1km", "3km", "5km", "10km")}
+
+    for a in acts:
+        try:
+            adate = dt.date.fromisoformat(a["date"][:10])
+        except ValueError:
+            continue
+        age = (today - adate).days
+        if age < 0 or age > 365:
+            continue
+        pf = a.get("peaks_fresh") or {}
+        p_fat = a.get("peaks_fatigued") or {}
+        for dur_lbl, _sec in COACH_DURATIONS:
+            val = pf.get(dur_lbl)
+            if val:
+                for ep_name, ep_days in epochs:
+                    if age <= ep_days and val > fresh_ep[dur_lbl].get(ep_name, 0):
+                        fresh_ep[dur_lbl][ep_name] = int(val)
+            fval = p_fat.get(dur_lbl)
+            if fval:
+                for ep_name, ep_days in epochs:
+                    if age <= ep_days and fval > fatig_ep[dur_lbl].get(ep_name, 0):
+                        fatig_ep[dur_lbl][ep_name] = int(fval)
+        bp = a.get("best_paces") or {}
+        for d_lbl in ("1km", "3km", "5km", "10km"):
+            pinfo = bp.get(d_lbl)
+            if isinstance(pinfo, dict) and pinfo.get("sec_per_km"):
+                spk = float(pinfo["sec_per_km"])
+                for ep_name, ep_days in epochs:
+                    cur_best = run_ep[d_lbl].get(ep_name)
+                    if age <= ep_days and (cur_best is None or spk < cur_best[0]):
+                        run_ep[d_lbl][ep_name] = (spk, pinfo.get("fmt", ""))
+
+    pc_lines = [
+        "---",
+        "summary: 3-Epoch Cycling Power Curve (42d Current, 90d Meso, 365d Season; Fresh vs. Fatigued >1500 kJ) and Running Best Paces",
+        "tags: [sport]",
+        f"updated: {today.isoformat()}",
+        "---",
+        "# 3-Epoch Power & Pace Curve",
+        "",
+        f"Stand: {today.isoformat()}. Precomputed peak performance matrix across 3 time horizons (`42d` Current Form · `90d` Meso Block · `365d` Season/All-Time).",
+        "",
+        "## 1. Cycling Mean Maximal Power — Fresh (0 kJ+)",
+        "",
+        "| Duration | 42d (Current) | 90d (Meso) | 365d (Season) | W/kg (42d) |",
+        "|---|---|---|---|---|",
+    ]
+    for dur_lbl, _sec in COACH_DURATIONS:
+        r = fresh_ep[dur_lbl]
+        v42 = f"{r['42d']} W" if r.get("42d") else "—"
+        v90 = f"{r['90d']} W" if r.get("90d") else "—"
+        v365 = f"{r['365d']} W" if r.get("365d") else "—"
+        wkg = f"{r['42d'] / weight_kg:.2f} W/kg" if r.get("42d") and weight_kg > 0 else "—"
+        pc_lines.append(f"| **{dur_lbl}** | {v42} | {v90} | {v365} | {wkg} |")
+
+    pc_lines += [
+        "",
+        "## 2. Cycling Durability — Fatigued (`> 1500 kJ` Prior Work)",
+        "",
+        "| Duration | 42d (`>1500 kJ`) | 90d (`>1500 kJ`) | 365d (`>1500 kJ`) | Retention vs. Fresh |",
+        "|---|---|---|---|---|",
+    ]
+    for dur_lbl in ("5s", "1m", "5m", "20m"):
+        rf = fatig_ep[dur_lbl]
+        r0 = fresh_ep[dur_lbl]
+        v42 = f"{rf['42d']} W" if rf.get("42d") else "—"
+        v90 = f"{rf['90d']} W" if rf.get("90d") else "—"
+        v365 = f"{rf['365d']} W" if rf.get("365d") else "—"
+        base_f = rf.get("42d") or rf.get("90d") or rf.get("365d")
+        base_0 = r0.get("42d") or r0.get("90d") or r0.get("365d")
+        ret = f"{(base_f / base_0) * 100.0:.1f} %" if base_f and base_0 else "—"
+        pc_lines.append(f"| **{dur_lbl}** | {v42} | {v90} | {v365} | {ret} |")
+
+    pc_lines += [
+        "",
+        "## 3. Running Best Split Paces",
+        "",
+        "| Distance | 42d (Current) | 90d (Meso) | 365d (Season) |",
+        "|---|---|---|---|",
+    ]
+    for d_lbl, disp in (("1km", "1 km"), ("3km", "3 km"), ("5km", "5 km"), ("10km", "10 km")):
+        rr = run_ep[d_lbl]
+        p42 = rr["42d"][1] if rr.get("42d") else "—"
+        p90 = rr["90d"][1] if rr.get("90d") else "—"
+        p365 = rr["365d"][1] if rr.get("365d") else "—"
+        pc_lines.append(f"| **{disp}** | {p42} | {p90} | {p365} |")
+
+    write(os.path.join(brain, "coach", "power-curve.md"), "\n".join(pc_lines) + "\n")
+
+    # 2. Rebuild brain/coach/activities.md (Tier 1: 0-21d, Tier 2: 22-84d, Tier 3: 85-365d)
+    tier1, tier2, tier3_buckets = [], [], {}
+    for a in acts:
+        try:
+            adate = dt.date.fromisoformat(a["date"][:10])
+        except ValueError:
+            continue
+        age = (today - adate).days
+        if age <= 21:
+            tier1.append(a)
+        elif age <= 84:
+            tier2.append(a)
+        elif age <= 365:
+            ym = a["date"][:7]
+            b = tier3_buckets.setdefault(ym, {"count": 0, "min": 0, "kj": 0, "names": []})
+            b["count"] += 1
+            b["min"] += int(a.get("duration_min") or 0)
+            b["kj"] += int(a.get("work_kj") or 0)
+            if len(b["names"]) < 3 and a.get("name"):
+                b["names"].append(a["name"])
+
+    act_lines = [
+        "---",
+        "summary: 3-Tier Strava activity log, physiological telemetry (NP, IF, HR, kJ, MMP peaks), and athlete ride feedback",
+        "tags: [sport]",
+        f"updated: {today.isoformat()}",
+        "---",
+        "# Activity & Feedback Log (3-Tier History)",
+        "",
+        f"Stand: {today.isoformat()}. Synced via `atlas.py coach sync` and annotated via `atlas.py coach note`.",
+        "",
+        "## Tier 1 · Recent Activities (Last 21 Days — Full Telemetry & Feedback)",
+        "",
+    ]
+    if not tier1:
+        act_lines.append("*(No activities in the last 21 days.)*")
+    for a in tier1:
+        sp_ico = "🏃" if a.get("sport") == "running" else ("🏋️" if a.get("sport") == "strength" else "🚴")
+        dur_m = a.get("duration_min", 0)
+        dist_km = a.get("distance_km", 0)
+        elev_m = a.get("elevation_m", 0)
+        np_s = f"NP {a['np_w']} W (Avg {a.get('avg_w', '—')} W, IF {a.get('if', '—')}, {a.get('work_kj', 0)} kJ)" if a.get("np_w") else ""
+        hr_s = f"HR {a['avg_hr']}/{a.get('max_hr', '—')} bpm" if a.get("avg_hr") else ""
+        dec_s = f" · Pw:Hr {a['decoupling_pct']}%" if a.get("decoupling_pct") is not None else ""
+        pf = a.get("peaks_fresh") or {}
+        p_str = ", ".join(f"{k}: {pf[k]}W" for k in ("5s", "1m", "5m", "20m") if pf.get(k))
+        pfat = a.get("peaks_fatigued") or {}
+        pfat_str = ", ".join(f"{k}: {pfat[k]}W" for k in ("5s", "1m", "5m", "20m") if pfat.get(k))
+        fb = a.get("feedback") or ""
+        fb_disp = "⚠ `[feedback: pending]` — ask athlete 1 check-in question" if fb == "pending" else (fb or "—")
+        act_lines.append(f"### {a['date']} · {sp_ico} {a.get('name', 'Workout')} (`strava:{a.get('id', 'local')}`)")
+        meta_parts = [f"**Duration:** {dur_m} min"]
+        if dist_km:
+            meta_parts.append(f"**Dist:** {dist_km:.1f} km ({elev_m} m)")
+        if np_s:
+            meta_parts.append(f"**Power:** {np_s}")
+        if hr_s:
+            meta_parts.append(f"**Cardio:** {hr_s}{dec_s}")
+        act_lines.append("- " + " · ".join(meta_parts))
+        if p_str:
+            act_lines.append(f"- **Peaks (Fresh):** {p_str}" + (f" | **Fatigued (`>1500 kJ`):** {pfat_str}" if pfat_str else ""))
+        if a.get("best_paces"):
+            bp_s = ", ".join(f"{k}: {v.get('fmt')}" for k, v in a["best_paces"].items() if isinstance(v, dict))
+            if bp_s:
+                act_lines.append(f"- **Split Paces:** {bp_s}")
+        if a.get("laps"):
+            act_lines.append("- **Laps:** " + " | ".join(str(lp) for lp in a["laps"][:8]))
+        act_lines.append(f"- **Athlete Feedback:** {fb_disp}")
+        act_lines.append("")
+
+    act_lines += [
+        "## Tier 2 · Meso History (Weeks 4–12 — Compact Log)",
+        "",
+        "| Date | Sport | Activity | Duration | Load / NP | HR (Avg/Max) | Feedback |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for a in tier2:
+        ld = f"NP {a['np_w']}W ({a.get('work_kj', 0)}kJ)" if a.get("np_w") else (f"{a.get('distance_km', 0):.1f} km" if a.get("distance_km") else "—")
+        hr_c = f"{a['avg_hr']}/{a.get('max_hr', '—')}" if a.get("avg_hr") else "—"
+        fb_c = (a.get("feedback") or "—").replace("|", "/").replace("\n", " ")
+        act_lines.append(f"| {a['date']} | {a.get('sport', 'cycling')} | {a.get('name', 'Workout')} | {a.get('duration_min', 0)}m | {ld} | {hr_c} | {fb_c} |")
+
+    act_lines += [
+        "",
+        "## Tier 3 · Macro Block Totals (Weeks 13–52)",
+        "",
+        "| Month / Block | Rides / Runs | Total Hours | Total Work (kJ) | Key Highlights |",
+        "|---|---|---|---|---|",
+    ]
+    for ym, b in sorted(tier3_buckets.items(), reverse=True):
+        hrs = f"{b['min'] / 60.0:.1f} h"
+        act_lines.append(f"| **{ym}** | {b['count']} | {hrs} | {b['kj']} kJ | {', '.join(b['names']) or '—'} |")
+
+    write(os.path.join(brain, "coach", "activities.md"), "\n".join(act_lines) + "\n")
+
+
+def _match_activities_to_calendar(brain, activities):
+    """Mark matching `- [ ] YYYY-MM-DD ... [workout:...]` lines in brain/calendar/README.md as `- [x]` and attach feedback tag."""
+    cal_path = os.path.join(brain, "calendar", "README.md")
+    if not os.path.isfile(cal_path):
+        return 0
+    text = read(cal_path)
+    lines = text.splitlines()
+    by_date = {}
+    for a in activities:
+        if isinstance(a, dict) and a.get("date"):
+            by_date.setdefault(a["date"][:10], []).append(a)
+    matched = 0
+    for idx_l, line in enumerate(lines):
+        m = re.match(r"^(\s*-\s*)\[([ xX\-])\](\s+)(\d{4}-\d{2}-\d{2})\b(.*)$", line)
+        if not m or "[workout" not in m.group(5).lower():
+            continue
+        d_str = m.group(4)
+        if d_str not in by_date:
+            continue
+        rest = m.group(5)
+        m_sub = re.search(r"\[workout:([a-z0-9_-]+)\]", rest, re.I)
+        w_sport = m_sub.group(1).lower() if m_sub else ""
+        day_cands = by_date[d_str]
+        sport_matches = [a for a in day_cands if not w_sport or a.get("sport", "").lower() == w_sport]
+        act = sport_matches[0] if sport_matches else day_cands[0]
+        changed = False
+        if m.group(2) == " ":
+            changed = True
+        fb = act.get("feedback") or ""
+        if fb and "[feedback:" not in rest.lower():
+            rest = rest.rstrip() + f" [feedback: {fb}]"
+            changed = True
+        elif fb and fb != "pending" and "[feedback: pending]" in rest.lower():
+            rest = re.sub(r"\[feedback:\s*pending\]", f"[feedback: {fb}]", rest, flags=re.I)
+            changed = True
+        if changed:
+            lines[idx_l] = f"{m.group(1)}[x]{m.group(3)}{d_str}{rest}"
+            matched += 1
+    if matched:
+        write(cal_path, "\n".join(lines) + ("\n" if text.endswith("\n") else ""))
+    return matched
+
+
+def _strava_refresh_if_needed(brain, env_dict):
+    """Refresh Strava OAuth access token if expired or expiring within 120 seconds."""
+    import urllib.parse
+    import urllib.request
+    exp = int(env_dict.get("STRAVA_EXPIRES_AT") or 0)
+    if env_dict.get("STRAVA_ACCESS_TOKEN") and exp > time.time() + 120:
+        return env_dict["STRAVA_ACCESS_TOKEN"]
+    cid = env_dict.get("STRAVA_CLIENT_ID")
+    csec = env_dict.get("STRAVA_CLIENT_SECRET")
+    rtok = env_dict.get("STRAVA_REFRESH_TOKEN")
+    if not (cid and csec and rtok):
+        return env_dict.get("STRAVA_ACCESS_TOKEN", "")
+    data = urllib.parse.urlencode({
+        "client_id": cid,
+        "client_secret": csec,
+        "grant_type": "refresh_token",
+        "refresh_token": rtok,
+    }).encode("utf-8")
+    req = urllib.request.Request("https://www.strava.com/oauth/token", data=data, method="POST")
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        res = json.loads(resp.read().decode("utf-8", errors="replace"))
+    env_dict["STRAVA_ACCESS_TOKEN"] = res.get("access_token", "")
+    env_dict["STRAVA_REFRESH_TOKEN"] = res.get("refresh_token", rtok)
+    env_dict["STRAVA_EXPIRES_AT"] = str(res.get("expires_at", int(time.time()) + 21600))
+    _save_strava_env(brain, env_dict)
+    return env_dict["STRAVA_ACCESS_TOKEN"]
+
+
+def _coach_sync(root, brain, hk, days=90, mock_file=None, execute=True, quiet=False):
+    """Sync Strava activities + 1Hz streams (or load mock JSON), compute 3-epoch curves & match calendar workouts."""
+    _coach_init(root, brain, hk, execute=execute, quiet=True)
+    ftp_w, weight_kg = _extract_profile_numbers(brain, hk)
+    act_json_path = os.path.join(brain, "coach", "activities.json")
+    existing = load_json(act_json_path, [])
+    if not isinstance(existing, list):
+        existing = []
+    by_id = {str(a.get("id")): a for a in existing if isinstance(a, dict) and a.get("id") is not None}
+
+    raw_activities = []
+    if mock_file:
+        mock_data = load_json(os.path.expanduser(mock_file), [])
+        raw_activities = mock_data if isinstance(mock_data, list) else mock_data.get("activities", [])
+    else:
+        env_dict = _load_strava_env(brain)
+        if not env_dict.get("STRAVA_ACCESS_TOKEN") and not env_dict.get("STRAVA_REFRESH_TOKEN"):
+            if not quiet:
+                say("strava sync: not connected yet (brain/_secrets/strava.env missing). Run `atlas.py coach auth-strava`.")
+            return 0
+        import urllib.request
+        token = _strava_refresh_if_needed(brain, env_dict)
+        after_ts = int((dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)).timestamp())
+        url = f"https://www.strava.com/api/v3/athlete/activities?after={after_ts}&per_page=100"
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw_activities = json.loads(resp.read().decode("utf-8", errors="replace"))
+
+    today = dt.date.today()
+    stream_cache_dir = os.path.join(brain, "_atlas", "cache", "strava", "streams")
+    if execute:
+        os.makedirs(stream_cache_dir, exist_ok=True)
+
+    synced_count = 0
+    for raw in raw_activities:
+        if not isinstance(raw, dict):
+            continue
+        aid = str(raw.get("id") or "")
+        if not aid:
+            continue
+        s_type = (raw.get("sport_type") or raw.get("type") or "Ride").lower()
+        if any(w in s_type for w in ("ride", "cycling", "virtualride", "gravel", "ebike")):
+            sport = "cycling"
+        elif any(w in s_type for w in ("run", "trailrun", "virtualrun")):
+            sport = "running"
+        elif any(w in s_type for w in ("weight", "workout", "strength", "crossfit")):
+            sport = "strength"
+        else:
+            sport = s_type
+
+        start_date = (raw.get("start_date_local") or raw.get("date") or today.isoformat())[:10]
+        dur_sec = int(raw.get("moving_time") or raw.get("elapsed_time") or (raw.get("duration_min", 0) * 60) or 0)
+        dur_min = int(round(dur_sec / 60.0))
+        dist_km = round(float(raw.get("distance") or (raw.get("distance_km", 0) * 1000.0) or 0.0) / 1000.0, 2)
+        elev_m = int(round(float(raw.get("total_elevation_gain") or raw.get("elevation_m") or 0)))
+
+        prev = by_id.get(aid, {})
+        entry = dict(prev)
+        entry.update({
+            "id": aid,
+            "date": start_date,
+            "name": raw.get("name") or prev.get("name") or "Workout",
+            "sport": sport,
+            "duration_min": dur_min,
+            "distance_km": dist_km,
+            "elevation_m": elev_m,
+        })
+        if raw.get("average_watts") and not entry.get("avg_w"):
+            entry["avg_w"] = int(round(float(raw["average_watts"])))
+        if raw.get("weighted_average_watts") and not entry.get("np_w"):
+            entry["np_w"] = int(round(float(raw["weighted_average_watts"])))
+        if raw.get("average_heartrate") and not entry.get("avg_hr"):
+            entry["avg_hr"] = int(round(float(raw["average_heartrate"])))
+        if raw.get("max_heartrate") and not entry.get("max_hr"):
+            entry["max_hr"] = int(round(float(raw["max_heartrate"])))
+        if raw.get("kilojoules") and not entry.get("work_kj"):
+            entry["work_kj"] = int(round(float(raw["kilojoules"])))
+        if raw.get("laps") and isinstance(raw["laps"], list):
+            entry["laps"] = raw["laps"]
+
+        # Load or fetch 1Hz streams
+        s_file = os.path.join(stream_cache_dir, f"{aid}.json")
+        streams = None
+        if isinstance(raw.get("streams"), dict):
+            streams = raw["streams"]
+            if execute:
+                dump_json(s_file, streams)
+        elif os.path.isfile(s_file):
+            streams = load_json(s_file, None)
+        elif not mock_file and sport in ("cycling", "running") and dur_min >= 10:
+            try:
+                env_dict = _load_strava_env(brain)
+                token = _strava_refresh_if_needed(brain, env_dict)
+                import urllib.request
+                s_url = f"https://www.strava.com/api/v3/activities/{aid}/streams?keys=watts,heartrate,cadence,velocity_smooth,time&key_by_type=true"
+                req = urllib.request.Request(s_url, headers={"Authorization": f"Bearer {token}"})
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    s_raw = json.loads(resp.read().decode("utf-8", errors="replace"))
+                    if isinstance(s_raw, dict):
+                        streams = {k: (v.get("data", []) if isinstance(v, dict) else v) for k, v in s_raw.items()}
+                        if execute:
+                            dump_json(s_file, streams)
+            except Exception:
+                streams = None
+
+        if isinstance(streams, dict):
+            m_calc = _compute_stream_metrics(streams, ftp_watts=ftp_w, weight_kg=weight_kg, sport=sport)
+            entry.update(m_calc)
+
+        # Preserve or import athlete feedback note
+        existing_fb = prev.get("feedback", "")
+        strava_note = (raw.get("private_note") or raw.get("description") or raw.get("feedback") or "").strip()
+        if existing_fb and existing_fb != "pending":
+            entry["feedback"] = existing_fb
+        elif strava_note and strava_note != "pending":
+            entry["feedback"] = strava_note
+        else:
+            try:
+                age_d = (today - dt.date.fromisoformat(start_date)).days
+            except ValueError:
+                age_d = 99
+            if dur_min >= 15 and 0 <= age_d <= 14:
+                entry["feedback"] = "pending"
+            else:
+                entry["feedback"] = existing_fb or ""
+
+        by_id[aid] = entry
+        synced_count += 1
+
+    all_acts = sorted(by_id.values(), key=lambda x: (x.get("date", ""), str(x.get("id", ""))), reverse=True)
+    if execute:
+        dump_json(act_json_path, all_acts)
+        _rebuild_coach_markdown_files(brain, all_acts, ftp_watts=ftp_w, weight_kg=weight_kg)
+        matched = _match_activities_to_calendar(brain, all_acts)
+        set_state(brain, last_strava_sync=now_iso())
+        hk.load_index()
+        hk.render_calendar_html(hk.load_index(), start_server=False)
+    else:
+        matched = 0
+    if not quiet:
+        pend_cnt = sum(1 for a in all_acts if a.get("feedback") == "pending")
+        say(f"coach sync ({'applied' if execute else 'dry-run'}): {synced_count} activity/ies processed, "
+            f"{matched} calendar workout(s) marked [x], {pend_cnt} ride check-in(s) pending.")
+    return synced_count
+
+
+def _coach_note(root, brain, hk, date_str, text, rpe=None):
+    """Save subjective athlete ride feedback (RPE, legs, feel) to activities.json, activities.md, and calendar/README.md."""
+    _coach_init(root, brain, hk, execute=True, quiet=True)
+    ftp_w, weight_kg = _extract_profile_numbers(brain, hk)
+    note_str = f"RPE {rpe}/10 — {text.strip()}" if rpe else text.strip()
+    act_json_path = os.path.join(brain, "coach", "activities.json")
+    acts = load_json(act_json_path, [])
+    if not isinstance(acts, list):
+        acts = []
+    updated_act = False
+    for a in acts:
+        if isinstance(a, dict) and str(a.get("date", ""))[:10] == date_str:
+            a["feedback"] = note_str
+            updated_act = True
+    if not updated_act:
+        acts.insert(0, {
+            "id": f"manual-{date_str}",
+            "date": date_str,
+            "name": "Logged Workout",
+            "sport": "cycling",
+            "duration_min": 60,
+            "feedback": note_str,
+        })
+    dump_json(act_json_path, acts)
+    _rebuild_coach_markdown_files(brain, acts, ftp_watts=ftp_w, weight_kg=weight_kg)
+
+    cal_path = os.path.join(brain, "calendar", "README.md")
+    if os.path.isfile(cal_path):
+        cal_txt = read(cal_path)
+        lines = cal_txt.splitlines()
+        for i, line in enumerate(lines):
+            m = re.match(r"^(\s*-\s*)\[([ xX\-])\](\s+)(\d{4}-\d{2}-\d{2})\b(.*)$", line)
+            if m and m.group(4) == date_str and "[workout" in m.group(5).lower():
+                rest = m.group(5)
+                if re.search(r"\[feedback:[^\]]*\]", rest, re.I):
+                    rest = re.sub(r"\[feedback:[^\]]*\]", f"[feedback: {note_str}]", rest, flags=re.I)
+                else:
+                    rest = rest.rstrip() + f" [feedback: {note_str}]"
+                lines[i] = f"{m.group(1)}[x]{m.group(3)}{date_str}{rest}"
+        write(cal_path, "\n".join(lines) + ("\n" if cal_txt.endswith("\n") else ""))
+    hk.load_index()
+    hk.render_calendar_html(hk.load_index(), start_server=False)
+    say(f"coach note: saved feedback for {date_str} -> '{note_str}'")
+
+
+def _coach_zwo(root, brain, hk, date_str=None, days=14):
+    """Compile structured cycling workouts from brain/calendar/README.md into .zwo XML files in brain/coach/workouts/."""
+    _coach_init(root, brain, hk, execute=True, quiet=True)
+    ftp_w, _wkg = _extract_profile_numbers(brain, hk)
+    idx = hk.load_index()
+    items = hk.calendar_items(idx, days=max(days, 30), past_days=14, include_done=True)
+    out_dir = os.path.join(brain, "coach", "workouts")
+    os.makedirs(out_dir, exist_ok=True)
+    written = []
+    for it in items:
+        if it.get("kind") != "workout" or (it.get("subkind") or "cycling") != "cycling":
+            continue
+        ds = it["start"].isoformat()
+        if date_str and ds != date_str:
+            continue
+        if not date_str and not (0 <= it["delta"] <= days):
+            continue
+        spec = hk.parse_workout_spec(it.get("what", ""), ftp_watts=ftp_w, sport="cycling")
+        if not spec.get("has_intervals"):
+            continue
+        xml_str = hk.compile_zwo_xml(spec, date_str=ds, ftp_watts=ftp_w)
+        slug = re.sub(r"[^a-z0-9]+", "-", spec.get("title", "workout").lower()).strip("-") or "workout"
+        fname = f"{ds}_{slug}.zwo"
+        fpath = os.path.join(out_dir, fname)
+        write(fpath, xml_str)
+        written.append(fpath)
+    hk.render_calendar_html(idx, start_server=False)
+    if written:
+        say(f"coach zwo: generated {len(written)} .zwo file(s) (FTP={ftp_w}W):")
+        for p in written:
+            say(f"  {fwd(p)}")
+    else:
+        say("coach zwo: no matching cycling workouts with interval specs found.")
+    return written
+
+
+def _coach_auth_strava(root, brain, args):
+    """Interactive loopback OAuth flow (or headless --code exchange) for Strava API v3."""
+    env_dict = _load_strava_env(brain)
+    if getattr(args, "client_id", None):
+        env_dict["STRAVA_CLIENT_ID"] = args.client_id.strip()
+    if getattr(args, "client_secret", None):
+        env_dict["STRAVA_CLIENT_SECRET"] = args.client_secret.strip()
+    if getattr(args, "access_token", None):
+        env_dict["STRAVA_ACCESS_TOKEN"] = args.access_token.strip()
+    if getattr(args, "refresh_token", None):
+        env_dict["STRAVA_REFRESH_TOKEN"] = args.refresh_token.strip()
+        if not env_dict.get("STRAVA_EXPIRES_AT"):
+            env_dict["STRAVA_EXPIRES_AT"] = str(int(time.time()) + 21600)
+    if env_dict:
+        _save_strava_env(brain, env_dict)
+
+    cid = env_dict.get("STRAVA_CLIENT_ID")
+    csec = env_dict.get("STRAVA_CLIENT_SECRET")
+    if not cid or not csec:
+        say("=== Strava Onboarding (Step 1 of 2) ===")
+        say("1. Open https://www.strava.com/settings/api (Authorization Callback Domain: `127.0.0.1` or `localhost`).")
+        say("2. Run:")
+        say("   python -I brain/_atlas/tools/atlas.py coach auth-strava --client-id <ID> --client-secret <SECRET>")
+        return
+
+    if getattr(args, "access_token", None) and not getattr(args, "code", None):
+        say(f"strava auth: saved credentials and token to {fwd(_strava_env_path(brain))}.")
+        return
+
+    port = getattr(args, "port", 8766) or 8766
+    code = getattr(args, "code", None)
+    if not code:
+        import http.server
+        import urllib.parse
+        import webbrowser
+        redirect_uri = f"http://127.0.0.1:{port}/callback"
+        auth_url = (
+            f"https://www.strava.com/oauth/authorize?client_id={cid}&response_type=code"
+            f"&redirect_uri={urllib.parse.quote(redirect_uri, safe='')}"
+            f"&approval_prompt=force&scope=read,activity:read_all,profile:read_all"
+        )
+        say(f"Opening Strava authorization in browser:\n  {auth_url}")
+        captured = {"code": None}
+
+        class _OAuthHandler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a, **kw):
+                pass
+
+            def do_GET(self):
+                parsed = urllib.parse.urlparse(self.path)
+                qs = urllib.parse.parse_qs(parsed.query)
+                if "code" in qs:
+                    captured["code"] = qs["code"][0]
+                    body = b"<html><body style='font-family:sans-serif;background:#070a0f;color:#34d399;padding:40px'><h2>&#10003; Atlas Coach mit Strava verbunden!</h2><p>Du kannst dieses Browser-Tab jetzt schliessen.</p></body></html>"
+                    self.send_response(200)
+                else:
+                    body = b"<html><body>Authorization failed or cancelled.</body></html>"
+                    self.send_response(400)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        srv = http.server.HTTPServer(("127.0.0.1", port), _OAuthHandler)
+        srv.timeout = 120
+        try:
+            webbrowser.open(auth_url)
+        except Exception:
+            pass
+        srv.handle_request()
+        srv.server_close()
+        code = captured["code"]
+
+    if not code:
+        sys.exit("strava auth: did not receive authorization code.")
+
+    import urllib.parse
+    import urllib.request
+    data = urllib.parse.urlencode({
+        "client_id": cid,
+        "client_secret": csec,
+        "code": code,
+        "grant_type": "authorization_code",
+    }).encode("utf-8")
+    req = urllib.request.Request("https://www.strava.com/oauth/token", data=data, method="POST")
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        res = json.loads(resp.read().decode("utf-8", errors="replace"))
+    env_dict["STRAVA_ACCESS_TOKEN"] = res.get("access_token", "")
+    env_dict["STRAVA_REFRESH_TOKEN"] = res.get("refresh_token", "")
+    env_dict["STRAVA_EXPIRES_AT"] = str(res.get("expires_at", int(time.time()) + 21600))
+    athlete = res.get("athlete") or {}
+    if athlete.get("id"):
+        env_dict["STRAVA_ATHLETE_ID"] = str(athlete["id"])
+    _save_strava_env(brain, env_dict)
+    say(f"strava auth: connected athlete {env_dict.get('STRAVA_ATHLETE_ID', 'ok')} -> {fwd(_strava_env_path(brain))}")
+
+
+def _coach_context(root, brain, hk, mode="auto", deep_dive=None, open_cal=False, no_sync=False):
+    """Assemble and print the mode-specific 3-Tier Context Package for the Atlas Sport-Coach."""
+    _coach_init(root, brain, hk, execute=True, quiet=True)
+    st = get_state(brain)
+    c_state = hk.load_coach_state()
+    if c_state["strava_connected"] and not no_sync:
+        last_sync = st.get("last_strava_sync")
+        age_min = ((dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(last_sync)).total_seconds() / 60.0) if last_sync else 9999
+        if age_min >= 30:
+            try:
+                _coach_sync(root, brain, hk, days=30, execute=True, quiet=True)
+                c_state = hk.load_coach_state()
+            except Exception:
+                pass
+
+    idx = hk.load_index()
+    all_cal = hk.calendar_items(idx, days=365, past_days=21, include_done=True)
+    macro = hk.parse_macro_plan(cal_items=all_cal)
+    eff_mode = mode if mode != "auto" else ("macro" if macro["stale"] else "daily")
+
+    say(f"=== 1. ATLAS SPORT-COACH CONTEXT (mode: {eff_mode}) ===")
+    say(f"  Macro Plan: active_phase='{macro['active_phase']}', updated='{macro['updated'] or 'never'}', "
+        f"goals_hash='{macro['goals_hash']} -> {macro['current_goals_hash']}', stale={macro['stale']}"
+        + (f" ({macro['stale_reason']})" if macro["stale"] else ""))
+    if macro["stale"] and eff_mode in ("plan-14d", "macro"):
+        say("  [!] STALE MACRO PLAN DETECTED: You MUST update `brain/coach/macro-plan.md` (with current `updated:` and "
+            f"`goals_hash: {macro['current_goals_hash']}`) BEFORE writing 14-day workouts in `brain/calendar/README.md`!")
+    if c_state["strava_connected"]:
+        say(f"  Strava: connected ({len(c_state['activities'])} cached activities)")
+    else:
+        say("  Strava: NOT CONNECTED (`brain/_secrets/strava.env` missing). Offer onboarding via `atlas.py coach auth-strava`.")
+
+    pend = c_state.get("pending_feedback", [])
+    if pend:
+        say(f"  [!] PENDING RIDE CHECK-IN ({len(pend)} recent activity/ies without athlete feedback):")
+        for p in pend[:3]:
+            say(f"      - {p.get('date')} '{p.get('name')}' ({p.get('duration_min', 0)}m, NP {p.get('np_w') or '—'}W): "
+                f"Ask 1 concise question how it felt (RPE/legs) and save via `atlas.py coach note --date {p.get('date')} --text \"...\"`")
+
+    say("\n=== 2. ATHLETE PROFILE & THRESHOLDS (brain/coach/profile.md) ===")
+    prof_path = os.path.join(brain, "coach", "profile.md")
+    if os.path.isfile(prof_path):
+        say(read(prof_path).strip())
+
+    say("\n=== 3. MACRO PERIODIZATION (brain/coach/macro-plan.md) ===")
+    macro_path = os.path.join(brain, "coach", "macro-plan.md")
+    if os.path.isfile(macro_path):
+        if eff_mode == "macro" or macro["stale"]:
+            say(read(macro_path).strip())
+        else:
+            # Slice current + next 4 weeks from macro-plan.md
+            cur_kw = dt.date.today().isocalendar()[1]
+            say(f"Active Phase: {macro['active_phase']} (updated {macro['updated']})")
+            for w in macro.get("weeks", [])[:8]:
+                say(f"  KW {w['kw']} ({w['monday']}): Phase={w['phase']} | Vol={w['hours']} | "
+                    f"Cycling={w['cycling']} | Run/Strength={w['running_strength']} | Notes={w['notes']}")
+
+    if eff_mode in ("plan-14d", "macro"):
+        say("\n=== 4. 3-EPOCH POWER & PACE CURVE (brain/coach/power-curve.md) ===")
+        pc_path = os.path.join(brain, "coach", "power-curve.md")
+        if os.path.isfile(pc_path):
+            say(read(pc_path).strip())
+
+    say("\n=== 5. CALENDAR HORIZON (brain/calendar/README.md) ===")
+    goals = [i for i in all_cal if i["kind"] == "goal" and i["delta"] >= 0 and i["status"] == "open"]
+    blk_horizon = 365 if (eff_mode == "macro" or macro["stale"]) else 28
+    blocked = [i for i in all_cal if 0 <= i["delta"] <= blk_horizon and i["status"] == "open"
+               and (i["kind"] == "blocked" or (i["kind"] == "event" and i["time"]))]
+    workouts = [i for i in all_cal if -14 <= i["delta"] <= 14 and i["kind"] == "workout"]
+    say("Upcoming Goals (365d):")
+    for g in goals:
+        say(f"  - {g['start'].isoformat()} (in {g['delta']}d / {g['delta']/7:.1f}w) [goal:{g['subkind'] or 'A'}] {g['what']}")
+    if not goals:
+        say("  (none)")
+    say(f"Blocked & Busy Windows ({blk_horizon}d):")
+    for b in blocked:
+        span = b["start"].isoformat() if b["start"] == b["end"] else f"{b['start'].isoformat()}..{b['end'].isoformat()}"
+        t_s = f" {b['time']}" if b["time"] else ""
+        say(f"  - {span}{t_s} [{b['kind']}] {b['what']}")
+    if not blocked:
+        say("  (none)")
+    say("Planned & Recent Calendar Workouts (-14d .. +14d):")
+    box_map = {"open": "[ ]", "done": "[x]", "skipped": "[-]"}
+    for w in workouts:
+        t_s = f" {w['time']}" if w["time"] else ""
+        say(f"  - {box_map.get(w['status'], '[ ]')} {w['start'].isoformat()}{t_s} [workout:{w['subkind'] or 'cycling'}] {w['what']}")
+    if not workouts:
+        say("  (none)")
+
+    say("\n=== 6. ACTIVITY & FEEDBACK LOG (brain/coach/activities.md) ===")
+    act_md_path = os.path.join(brain, "coach", "activities.md")
+    if os.path.isfile(act_md_path):
+        act_text = read(act_md_path).strip()
+        if eff_mode in ("daily", "checkin") and "## Tier 2" in act_text:
+            say(act_text[:act_text.index("## Tier 2")].strip())
+        elif eff_mode == "plan-14d" and "## Tier 3" in act_text:
+            say(act_text[:act_text.index("## Tier 3")].strip())
+        else:
+            say(act_text)
+
+    if deep_dive:
+        say(f"\n=== 7. DEEP-DIVE ACTIVITY ({deep_dive}) ===")
+        matches = [a for a in c_state.get("activities", []) if str(a.get("date", ""))[:10] == deep_dive]
+        if matches:
+            for m_act in matches:
+                say(json.dumps(m_act, indent=2, ensure_ascii=False))
+        else:
+            say(f"  (no activity found on {deep_dive})")
+
+    if open_cal:
+        _open_visual_calendar(hk, idx, open_now=True)
+
+
+def cmd_coach(args):
+    root, brain = paths(args)
+    hk = hook_module(brain)
+    action = getattr(args, "action", None) or "context"
+    if getattr(args, "init", False) and action == "context" and not getattr(args, "mode_explicit", False):
+        _coach_init(root, brain, hk, execute=args.execute, quiet=False)
+        return
+    if action == "status":
+        _coach_init(root, brain, hk, execute=False, quiet=True)
+        c_state = hk.load_coach_state()
+        macro = hk.parse_macro_plan()
+        say(f"coach status: module={'coach' in get_state(brain).get('modules', [])}, "
+            f"strava_connected={c_state['strava_connected']}, "
+            f"activities={len(c_state['activities'])}, "
+            f"pending_feedback={len(c_state['pending_feedback'])}, "
+            f"macro_phase='{macro['active_phase']}', macro_stale={macro['stale']} ({macro['stale_reason']})")
+    elif action == "auth-strava":
+        _coach_auth_strava(root, brain, args)
+    elif action == "sync":
+        _coach_sync(root, brain, hk, days=args.days, mock_file=args.mock_file, execute=args.execute, quiet=False)
+    elif action == "note":
+        if not args.date or not args.text:
+            sys.exit("coach note requires --date YYYY-MM-DD and --text \"...\"")
+        _coach_note(root, brain, hk, args.date, args.text, rpe=args.rpe)
+    elif action == "zwo":
+        _coach_zwo(root, brain, hk, date_str=args.date, days=args.days)
+    else:
+        _coach_context(root, brain, hk, mode=args.mode, deep_dive=args.deep_dive,
+                       open_cal=getattr(args, "open", False), no_sync=getattr(args, "no_sync", False))
 
 
 # ================================================================= inventory
@@ -1808,6 +2944,25 @@ def _upgrades(src, v_from, v_to):
     return [(v, data) for _t, v, data in sorted(out)]
 
 
+def _ensure_coach_index_link(brain, execute=True):
+    idx_file = os.path.join(brain, "INDEX.md")
+    if not os.path.isfile(idx_file):
+        return False
+    idx_text = read(idx_file)
+    if "coach/README.md" in idx_text:
+        return False
+    if execute:
+        row = "| `coach/` | Sport-Coach hub: athlete profile, thresholds, macro periodization, 3-epoch power curve, activity log | `coach/README.md` |\n"
+        if "| `calendar/` |" in idx_text:
+            idx_text = idx_text.replace("| `calendar/` |", row + "| `calendar/` |", 1)
+        elif "| `self/` |" in idx_text:
+            idx_text = idx_text.replace("| `self/` |", row + "| `self/` |", 1)
+        else:
+            idx_text = idx_text.rstrip() + "\n- Sport-Coach Hub: `coach/README.md`\n"
+        write(idx_file, idx_text)
+    return True
+
+
 def _apply_upgrade(brain, src, values, data, dry):
     """Mechanical, additive and idempotent: never overwrites the user's content. Returns (actions, notes)."""
     acts = []
@@ -1822,6 +2977,29 @@ def _apply_upgrade(brain, src, values, data, dry):
             acts.append(f"add {rel} (from the skeleton)")
             if not dry:
                 write(dst, render(read(s), values))
+    for m in data.get("modules_add", []):
+        st = get_state(brain)
+        mods = list(st.get("modules", []))
+        if m not in mods:
+            acts.append(f"enable module `{m}`")
+            if not dry:
+                mods.append(m)
+                set_state(brain, modules=mods)
+        mhome = os.path.join(src, "modules", m, "home")
+        if os.path.isdir(mhome):
+            for s_path, d_path in _copy_plan(mhome, brain):
+                rel_d = fwd(os.path.relpath(d_path, brain))
+                if not os.path.exists(d_path):
+                    acts.append(f"add {rel_d} (from module {m})")
+                    if not dry:
+                        os.makedirs(os.path.dirname(d_path), exist_ok=True)
+                        if d_path.endswith((".md", ".gitignore", ".ignore")):
+                            write(d_path, render(read(s_path), values))
+                        else:
+                            shutil.copy2(s_path, d_path)
+        if m == "coach":
+            if _ensure_coach_index_link(brain, execute=not dry):
+                acts.append("INDEX.md: link `coach/README.md`")
     sp = os.path.join(brain, "settings.md")
     for key, val in (data.get("settings_add") or {}).items():
         if os.path.exists(sp):
@@ -1842,8 +3020,17 @@ def _apply_upgrade(brain, src, values, data, dry):
 
 def _plan_core(brain, root, src):
     st = get_state(brain)
-    modules = st.get("modules", [])
+    modules = list(st.get("modules", []))
     atlas_dir = os.path.join(brain, "_atlas")
+    try:
+        v_old = read(os.path.join(atlas_dir, "VERSION")).strip()
+        v_new = read(os.path.join(src, "core", "VERSION")).strip()
+    except OSError:
+        v_old, v_new = "0", "0"
+    for _v, udata in _upgrades(src, v_old, v_new):
+        for m in udata.get("modules_add", []):
+            if m not in modules:
+                modules.append(m)
     new = _source_core(src, modules)
     local = _core_files(atlas_dir)
     base = _core_files(os.path.join(atlas_dir, BASE))
@@ -1864,11 +3051,6 @@ def _plan_core(brain, root, src):
         tpl = os.path.join(atlas_dir, "templates", "router.md")
         base_block = _router_core(render(read(tpl), _router_values(brain, root))) if os.path.exists(tpl) else None
     router = _three_way(local_block, base_block, up_block) if local_block is not None else "missing"
-    try:
-        v_old = read(os.path.join(atlas_dir, "VERSION")).strip()
-        v_new = read(os.path.join(src, "core", "VERSION")).strip()
-    except OSError:
-        v_old, v_new = "0", "0"
     return {"items": items, "new": new, "router": (router, local_block, base_block, up_block), "v_old": v_old,
             "v_new": v_new, "modules": modules}
 
@@ -2431,6 +3613,29 @@ def main():
     p.add_argument("--ics-source", help="URL or file path of an .ics feed")
     p.add_argument("--execute", action="store_true")
 
+    p = sub.add_parser("coach")
+    p.add_argument("action", nargs="?", default="context",
+                   choices=("context", "status", "auth-strava", "sync", "note", "zwo"),
+                   help="coach action (default: context)")
+    p.add_argument("--init", action="store_true", help="scaffold brain/coach/ and harvest existing athlete thresholds")
+    p.add_argument("--mode", choices=("auto", "daily", "checkin", "plan-14d", "macro"), default="auto",
+                   help="context slicing mode (default: auto)")
+    p.add_argument("--deep-dive", help="date (YYYY-MM-DD) for full activity stream/lap telemetry")
+    p.add_argument("--date", help="target date (YYYY-MM-DD) for `note` or `zwo`")
+    p.add_argument("--text", help="athlete feedback note text for `note`")
+    p.add_argument("--rpe", type=int, help="optional RPE (1-10) for `note`")
+    p.add_argument("--days", type=int, default=14, help="horizon in days for `sync` (default 90) or `zwo` (default 14)")
+    p.add_argument("--mock-file", help="offline Strava JSON fixture for `sync`")
+    p.add_argument("--client-id", help="Strava API Client ID for `auth-strava`")
+    p.add_argument("--client-secret", help="Strava API Client Secret for `auth-strava`")
+    p.add_argument("--access-token", help="Strava OAuth Access Token for `auth-strava`")
+    p.add_argument("--refresh-token", help="Strava OAuth Refresh Token for `auth-strava`")
+    p.add_argument("--code", help="Strava OAuth authorization code for headless `auth-strava`")
+    p.add_argument("--port", type=int, default=8766, help="loopback OAuth callback port (default: 8766)")
+    p.add_argument("--open", action="store_true", help="open visual calendar in Coach View")
+    p.add_argument("--no-sync", action="store_true", help="skip automatic Strava background sync during `context`")
+    p.add_argument("--execute", action="store_true")
+
     p = sub.add_parser("inventory")
     p.add_argument("--out", required=True)
     p.add_argument("--scan", help="folder to map (default: the home directory)")
@@ -2469,8 +3674,9 @@ def main():
     handlers = {"init": cmd_init, "routes": cmd_routes, "projects": cmd_projects, "index": cmd_index, "probe": cmd_probe,
                 "find": cmd_find, "mark": cmd_mark, "adopt": cmd_adopt, "code-sync": cmd_code_sync,
                 "core-accept": cmd_core_accept, "dev-check": cmd_dev_check, "dev-setup": cmd_dev_setup,
-                "check": cmd_check, "deadlines": cmd_deadlines, "calendar": cmd_calendar, "inventory": cmd_inventory,
-                "move": cmd_move, "verify": cmd_verify, "undo": cmd_undo, "core-diff": cmd_core_diff, "state": cmd_state}
+                "check": cmd_check, "deadlines": cmd_deadlines, "calendar": cmd_calendar, "coach": cmd_coach,
+                "inventory": cmd_inventory, "move": cmd_move, "verify": cmd_verify, "undo": cmd_undo,
+                "core-diff": cmd_core_diff, "state": cmd_state}
     if args.cmd == "init" and not args.root:
         args.root = r"C:\Atlas" if os.name == "nt" else os.path.join("~", "Atlas")
     if args.cmd in ("wire", "unwire"):

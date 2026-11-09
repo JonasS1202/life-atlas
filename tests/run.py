@@ -459,6 +459,126 @@ class Calendar(AtlasCase):
             proc.wait(timeout=2)
 
 
+class Coach(AtlasCase):
+    modules = "developer,coach"
+
+    def test_coach_workflow_zwo_strava_sync_and_routing(self):
+        import datetime as dt
+        today = dt.date.today()
+        d_yest = (today - dt.timedelta(days=1)).isoformat()
+        d_tmrw = (today + dt.timedelta(days=1)).isoformat()
+        d_race = (today + dt.timedelta(days=90)).isoformat()
+
+        with open(os.path.join(self.brain, "self", "README.md"), "w", encoding="utf-8") as fh:
+            fh.write(
+                "---\nsummary: Athletenprofil\ntags: [self, sport]\n---\n# Profil\n\n"
+                "| Parameter | Wert | Details |\n|---|---|---|\n"
+                "| **Biometrie** | **175 cm · 67 kg** | Gewicht |\n"
+                "| **FTP** | **275 W (4,10 W/kg)** | Indoor/Outdoor |\n"
+            )
+        cal_path = os.path.join(self.brain, "calendar", "README.md")
+        with open(cal_path, "w", encoding="utf-8") as fh:
+            fh.write(
+                "---\nsummary: Calendar\ntags: [atlas, calendar]\n---\n# Calendar & To-Dos\n\n## Timeline\n\n"
+                f"- [ ] {d_race} [goal:A] Münsterland Giro (125 km)\n"
+                f"- [ ] {d_yest} 17:30 [workout:cycling] Endurance + Finale (105m | 100m Z2@70%, 5m Z5@120%)\n"
+                f"- [ ] {d_tmrw} 17:30 [workout:cycling] Threshold 4x8m (90m | 15m WU 55-75%, 4x 8m@102% / 4m@55%, 19m Z2@68%, 10m CD 65-50%)\n\n"
+                "## Open To-Dos\n"
+            )
+
+        # 1. Initialize coach hub & harvest profile thresholds
+        res_init = self.atlas("coach", "--init", "--execute").stdout
+        self.assertIn("coach init (applied)", res_init)
+        prof_text = self.read(os.path.join(self.brain, "coach", "profile.md"))
+        self.assertIn("275 W", prof_text)
+        self.assertIn("67 kg", prof_text)
+
+        # 2. Generate .zwo workout files from compact interval DSL in calendar/README.md
+        res_zwo = self.atlas("coach", "zwo", "--days", "14").stdout
+        self.assertIn("generated 1 .zwo file(s) (FTP=275W)", res_zwo)
+        zwo_path = os.path.join(self.brain, "coach", "workouts", f"{d_tmrw}_threshold-4x8m.zwo")
+        self.assertTrue(os.path.isfile(zwo_path))
+        zwo_xml = self.read(zwo_path)
+        self.assertIn('<Warmup Duration="900" PowerLow="0.55" PowerHigh="0.75"/>', zwo_xml)
+        self.assertIn('<IntervalsT Repeat="4" OnDuration="480" OffDuration="240" OnPower="1.02" OffPower="0.55"/>', zwo_xml)
+        self.assertIn('<SteadyState Duration="1140" Power="0.68"/>', zwo_xml)
+        self.assertIn('<Cooldown Duration="600" PowerLow="0.65" PowerHigh="0.50"/>', zwo_xml)
+
+        # 3. Mock Strava sync with >1500 kJ 1Hz power stream & running velocity stream
+        # 6000s @ 260W = 1,560,000 J (1560 kJ), then 300s @ 340W after >1500 kJ!
+        watts_stream = [260] * 6000 + [340] * 300
+        hr_stream = [142] * 6000 + [174] * 300
+        mock_acts = [
+            {
+                "id": "9001",
+                "start_date_local": f"{d_yest}T17:30:00Z",
+                "name": "Outdoor Endurance + Finale",
+                "sport_type": "Ride",
+                "moving_time": 6300,
+                "distance": 62500.0,
+                "total_elevation_gain": 480,
+                "streams": {"watts": watts_stream, "heartrate": hr_stream},
+            },
+            {
+                "id": "9002",
+                "start_date_local": f"{d_yest}T08:00:00Z",
+                "name": "Morning Tempo Run",
+                "sport_type": "Run",
+                "moving_time": 1500,
+                "distance": 6000.0,
+                "total_elevation_gain": 35,
+                "streams": {"velocity_smooth": [4.0] * 1500, "heartrate": [158] * 1500},
+                "private_note": "Lockerer Schritt",
+            },
+        ]
+        mock_path = os.path.join(self.tmp, "strava_mock.json")
+        with open(mock_path, "w", encoding="utf-8") as fh:
+            json.dump(mock_acts, fh)
+        res_sync = self.atlas("coach", "sync", "--mock-file", mock_path, "--execute").stdout
+        self.assertIn("2 activity/ies processed", res_sync)
+        self.assertIn("1 calendar workout(s) marked [x]", res_sync)
+        self.assertIn("1 ride check-in(s) pending", res_sync)
+
+        # Check 3-Epoch Power Curve (Fresh & Fatigued >1500 kJ) and Running Paces
+        pc_text = self.read(os.path.join(self.brain, "coach", "power-curve.md"))
+        self.assertIn("340 W", pc_text)
+        self.assertIn("4:10/km", pc_text)
+
+        # Check calendar [x] auto-match and pending feedback check-in
+        cal_after = self.read(cal_path)
+        self.assertIn(f"- [x] {d_yest} 17:30 [workout:cycling]", cal_after)
+        self.assertIn("[feedback: pending]", cal_after)
+
+        # Save athlete ride feedback note
+        res_note = self.atlas("coach", "note", "--date", d_yest, "--text", "Beine top im Finale", "--rpe", "7").stdout
+        self.assertIn("RPE 7/10 — Beine top im Finale", res_note)
+        self.assertIn("[feedback: RPE 7/10 — Beine top im Finale]", self.read(cal_path))
+        self.assertNotIn("[feedback: pending]", self.read(cal_path))
+
+        # 4. Verify Coach Context Slicing & Hook Routing + Staleness Detection
+        ctx_out = self.atlas("coach", "context", "--mode", "plan-14d", "--no-sync").stdout
+        self.assertIn("ATHLETE PROFILE & THRESHOLDS", ctx_out)
+        self.assertIn("3-EPOCH POWER & PACE CURVE", ctx_out)
+
+        # Add a new goal to trigger goals_hash staleness detection
+        with open(cal_path, "a", encoding="utf-8") as fh:
+            fh.write(f"\n- [ ] {(today + dt.timedelta(days=45)).isoformat()} [goal:B] Jedermann Kriterium\n")
+        hook_out = self.hook("claude", "prompt", {
+            "prompt": "Coach, bitte erstelle meinen Trainingsplan für die nächsten 2 Wochen",
+            "session_id": "coach-sess",
+            "cwd": fwd(self.root),
+        })
+        self.assertIn("Atlas coach -> mode 'plan-14d'", hook_out)
+        self.assertIn("Macro plan is STALE", hook_out)
+
+        # 5. Verify atlas.py check passes with 0 errors, 0 orphans, and within skill description budget
+        self.wire_both()
+        chk = self.atlas("check", check=False).stdout
+        self.assertNotIn("ERROR", chk, chk)
+        self.assertNotIn("not reachable from INDEX.md", chk, chk)
+        self.assertNotIn("skill descriptions total", chk, chk)
+
+
 if __name__ == "__main__":
     os.makedirs(BASE_DIR, exist_ok=True)
     prog = unittest.main(argv=[sys.argv[0], "-v", *sys.argv[1:]], exit=False)
