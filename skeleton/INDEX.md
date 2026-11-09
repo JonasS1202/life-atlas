@@ -31,6 +31,7 @@ when an area or rule appears or moves, this page changes in the same turn. Write
 |---|---|---|
 | `self/` | Who the user is: profile, values, goals, patterns | `self/README.md` |
 | `calendar/` | Central calendar timeline (events, blocked dates, goals, workouts, birthdays) & open to-dos | `calendar/README.md` |
+| `coach/` | Sport-Coach hub: athlete profile, thresholds, macro periodization, 3-epoch power curve, activity log | `coach/README.md` |
 | `settings.md` | How Atlas behaves: briefing, questions, rhythms, style (the user changes it in plain words) | – |
 | `tags.md` | Tag vocabulary with synonyms | – |
 | `glossary.md` | Terms, abbreviations, nicknames | – |

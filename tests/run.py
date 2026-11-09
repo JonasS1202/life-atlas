@@ -319,6 +319,43 @@ class Update(AtlasCase):
         self.assertEqual(self.read(self.hookf), hook_before)
         self.assertNotEqual(self.read(os.path.join(self.brain, "_atlas", "VERSION")).strip(), "9.9.9")
 
+    def test_upgrade_heals_missing_coach_skill_and_protects_user_data(self):
+        self.wire_both()
+        a = os.path.join(self.brain, "_atlas")
+        # Simulate a broken v0.7.0 / v0.6.x state where atlas-coach skill and procedure were missing
+        for p in (
+            os.path.join(a, "skills", "atlas-coach", "SKILL.md"),
+            os.path.join(a, ".base", "skills", "atlas-coach", "SKILL.md"),
+            os.path.join(a, "procedures", "coach.md"),
+            os.path.join(a, ".base", "procedures", "coach.md"),
+            os.path.join(self.root, ".agents", "skills", "atlas-coach", "SKILL.md"),
+            os.path.join(self.root, ".claude", "skills", "atlas-coach", "SKILL.md"),
+        ):
+            if os.path.exists(p):
+                os.remove(p)
+        # Simulate local drift in a core skill file (must be hard-overwritten by update)
+        with open(os.path.join(a, "skills", "atlas-brief", "SKILL.md"), "a", encoding="utf-8") as fh:
+            fh.write("\n<!-- stale local drift -->\n")
+        # Simulate sacred user data in brain/coach/profile.md and brain/ROUTER.md (must be 100% protected)
+        prof_path = os.path.join(self.brain, "coach", "profile.md")
+        with open(prof_path, "w", encoding="utf-8") as fh:
+            fh.write("---\nsummary: Custom Athlete Profile\ntags: [sport, self]\n---\n# Athlete Profile\n\n| **FTP** | `295 W (4.30 W/kg)` | Custom User Data |\n")
+        with open(os.path.join(self.brain, "ROUTER.md"), "a", encoding="utf-8") as fh:
+            fh.write("- Eigene goldene Regel: Niemals überschreiben.\n")
+        with open(os.path.join(a, "VERSION"), "w", encoding="utf-8") as fh:
+            fh.write("0.7.0\n")
+
+        up = self.make_upstream(version="0.7.1")
+        self.atlas("core-apply", "--source", up, "--user-home", self.home, "--execute")
+
+        self.assertTrue(os.path.isfile(os.path.join(a, "skills", "atlas-coach", "SKILL.md")))
+        self.assertTrue(os.path.isfile(os.path.join(a, "procedures", "coach.md")))
+        self.assertTrue(os.path.isfile(os.path.join(self.root, ".agents", "skills", "atlas-coach", "SKILL.md")))
+        self.assertTrue(os.path.isfile(os.path.join(self.root, ".claude", "skills", "atlas-coach", "SKILL.md")))
+        self.assertNotIn("stale local drift", self.read(os.path.join(a, "skills", "atlas-brief", "SKILL.md")))
+        self.assertIn("295 W (4.30 W/kg)", self.read(prof_path))
+        self.assertIn("Eigene goldene Regel: Niemals überschreiben.", self.read(os.path.join(self.brain, "ROUTER.md")))
+
 
 class Devices(AtlasCase):
     def test_two_devices_sync_and_conflict(self):

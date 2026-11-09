@@ -1062,15 +1062,26 @@ def _extract_coach_context(idx, cal_items=None):
 
     sport_tags = {"radsport", "sport", "cycling", "running", "gesundheit", "health", "training", "fitness"}
     cand_rels = []
-    # Prioritize brain/coach/profile.md first so canonical coach thresholds take precedence
-    if os.path.isfile(os.path.join(BRAIN, "coach", "profile.md")):
+    prof_full = os.path.join(BRAIN, "coach", "profile.md")
+    prof_customized = False
+    if os.path.isfile(prof_full):
+        try:
+            with open(prof_full, encoding="utf-8", errors="replace") as fh:
+                ptxt = fh.read(4000)
+            prof_customized = not ("186 cm" in ptxt and "75.0 kg" in ptxt) and "— cm · — kg" not in ptxt
+        except OSError:
+            pass
+    # Prioritize customized brain/coach/profile.md first so canonical coach thresholds take precedence
+    if prof_customized and "coach/profile.md" in idx:
         cand_rels.append("coach/profile.md")
     for rel, e in sorted(idx.items()):
-        if rel in cand_rels:
+        if rel in cand_rels or (rel == "coach/profile.md" and not prof_customized):
             continue
         tset = set(e.get("tags", []))
         if rel.startswith(("self/", "coach/")) or (tset & sport_tags) or any(w in rel.lower() for w in ("radsport", "sport", "training", "physiologie")):
             cand_rels.append(rel)
+    if os.path.isfile(prof_full) and "coach/profile.md" not in cand_rels:
+        cand_rels.append("coach/profile.md")
 
     for rel in cand_rels:
         full = os.path.join(BRAIN, rel)
@@ -2681,7 +2692,11 @@ def prompt_text(prompt, cwd, session):
                      ".agents/rules) once; after that work there like a normal coding agent.")
         sess.setdefault("routed", []).append(p["slug"])
         sess["project"] = p["slug"]
-    coach_enabled = "coach" in st.get("modules", []) or os.path.isdir(os.path.join(BRAIN, "coach"))
+    coach_enabled = (
+        "coach" in st.get("modules", [])
+        or os.path.isdir(os.path.join(BRAIN, "coach"))
+        or os.path.isfile(os.path.join(BRAIN, "_atlas", "procedures", "coach.md"))
+    )
     if (coach_enabled or COACH_RX_EXPLICIT.search(prompt)) and not routes:
         c_mode, c_why, c_macro = detect_coach_mode(prompt, idx)
         if c_mode:

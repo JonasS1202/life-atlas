@@ -288,12 +288,11 @@ def cmd_init(args):
         else:
             shutil.copy2(s, d)
     write(os.path.join(brain, "ROUTER.md"), render(read(os.path.join(src, "core", "templates", "router.md")), values))
-    for d in ("inbox", "journal", "people", "areas", "projects", "howto", "self", "calendar", "skills", "_secrets",
+    for d in ("inbox", "journal", "people", "areas", "projects", "howto", "self", "calendar", "coach",
+              os.path.join("coach", "workouts"), "skills", "_secrets",
               "_archive", os.path.join("_atlas", "memory"), os.path.join("_atlas", "migrations")):
         os.makedirs(os.path.join(brain, d), exist_ok=True)
-    if "coach" in modules:
-        os.makedirs(os.path.join(brain, "coach", "workouts"), exist_ok=True)
-        _ensure_coach_index_link(brain, execute=True)
+    _ensure_coach_index_link(brain, execute=True)
     os.makedirs(os.path.join(root, "code"), exist_ok=True)
     mem = os.path.join(brain, "_atlas", "memory", "MEMORY.md")
     if not os.path.exists(mem):
@@ -394,6 +393,9 @@ def cmd_wire(args, remove=False):
         set_state(brain, granted=granted)
     else:
         wired[key] = {"hooks": fwd(t["hooks"]), "python": fwd(python), "router_mode": args.router_mode}
+        if os.path.isdir(os.path.join(brain, "coach")):
+            os.makedirs(os.path.join(brain, "coach", "workouts"), exist_ok=True)
+            _ensure_coach_index_link(brain, execute=True)
     extra = {}
     if args.agent == "antigravity":
         extra["antigravity_router_copy"] = fwd(t["router"]) if (not remove and args.router_mode == "copy") else ""
@@ -1559,12 +1561,12 @@ def _coach_init(root, brain, hk, execute=True, quiet=False):
         os.makedirs(workouts_dir, exist_ok=True)
     for rel, content in files:
         dst = os.path.join(brain, rel)
-        if not os.path.isfile(dst) or (not quiet and rel == "coach/profile.md" and prof_is_skeleton and m_map):
+        if not os.path.isfile(dst) or (rel == "coach/profile.md" and prof_is_skeleton and m_map):
             created.append(rel)
             if execute:
                 write(dst, content)
     macro_dst = os.path.join(brain, "coach", "macro-plan.md")
-    if execute and not quiet and os.path.isfile(macro_dst):
+    if execute and os.path.isfile(macro_dst):
         m_txt = read(macro_dst)
         if "goals_hash: none" in m_txt and ghash != "none":
             write(macro_dst, m_txt.replace("goals_hash: none", f"goals_hash: {ghash}", 1))
@@ -3018,7 +3020,10 @@ def _apply_upgrade(brain, src, values, data, dry):
     return acts, list(data.get("notes", []))
 
 
-def _plan_core(brain, root, src):
+HARD_CORE_PREFIXES = ("tools/", "hooks/", "skills/", "agents/", "upgrades/", "VERSION", "charter.md", "adapters.md")
+
+
+def _plan_core(brain, root, src, hard=False):
     st = get_state(brain)
     modules = list(st.get("modules", []))
     atlas_dir = os.path.join(brain, "_atlas")
@@ -3038,8 +3043,14 @@ def _plan_core(brain, root, src):
     for rel in sorted(set(new) | set(local) | set(base)):
         if rel.startswith("upgrades/") and rel not in new:
             continue
-        items.append((rel, _three_way(local.get(rel), base.get(rel), new.get(rel, (None, None))[0])))
-    # The router's core block (in brain/ROUTER.md) takes part like a file.
+        up_h = new.get(rel, (None, None))[0]
+        loc_h = local.get(rel)
+        if (hard or rel.startswith(HARD_CORE_PREFIXES)) and up_h is not None:
+            decision = "same" if loc_h == up_h else ("add" if loc_h is None else "update")
+        else:
+            decision = _three_way(loc_h, base.get(rel), up_h)
+        items.append((rel, decision))
+    # The router's core block (in brain/ROUTER.md) is always updated to upstream; personal rules after <!-- atlas:core:end --> stay untouched.
     router_path = os.path.join(brain, "ROUTER.md")
     local_block = _router_core(read(router_path)) if os.path.exists(router_path) else None
     up_block = _router_core(render(read(os.path.join(src, "core", "templates", "router.md")),
@@ -3050,7 +3061,12 @@ def _plan_core(brain, root, src):
     else:  # Atlas installed before 0.4: the installed template is the base
         tpl = os.path.join(atlas_dir, "templates", "router.md")
         base_block = _router_core(render(read(tpl), _router_values(brain, root))) if os.path.exists(tpl) else None
-    router = _three_way(local_block, base_block, up_block) if local_block is not None else "missing"
+    if local_block is None:
+        router = "missing"
+    elif local_block == up_block or up_block is None:
+        router = "same"
+    else:
+        router = "update"
     return {"items": items, "new": new, "router": (router, local_block, base_block, up_block), "v_old": v_old,
             "v_new": v_new, "modules": modules}
 
@@ -3089,7 +3105,21 @@ def cmd_core_diff(args, apply=False):
     root, brain = paths(args)
     src, cleanup = _resolve_source(brain, getattr(args, "source", None))
     try:
-        plan = _plan_core(brain, root, src)
+        if apply and args.execute and not getattr(args, "bootstrapped", False):
+            src_tool = os.path.join(src, "core", "tools", "atlas.py")
+            cur_tool = os.path.abspath(__file__)
+            if os.path.isfile(src_tool) and sha256_file(src_tool) != sha256_file(cur_tool):
+                chk = subprocess.run([sys.executable, "-I", "-m", "py_compile", src_tool], capture_output=True)
+                if chk.returncode == 0:
+                    cmd = [sys.executable, "-I", src_tool, "--root", root, "core-apply", "--source", src,
+                           "--execute", "--bootstrapped"]
+                    if getattr(args, "user_home", None):
+                        cmd += ["--user-home", args.user_home]
+                    if getattr(args, "hard", False):
+                        cmd.append("--hard")
+                    res = subprocess.run(cmd)
+                    sys.exit(res.returncode)
+        plan = _plan_core(brain, root, src, hard=getattr(args, "hard", False))
         groups = {}
         for rel, what in plan["items"]:
             groups.setdefault(what, []).append(rel)
@@ -3197,6 +3227,10 @@ def _core_apply(args, root, brain, src, plan, ups, values):
         acts, n = _apply_upgrade(brain, src, values, data, dry=False)
         result.setdefault("upgrades", []).extend(f"{v}: {a}" for a in acts)
         notes += [f"{v}: {x}" for x in n]
+    try:
+        _coach_init(root, brain, hook_module(brain), execute=True, quiet=True)
+    except Exception:
+        pass
     # The new base is the upstream we just considered; unresolved conflicts keep their old base until accepted.
     unresolved = set(result["conflicts"])
     base_dir = os.path.join(atlas_dir, BASE)
@@ -3215,12 +3249,38 @@ def _core_apply(args, root, brain, src, plan, ups, values):
     # Re-wire with the NEW tool and probe every wired agent; any failure rolls everything back.
     tool = os.path.join(atlas_dir, "tools", "atlas.py")
     st = get_state(brain)
-    wired = st.get("wired", {}) if isinstance(st.get("wired"), dict) else {}
+    wired = dict(st.get("wired", {})) if isinstance(st.get("wired"), dict) else {}
+    # Auto-detect project-scoped agent wiring in root if state.json lost it
+    if "antigravity:project" not in wired and (
+        os.path.isfile(os.path.join(root, "GEMINI.md"))
+        or os.path.isfile(os.path.join(root, ".agents", "hooks.json"))
+        or os.path.isdir(os.path.join(root, ".agents", "skills"))
+    ):
+        g_md = read(os.path.join(root, "GEMINI.md")) if os.path.isfile(os.path.join(root, "GEMINI.md")) else ""
+        wired["antigravity:project"] = {
+            "hooks": fwd(os.path.join(root, ".agents", "hooks.json")),
+            "python": fwd(sys.executable),
+            "router_mode": "copy" if "atlas:router:start" in g_md else "include",
+        }
+    if "claude:project" not in wired and (
+        os.path.isfile(os.path.join(root, "CLAUDE.md"))
+        or os.path.isfile(os.path.join(root, ".claude", "settings.json"))
+        or os.path.isdir(os.path.join(root, ".claude", "skills"))
+    ):
+        wired["claude:project"] = {
+            "hooks": fwd(os.path.join(root, ".claude", "settings.json")),
+            "python": fwd(sys.executable),
+            "router_mode": "include",
+        }
     failed = []
     for key, info in wired.items():
         agent, scope = key.split(":")
+        rmode = (info or {}).get("router_mode") or "include"
+        if agent == "antigravity" and scope == "project" and os.path.isfile(os.path.join(root, "GEMINI.md")):
+            if "atlas:router:start" in read(os.path.join(root, "GEMINI.md")):
+                rmode = "copy"
         base_cmd = [sys.executable, "-I", tool, "--root", root]
-        r1 = subprocess.run(base_cmd + ["wire", "--agent", agent, "--scope", scope, "--execute"] +
+        r1 = subprocess.run(base_cmd + ["wire", "--agent", agent, "--scope", scope, "--router-mode", rmode, "--execute"] +
                             (["--user-home", args.user_home] if getattr(args, "user_home", None) else []),
                             capture_output=True, text=True, encoding="utf-8", errors="replace")
         r2 = subprocess.run(base_cmd + ["probe", "--agent", agent, "--scope", scope] +
@@ -3654,10 +3714,12 @@ def main():
     for name in ("core-diff", "core-apply"):
         p = sub.add_parser(name)
         p.add_argument("--source", help="life-atlas folder or URL (default: state upstream)")
+        p.add_argument("--hard", action="store_true", help="hard-overwrite all _atlas/ core files (user brain/ files stay untouched)")
         p.add_argument("--execute", action="store_true")
         if name == "core-apply":
             p.add_argument("--rollback", help="restore the core backed up by this run id")
             p.add_argument("--user-home", help="for tests: use this folder instead of ~ when re-wiring")
+            p.add_argument("--bootstrapped", action="store_true", help=argparse.SUPPRESS)
     p = sub.add_parser("core-accept")
     p.add_argument("--source", help="life-atlas folder or URL (default: state upstream)")
     p.add_argument("files", nargs="+", help="core files (or ROUTER.md) whose conflict you merged by hand")

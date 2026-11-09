@@ -18,11 +18,14 @@ python -I <ROOT>/brain/_atlas/tools/atlas.py core-apply --execute
 
 What this command does automatically in one step:
 - Clones the upstream `life-atlas` repository from `_atlas/state.json` → `upstream` (falling back to the official
-  `https://github.com/JonasS1202/life-atlas.git`) into a temporary folder.
-- Performs a three-way comparison against `_atlas/.base/`, backs up `_atlas/` and grown files, applies all clean
-  updates and three-way merges, updates the router core block (keeping the user's personal section untouched), runs
-  declarative upgrades, re-wires every connected agent, probes the hooks (rolling back automatically if any probe
-  fails), and commits `atlas: update-check core <old> -> <new>`.
+  `https://github.com/JonasS1202/life-atlas.git`) into a temporary folder and self-bootstraps into the new `atlas.py`.
+- Hard-updates all engine files (`_atlas/tools/`, `_atlas/hooks/`, `_atlas/skills/`, `_atlas/agents/`, `_atlas/upgrades/`,
+  `VERSION`, `charter.md`, `adapters.md`) and the `ROUTER.md` core block (`<!-- atlas:core:start/end -->`), while
+  keeping all user data (`self/`, `people/`, `areas/`, `projects/`, `howto/`, `journal/`, `inbox/`, `skills/`,
+  `_secrets/`, `calendar/`, `coach/`, and the personal `## About` section of `ROUTER.md`) 100% untouched.
+- Runs declarative upgrades and post-upgrade initializers (`coach --init`), auto-detects and re-wires every connected
+  agent (`.agents/skills/`, `.claude/skills/`, hooks, preserving `router_mode`), probes the hooks (rolling back
+  automatically if any probe fails), and commits `atlas: update-check core <old> -> <new>`.
 - Prints the full `changelog:` between the versions and what changed.
 
 After running `core-apply --execute`:

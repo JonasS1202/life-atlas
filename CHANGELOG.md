@@ -2,6 +2,14 @@
 
 Written for users: `/atlas-update` shows the sections between the installed and the new version.
 
+## [0.7.1] - 2026-11-09
+
+- **Hardened & Self-Bootstrapping Update Engine (`core-apply` / `/atlas-update`):**
+  - **Promoted `/atlas-coach` (`SKILL.md`, `procedures/coach.md`, and `skeleton/coach/*.md`) into Core & Skeleton:** Fixed an upgrade bug where updating from `v0.6.x` to `v0.7.0` executed the old `v0.6.x` `atlas.py` (which did not recognize `"modules_add": ["coach"]` in `0.7.0.json`), leaving `brain/_atlas/skills/atlas-coach/SKILL.md`, `brain/_atlas/procedures/coach.md`, and `.agents/skills/atlas-coach/SKILL.md` uninstalled until manually wired. Moving them into `core/` and `skeleton/` ensures both `0.6.x -> 0.7.1` and `0.7.0 -> 0.7.1` updates install and wire `/atlas-coach` in one step.
+  - **Self-Bootstrapping `core-apply`:** `atlas.py core-apply --execute` now automatically delegates execution to the newly downloaded upstream `src/core/tools/atlas.py` (`--bootstrapped`) after verifying it compiles cleanly, so future updates always run with the newest upgrade engine.
+  - **Deterministic Hard Engine Sync with 100% User-Data Protection:** Engine files (`tools/`, `hooks/`, `skills/`, `agents/`, `upgrades/`, `VERSION`, `charter.md`, `adapters.md`) and the `ROUTER.md` core block (`<!-- atlas:core:start --> ... <!-- atlas:core:end -->`) are now always deterministically updated to upstream (never stuck in `keep-local` or `conflict`), while all user brain pages (`self/`, `people/`, `areas/`, `projects/`, `howto/`, `journal/`, `inbox/`, `skills/`, `_secrets/`, `calendar/README.md`, existing `coach/*.md` files, and the personal `## About <Name>` section of `ROUTER.md`) remain 100% untouched.
+  - **Automatic Agent Re-Wiring & Router-Mode Preservation:** `core-apply` now auto-detects project-wired agents (`GEMINI.md` / `.agents/` and `CLAUDE.md` / `.claude/`) even if `state.json` lost an entry, preserves `router_mode` (`copy` vs. `include`), and runs `_coach_init` deterministically in Python.
+
 ## [0.7.0] - 2026-11-09
 
 - **Native Atlas Sport-Coach (`modules/coach/`, `/atlas-coach`, `atlas.py coach`):**

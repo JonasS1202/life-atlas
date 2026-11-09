@@ -1,10 +1,16 @@
 {
   "dirs": ["coach", "coach/workouts"],
-  "modules_add": ["coach"],
+  "skeleton_add": [
+    "coach/README.md",
+    "coach/profile.md",
+    "coach/macro-plan.md",
+    "coach/power-curve.md",
+    "coach/activities.md"
+  ],
   "tags_add": [
     ["sport", "Sport, endurance training, coaching, workouts, physiology", "training, laufen, running, triathlon, athletik"]
   ],
   "notes": [
-    "Run `python -I <ROOT>/brain/_atlas/tools/atlas.py coach --init --execute` (or `python3`) to scaffold `brain/coach/` (`profile.md`, `macro-plan.md`, `power-curve.md`, `activities.md`), harvest existing athlete thresholds from `brain/self/` or `brain/areas/` into `brain/coach/profile.md`, and link `coach/README.md` in `brain/INDEX.md`."
+    "Run `python -I <ROOT>/brain/_atlas/tools/atlas.py coach --init --execute` (or `python3`) to harvest any existing athlete thresholds from `brain/self/` or `brain/areas/` into `brain/coach/profile.md` and link `coach/README.md` in `brain/INDEX.md`."
   ]
 }
