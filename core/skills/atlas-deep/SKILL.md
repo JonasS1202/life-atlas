@@ -1,7 +1,6 @@
 ---
 name: atlas-deep
-description: "Deep mode, only on request: a reflective conversation about values, motives, patterns and goals; kept only with consent. Use for 'deep mode', 'lerne mich kennen', 'analysiere mich'."
-disable-model-invocation: true
+description: "Deep friend-and-psychologist conversation to truly understand the user beyond surface facts: relationships, motives, blind spots, history, and nuances across all brain pages. Use for 'deep mode', 'lerne mich kennen', 'frag mich tief aus', 'wie ein Freund', 'analysiere mich'."
 ---
 
 Read `{{BRAIN}}/_atlas/procedures/deep.md` completely and follow it.

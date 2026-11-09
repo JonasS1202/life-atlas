@@ -2,6 +2,16 @@
 
 Written for users: `/atlas-update` shows the sections between the installed and the new version.
 
+## [0.5.0] - 2026-11-09
+
+- **Deep friend-and-psychologist mode (`/atlas-deep`):** Completely redesigned `procedures/deep.md` and unlocked natural
+  chat invocation in `skills/atlas-deep/SKILL.md`. Instead of an abstract questionnaire, Atlas now scans `self/`,
+  `people/`, `areas/`, `projects/`, and `journal/` for depth gaps (treating fact-only pages as blank canvases), holds a
+  warm evening-with-a-best-friend conversation using psychological mirroring and bold hypotheses, follows up 2–3 layers
+  deep before changing topics, and files insights continuously into the brain.
+- **Smarter `/atlas-interview`:** Never stops with "I already know everything" once structural facts exist; automatically
+  pivots to context/relationship questions on thin pages or offers a seamless transition into `/atlas-deep`.
+
 ## [0.4.0] - 2026-11-07
 
 - **Safe updates:** three-way comparison of the core (`_atlas/.base/`), automatic merge with `git merge-file`, local

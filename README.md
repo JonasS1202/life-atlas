@@ -44,7 +44,7 @@ agent memories, scattered documents and code repositories included), and ends wi
 | **Daily log** | Each `Atlas:` line lands in `journal/<year>/<date>.md`: "what did we do last Tuesday" has an answer, at no token cost. |
 | **Looks after itself** | Weekly maintenance: scripts fix the mechanics (links, tag synonyms, caches), the model only judges what is left. |
 | **Personal** | Briefing, questions (per briefing, evenings, weekly, off), reminders, maintenance cadence, tone: defaults you change in plain words. Safety rules stay fixed. |
-| **Knows you** | `self/` holds who you are. `/atlas-deep`, only on request, is a reflective conversation about values, motives and goals; kept only with your consent. |
+| **Knows you** | `self/` holds who you are. `/atlas-deep` is a deep friend-and-psychologist conversation across your whole brain (relationships, motives, blind spots, nuances) so Atlas's everyday advice fits who you really are. |
 | **Several devices** | The brain is pulled at the start of a chat and pushed at the end; project paths are device-independent; `atlas.py code-sync` brings your repos to a new machine. |
 | **Self-healing** | Every chat starts with `Atlas · ok`. If an agent update breaks the wiring, Atlas notices, researches the official docs, prepares and tests the fix, and applies it after one yes. |
 
