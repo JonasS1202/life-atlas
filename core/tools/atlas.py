@@ -41,8 +41,10 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
+DEFAULT_UPSTREAM = "https://github.com/JonasS1202/life-atlas.git"
 TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 INSTALLED_BRAIN = os.path.normpath(os.path.join(TOOLS_DIR, "..", ".."))
 HOOK_FILE = os.path.normpath(os.path.join(TOOLS_DIR, "..", "hooks", "atlas_hook.py"))
@@ -696,48 +698,54 @@ SAMPLES = {
 def cmd_probe(args):
     root, brain = paths(args)
     user_home = os.path.abspath(os.path.expanduser(args.user_home or "~"))
-    t = _targets(args.agent, args.scope, root, user_home)
-    cmds = {}
-    if args.agent == "claude":
-        settings = load_json(t["hooks"], {})
-        for ev, he in (("session", "SessionStart"), ("prompt", "UserPromptSubmit"), ("stop", "Stop")):
-            for e in settings.get("hooks", {}).get(he, []):
-                for h in e.get("hooks", []):
-                    if "atlas_hook.py" in h.get("command", ""):
-                        cmds[ev] = h["command"]
+    if args.agent:
+        pairs = [(args.agent, args.scope)]
     else:
-        hooks = load_json(t["hooks"], {}).get("atlas", {})
-        for ev, he in (("session", "SessionStart"), ("prompt", "PreInvocation"), ("stop", "Stop")):
-            for h in hooks.get(he, []):
-                cmds[ev] = h.get("command", "")
+        wired = get_state(brain).get("wired", {})
+        pairs = [tuple(k.split(":")) for k in wired if ":" in k] or [("claude", args.scope), ("antigravity", args.scope)]
     ok = True
-    for ev in ("session", "prompt", "stop"):
-        cmd = cmds.get(ev)
-        if not cmd:
-            say(f"FAIL {args.agent}:{args.scope} {ev}: not registered in {fwd(t['hooks'])}")
-            ok = False
-            continue
-        sample = dict(SAMPLES[(args.agent, ev)])
-        sample["cwd" if args.agent == "claude" else "workspacePaths"] = fwd(root) if args.agent == "claude" else [fwd(root)]
-        t0 = time.monotonic()
-        try:
-            res = subprocess.run(cmd, shell=True, input=json.dumps(sample), capture_output=True, text=True,
-                                 timeout=30, cwd=root, encoding="utf-8", errors="replace",
-                                 env=dict(os.environ, ATLAS_PROBE="1"))
-        except subprocess.TimeoutExpired:
-            say(f"FAIL {args.agent} {ev}: timeout")
-            ok = False
-            continue
-        ms = int((time.monotonic() - t0) * 1000)
-        out = res.stdout.strip()
-        try:
-            json.loads(out) if out else None
-            valid = res.returncode == 0
-        except ValueError:
-            valid = False
-        ok &= valid
-        say(f"{'OK  ' if valid else 'FAIL'} {args.agent}:{args.scope} {ev}: exit {res.returncode}, {ms} ms, "
-            f"{len(out)} bytes{'' if valid else ' -> ' + (out or res.stderr)[:300]}")
+    for agent, scope in pairs:
+        t = _targets(agent, scope, root, user_home)
+        cmds = {}
+        if agent == "claude":
+            settings = load_json(t["hooks"], {})
+            for ev, he in (("session", "SessionStart"), ("prompt", "UserPromptSubmit"), ("stop", "Stop")):
+                for e in settings.get("hooks", {}).get(he, []):
+                    for h in e.get("hooks", []):
+                        if "atlas_hook.py" in h.get("command", ""):
+                            cmds[ev] = h["command"]
+        else:
+            hooks = load_json(t["hooks"], {}).get("atlas", {})
+            for ev, he in (("session", "SessionStart"), ("prompt", "PreInvocation"), ("stop", "Stop")):
+                for h in hooks.get(he, []):
+                    cmds[ev] = h.get("command", "")
+        for ev in ("session", "prompt", "stop"):
+            cmd = cmds.get(ev)
+            if not cmd:
+                say(f"FAIL {agent}:{scope} {ev}: not registered in {fwd(t['hooks'])}")
+                ok = False
+                continue
+            sample = dict(SAMPLES[(agent, ev)])
+            sample["cwd" if agent == "claude" else "workspacePaths"] = fwd(root) if agent == "claude" else [fwd(root)]
+            t0 = time.monotonic()
+            try:
+                res = subprocess.run(cmd, shell=True, input=json.dumps(sample), capture_output=True, text=True,
+                                     timeout=30, cwd=root, encoding="utf-8", errors="replace",
+                                     env=dict(os.environ, ATLAS_PROBE="1"))
+            except subprocess.TimeoutExpired:
+                say(f"FAIL {agent} {ev}: timeout")
+                ok = False
+                continue
+            ms = int((time.monotonic() - t0) * 1000)
+            out = res.stdout.strip()
+            try:
+                json.loads(out) if out else None
+                valid = res.returncode == 0
+            except ValueError:
+                valid = False
+            ok &= valid
+            say(f"{'OK  ' if valid else 'FAIL'} {agent}:{scope} {ev}: exit {res.returncode}, {ms} ms, "
+                f"{len(out)} bytes{'' if valid else ' -> ' + (out or res.stderr)[:300]}")
     sys.exit(0 if ok else 1)
 
 
@@ -1598,46 +1606,68 @@ def _changelog(src, v_old, v_new):
     return out
 
 
+def _resolve_source(brain, src_arg):
+    """Resolve a local life-atlas path or clone upstream into a temporary folder."""
+    if src_arg and os.path.isdir(src_arg):
+        return os.path.abspath(src_arg), None
+    st = get_state(brain)
+    url = src_arg or st.get("upstream") or DEFAULT_UPSTREAM
+    if os.path.isdir(url):
+        return os.path.abspath(url), None
+    tmp = tempfile.mkdtemp(prefix="atlas-up-")
+    res = subprocess.run(["git", "clone", "--depth", "1", url, tmp], capture_output=True, text=True)
+    if res.returncode != 0:
+        shutil.rmtree(tmp, ignore_errors=True)
+        sys.exit(f"Could not clone upstream {url}: {(res.stderr or res.stdout).strip()}")
+    return tmp, tmp
+
+
 def cmd_core_diff(args, apply=False):
     root, brain = paths(args)
-    src = os.path.abspath(args.source)
-    plan = _plan_core(brain, root, src)
-    groups = {}
-    for rel, what in plan["items"]:
-        groups.setdefault(what, []).append(rel)
-    router = plan["router"][0]
-    ups = _upgrades(src, plan["v_old"], plan["v_new"])
-    values = _router_values(brain, root)
-    say(f"update: installed {plan['v_old']} -> source {plan['v_new']}")
-    labels = {"update": "update (upstream changed, yours untouched)", "add": "new from upstream",
-              "remove": "dropped upstream", "keep-local": "kept: changed only in this Atlas",
-              "conflict": "CONFLICT: changed here and upstream -> three-way merge"}
-    for what in ("update", "add", "remove", "keep-local", "conflict"):
-        for rel in groups.get(what, []):
-            say(f"  {labels[what]}: _atlas/{rel}")
-    if router not in ("same", "missing"):
-        say(f"  router core block: {labels.get(router, router)} (your personal part always stays)")
-    notes = []
-    for v, data in ups:
-        acts, n = _apply_upgrade(brain, src, values, data, dry=True)
-        for a in acts:
-            say(f"  upgrade {v}: {a}")
-        notes += [f"{v}: {x}" for x in n]
-    for x in notes:
-        say(f"  agent task {x}")
-    log = _changelog(src, plan["v_old"], plan["v_new"])
-    if log:
-        say("changelog:\n  " + "\n  ".join(log[:40]))
-    pending = [w for _r, w in plan["items"] if w not in ("same",)] or router not in ("same", "missing") or ups
-    if not pending:
-        say("up to date: nothing to apply")
-        return
-    if not apply:
-        return
-    if not args.execute:
-        say("Dry run. Add --execute: backs up, applies, re-wires, probes, and rolls back by itself if a probe fails.")
-        return
-    _core_apply(args, root, brain, src, plan, ups, values)
+    src, cleanup = _resolve_source(brain, getattr(args, "source", None))
+    try:
+        plan = _plan_core(brain, root, src)
+        groups = {}
+        for rel, what in plan["items"]:
+            groups.setdefault(what, []).append(rel)
+        router = plan["router"][0]
+        ups = _upgrades(src, plan["v_old"], plan["v_new"])
+        values = _router_values(brain, root)
+        say(f"update: installed {plan['v_old']} -> source {plan['v_new']}")
+        labels = {"update": "update (upstream changed, yours untouched)", "add": "new from upstream",
+                  "remove": "dropped upstream", "keep-local": "kept: changed only in this Atlas",
+                  "conflict": "CONFLICT: changed here and upstream -> three-way merge"}
+        for what in ("update", "add", "remove", "keep-local", "conflict"):
+            for rel in groups.get(what, []):
+                say(f"  {labels[what]}: _atlas/{rel}")
+        if router not in ("same", "missing"):
+            say(f"  router core block: {labels.get(router, router)} (your personal part always stays)")
+        notes = []
+        for v, data in ups:
+            acts, n = _apply_upgrade(brain, src, values, data, dry=True)
+            for a in acts:
+                say(f"  upgrade {v}: {a}")
+            notes += [f"{v}: {x}" for x in n]
+        for x in notes:
+            say(f"  agent task {x}")
+        log = _changelog(src, plan["v_old"], plan["v_new"])
+        if log:
+            say("changelog:\n  " + "\n  ".join(log[:40]))
+        pending = [w for _r, w in plan["items"] if w not in ("same",)] or router not in ("same", "missing") or ups
+        if not pending:
+            if apply and args.execute:
+                _git(brain, "commit", "-q", "--allow-empty", "-m", "atlas: update-check")
+            say("up to date: nothing to apply")
+            return
+        if not apply:
+            return
+        if not args.execute:
+            say("Dry run. Add --execute: backs up, applies, re-wires, probes, and rolls back by itself if a probe fails.")
+            return
+        _core_apply(args, root, brain, src, plan, ups, values)
+    finally:
+        if cleanup:
+            shutil.rmtree(cleanup, ignore_errors=True)
 
 
 def _core_apply(args, root, brain, src, plan, ups, values):
@@ -1793,21 +1823,26 @@ def cmd_core_rollback(args):
 def cmd_core_accept(args):
     """After merging a conflict by hand: take the upstream version of these files as the new base."""
     root, brain = paths(args)
-    plan_new = _source_core(os.path.abspath(args.source), get_state(brain).get("modules", []))
-    for rel in args.files:
-        rel = fwd(rel).replace("_atlas/", "", 1) if rel.startswith("_atlas/") else fwd(rel)
-        if rel == "ROUTER.md":
-            block = _router_core(render(read(os.path.join(args.source, "core", "templates", "router.md")),
-                                        _router_values(brain, root)))
-            write(os.path.join(brain, "_atlas", BASE, ROUTER_BASE), block + "\n")
-        elif rel in plan_new:
-            dst = os.path.join(brain, "_atlas", BASE, rel)
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            shutil.copy2(plan_new[rel][1], dst)
-        else:
-            say(f"  not in the source core: {rel}")
-            continue
-        say(f"  accepted: {rel}")
+    src, cleanup = _resolve_source(brain, getattr(args, "source", None))
+    try:
+        plan_new = _source_core(src, get_state(brain).get("modules", []))
+        for rel in args.files:
+            rel = fwd(rel).replace("_atlas/", "", 1) if rel.startswith("_atlas/") else fwd(rel)
+            if rel == "ROUTER.md":
+                block = _router_core(render(read(os.path.join(src, "core", "templates", "router.md")),
+                                            _router_values(brain, root)))
+                write(os.path.join(brain, "_atlas", BASE, ROUTER_BASE), block + "\n")
+            elif rel in plan_new:
+                dst = os.path.join(brain, "_atlas", BASE, rel)
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copy2(plan_new[rel][1], dst)
+            else:
+                say(f"  not in the source core: {rel}")
+                continue
+            say(f"  accepted: {rel}")
+    finally:
+        if cleanup:
+            shutil.rmtree(cleanup, ignore_errors=True)
 
 
 # ================================================================= Atlas Dev (maintainers only)
@@ -2091,7 +2126,7 @@ def main():
     p.add_argument("--execute", action="store_true")
 
     p = sub.add_parser("probe")
-    p.add_argument("--agent", choices=("claude", "antigravity"), required=True)
+    p.add_argument("--agent", choices=("claude", "antigravity"), help="default: all wired agents")
     p.add_argument("--scope", choices=("project", "user"), default="project")
     p.add_argument("--user-home")
 
@@ -2120,13 +2155,13 @@ def main():
 
     for name in ("core-diff", "core-apply"):
         p = sub.add_parser(name)
-        p.add_argument("--source", required=name == "core-diff")
+        p.add_argument("--source", help="life-atlas folder or URL (default: state upstream)")
         p.add_argument("--execute", action="store_true")
         if name == "core-apply":
             p.add_argument("--rollback", help="restore the core backed up by this run id")
             p.add_argument("--user-home", help="for tests: use this folder instead of ~ when re-wiring")
     p = sub.add_parser("core-accept")
-    p.add_argument("--source", required=True)
+    p.add_argument("--source", help="life-atlas folder or URL (default: state upstream)")
     p.add_argument("files", nargs="+", help="core files (or ROUTER.md) whose conflict you merged by hand")
     p = sub.add_parser("dev-check")
     p.add_argument("--repo", help="life-atlas repository URL (default: state upstream)")

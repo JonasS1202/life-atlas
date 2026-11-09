@@ -2,6 +2,17 @@
 
 Written for users: `/atlas-update` shows the sections between the installed and the new version.
 
+## [0.5.1] - 2026-11-09
+
+- **One-command `/atlas-update` (applies immediately):** `atlas.py core-apply --execute` (and `core-diff` / `core-accept`)
+  now automatically clones `upstream` from `_atlas/state.json` (with fallback to the official repository) when `--source`
+  is omitted, installs clean updates immediately without waiting for a second confirmation after the preview, and skips
+  slow web searches or heal-mode probes when `Atlas · ok` is present. `atlas.py probe` without `--agent` now probes all
+  wired agents.
+- **Natural opening & real personality in `/atlas-deep`:** Explicitly forbids robotic meta-announcements (*"We are now in
+  Deep Mode..."*, *"In your own pace, without a mask..."*) and generic blank-slate questions. Atlas now greets the user
+  naturally by name like a close friend and opens directly with a concrete observation or hook from their `brain/`.
+
 ## [0.5.0] - 2026-11-09
 
 - **Deep friend-and-psychologist mode (`/atlas-deep`):** Completely redesigned `procedures/deep.md` and unlocked natural
