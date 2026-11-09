@@ -385,7 +385,11 @@ class Calendar(AtlasCase):
             fh.write(f"---\nsummary: Bruder Max\ntags: [person]\n---\n# Max\n\nGeburtstag: {d_bday}\n")
         os.makedirs(os.path.join(self.brain, "areas", "finanzen"), exist_ok=True)
         with open(os.path.join(self.brain, "areas", "finanzen", "steuern.md"), "w", encoding="utf-8") as fh:
-            fh.write("---\nsummary: Steuern\ntags: [contract]\n---\n# Steuern\n\n- [ ] Steuerbelege 2025 sortieren\n")
+            fh.write(f"---\nsummary: Steuern\ntags: [contract]\ndue:\n  - {d_wo} Erste Ausführung DBX0AN-Sparplan (140 Euro)\n---\n# Steuern\n\n- [ ] Steuerbelege 2025 sortieren\n")
+        with open(os.path.join(self.brain, "areas", "finanzen", "README.md"), "w", encoding="utf-8") as fh:
+            fh.write(f"---\nsummary: Finanzen\ntags: [contract]\ndue:\n  - {d_wo} Start DBX0AN-Sparplan (140 Euro)\n---\n# Finanzen\n")
+        with open(os.path.join(self.brain, "self", "README.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nsummary: Profil\ntags: [self, sport]\n---\n# Profil\n\n| Parameter | Wert | Details |\n|---|---|---|\n| **FTP** | **300 W (4,0 W/kg)** | Schwelle |\n")
         res_init = self.atlas("calendar", "--init", "--execute").stdout
         self.assertIn("harvested from brain", res_init)
         cal_path = os.path.join(self.brain, "calendar", "README.md")
@@ -393,8 +397,8 @@ class Calendar(AtlasCase):
         self.assertIn("[birthday] Max", cal_text)
         self.assertIn("Steuerbelege 2025 sortieren", cal_text)
         cal_text = cal_text.replace(
-            "## Timeline",
-            "## Timeline\n\n"
+            "\n## Timeline",
+            "\n## Timeline\n\n"
             f"- [ ] {d_trip_s}..{d_trip_e} [blocked] Dienstreise München\n"
             f"- [ ] {d_race} [goal:A] Eschborn-Frankfurt (Sub 2:35h)\n"
             f"- [ ] {d_wo} [workout:cycling] 90m SweetSpot (2x20m)\n",
@@ -407,7 +411,10 @@ class Calendar(AtlasCase):
         self.assertIn("Eschborn-Frankfurt", out_all)
         self.assertIn("Steuerbelege 2025 sortieren", out_all)
         self.assertIn("Max", out_all)
+        self.assertIn("Erste Ausführung DBX0AN-Sparplan", out_all)
+        self.assertNotIn("Start DBX0AN-Sparplan", out_all)
         out_coach = self.atlas("calendar", "--for", "coach").stdout
+        self.assertIn("300 W (4,0 W/kg)", out_coach)
         self.assertIn("Eschborn-Frankfurt", out_coach)
         self.assertIn("Dienstreise München", out_coach)
         self.assertIn("90m SweetSpot", out_coach)
@@ -416,7 +423,10 @@ class Calendar(AtlasCase):
         self.assertIn("Visual calendar: [📅 Atlas Kalender öffnen](http://127.0.0.1:", out_all)
         html_path = os.path.join(self.brain, "_atlas", "cache", "calendar.html")
         self.assertTrue(os.path.isfile(html_path))
-        self.assertIn("Eschborn-Frankfurt", self.read(html_path))
+        html_content = self.read(html_path)
+        self.assertIn("Eschborn-Frankfurt", html_content)
+        self.assertIn("minmax(0,1fr)", html_content)
+        self.assertNotIn("http-equiv=\"refresh\"", html_content)
 
 
 if __name__ == "__main__":

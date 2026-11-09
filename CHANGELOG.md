@@ -2,6 +2,19 @@
 
 Written for users: `/atlas-update` shows the sections between the installed and the new version.
 
+## [0.6.5] - 2026-11-09
+
+- **Expert Frontend Overhaul of the Visual Calendar & Coach Hub (`calendar.html`):**
+  - **Bulletproof CSS Grid (`minmax(0, 1fr)` & `min-width: 0`):** Fixed the CSS Grid column blowout bug where long event descriptions stretched a single weekday column across the entire viewport and pushed Wednesday–Sunday off-screen. Added a clickable **KW (ISO Calendar Week)** column, smart 5/6-week row sizing, 2-line clamped pills with extracted euro/meta subtitles, and a glowing `Heute` pill badge.
+  - **Three Layout Modes (`Monat` | `Woche` | `Agenda`) & Instant Search (`/`)**: Switch seamlessly between the 7-column Month Grid, a focused 7-day Week View, and a chronological Agenda Timeline, complete with keyboard shortcuts (`←`/`→`, `T`, `1`/`2`/`3`, `M`/`W`/`A`, `/`, `Esc`) and an interactive **Detail & Markdown-Template Modal** on click.
+  - **Zero-Flicker Background Live-Sync:** Replaced the disruptive `<meta http-equiv="refresh" content="20">` full-page reload (which reset the user's selected tab and month every 20 seconds) with a silent background `fetch` sync that preserves view state, active filter, selected month/week, and scroll position in `sessionStorage`.
+- **Upgraded `🚴 Coach View` & Athlete Telemetry Engine (`_extract_coach_context`):**
+  - Automatically extracts athlete physiology and training parameters from `brain/` (`FTP`, `W/kg`, `VO₂max`, `MMP Peaks`, weekly volume, strength/hypertrophy, biometrics, sleep & primary training window) plus strategic macro-goals and target events (0 LLM tokens).
+  - Switching to **`🚴 Coach View`** now reveals an **Athlete Telemetry Ribbon**, 4 Coach KPI cards (Saisonziele, ±14d Workout Compliance, 28d Trainings-Verfügbarkeit, Fokus-Rhythmus), and a dedicated Coach Sidebar (`🏆 Saisonziele & Athletik-Fokus`, `🚴 Trainingsblock -14d..+14d` including completed `[x]` workouts, and `🚫 Blocker & Zeitfenster 28d`).
+- **Smart Same-Day Deduplication & Checklist Harvesting:**
+  - `calendar_items()` now automatically deduplicates redundant `due:` entries on the same date when both a folder `README.md` (`areas/*/README.md`) and a detail page (`areas/*/*.md`) list the same milestone.
+  - `open_todos()` and `atlas.py calendar --init` now also harvest open tasks from checklist sections (`offene-todos-und-checkliste.md`) and fixed a bug where `## Timeline` / `## Open To-Dos` replacement matched backticked inline code in the intro text.
+
 ## [0.6.4] - 2026-11-09
 
 - **Reliable Local Port Binding in Linux & Container Environments (`s.bind`):**

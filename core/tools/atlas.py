@@ -1124,7 +1124,7 @@ def _calendar_init(root, brain, hk, execute):
     existing_cal = tpl.lower()
     existing_due = {raw.lower() for e in idx.values() for raw in e.get("due", [])}
     harvest_timeline, harvest_todos = [], []
-    bday_rx = re.compile(r"(?i)\b(?:geburtstag|birthday|geboren|born)\b[^0-9\n]{0,25}(\d{4}-\d{2}-\d{2}|\d{1,2}\.\d{1,2}\.\d{4})")
+    bday_rx = re.compile(r"(?i)\b(?:geburtstag|geburtsdatum|birthday|geboren|geb\.|born)\b[^0-9\n]{0,25}(\d{4}-\d{2}-\d{2}|\d{1,2}\.\d{1,2}\.\d{4})")
     task_rx = re.compile(r"^\s*-\s*\[\s\]\s+(.+)$")
     for dp, dns, fns in os.walk(brain):
         dns[:] = [d for d in dns if d not in (".git", "_secrets", "_archive", "_atlas", "calendar", "journal", "inbox")
@@ -1146,37 +1146,57 @@ def _calendar_init(root, brain, hk, execute):
                         iso = f"{int(yyyy):04d}-{int(mm):02d}-{int(dd):02d}"
                     else:
                         iso = raw_d
+                    mm_dd = iso[4:]
                     entry = f"- [ ] {iso} [birthday] {title}"
-                    if iso.lower() not in existing_cal and not any(iso in d for d in existing_due):
+                    if iso.lower() not in existing_cal and not any(iso in d or mm_dd in d for d in existing_due):
                         harvest_timeline.append(entry)
                         existing_cal += "\n" + entry.lower()
+            is_checklist_file = any(w in fn.lower() for w in ("todo", "checkliste", "aufgaben"))
+            in_open_sec = False
             for line in text.splitlines():
+                if line.startswith("#"):
+                    low_h = line.lower()
+                    in_open_sec = any(w in low_h for w in ("offene punkte", "offene to-dos", "open to-dos",
+                                                           "noch offen", "checkliste", "backlog"))
+                    if "erledigt" in low_h and "offen" not in low_h:
+                        in_open_sec = False
+                    continue
                 tm = task_rx.match(line)
-                if not tm:
+                if tm:
+                    task_text = tm.group(1).strip()
+                    if len(task_text) < 4 or task_text.startswith("("):
+                        continue
+                    if task_text.lower() in existing_cal:
+                        continue
+                    dm = re.match(r"^(\d{4}-\d{2}-\d{2})\b\s*[-:–—]?\s*(.+)$", task_text)
+                    if dm:
+                        entry = f"- [ ] {dm.group(1)} [todo] {dm.group(2).strip()} ({rel})"
+                        harvest_timeline.append(entry)
+                    else:
+                        entry = f"- [ ] [med] {task_text} ({rel})"
+                        harvest_todos.append(entry)
+                    existing_cal += "\n" + task_text.lower()
                     continue
-                task_text = tm.group(1).strip()
-                if len(task_text) < 4 or task_text.startswith("("):
-                    continue
-                if task_text.lower() in existing_cal:
-                    continue
-                dm = re.match(r"^(\d{4}-\d{2}-\d{2})\b\s*[-:–—]?\s*(.+)$", task_text)
-                if dm:
-                    entry = f"- [ ] {dm.group(1)} [todo] {dm.group(2).strip()} ({rel})"
-                    harvest_timeline.append(entry)
-                else:
-                    entry = f"- [ ] [med] {task_text} ({rel})"
-                    harvest_todos.append(entry)
-                existing_cal += "\n" + task_text.lower()
+                if is_checklist_file and in_open_sec:
+                    nm = re.match(r"^\d+\.\s+\*\*(.+?)\*\*(.*)$", line.strip())
+                    if nm:
+                        headline = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", (nm.group(1) + " " + nm.group(2))).replace("**", "").replace("`", "").strip()
+                        headline = re.sub(r"\s*:\s*$", "", headline).strip()
+                        if re.search(r"\b(erledigt|abgeschlossen|done)\b", headline, re.I) or headline.lower() in existing_cal:
+                            continue
+                        prio = "high" if re.search(r"\b(phase 5|nachziehen|nachtragen|frist)\b", headline, re.I) else "med"
+                        harvest_todos.append(f"- [ ] [{prio}] {headline} ({rel})")
+                        existing_cal += "\n" + headline.lower()
     if execute and (harvest_timeline or harvest_todos):
         cur = read(cal_readme)
         if harvest_timeline:
-            if "## Timeline" in cur:
-                cur = cur.replace("## Timeline", "## Timeline\n\n" + "\n".join(harvest_timeline), 1)
+            if "\n## Timeline" in cur:
+                cur = cur.replace("\n## Timeline", "\n## Timeline\n\n" + "\n".join(harvest_timeline), 1)
             else:
                 cur = cur.rstrip() + "\n\n## Timeline\n\n" + "\n".join(harvest_timeline) + "\n"
         if harvest_todos:
-            if "## Open To-Dos" in cur:
-                cur = cur.replace("## Open To-Dos", "## Open To-Dos\n\n" + "\n".join(harvest_todos), 1)
+            if "\n## Open To-Dos" in cur:
+                cur = cur.replace("\n## Open To-Dos", "\n## Open To-Dos\n\n" + "\n".join(harvest_todos), 1)
             else:
                 cur = cur.rstrip() + "\n\n## Open To-Dos\n\n" + "\n".join(harvest_todos) + "\n"
         write(cal_readme, cur)
@@ -1231,8 +1251,8 @@ def cmd_calendar(args):
         for ln in added[:25]:
             say(f"  {ln}")
         if args.execute and added and os.path.isfile(cal_readme):
-            if "## Timeline" in cur:
-                cur = cur.replace("## Timeline", "## Timeline\n\n" + "\n".join(added), 1)
+            if "\n## Timeline" in cur:
+                cur = cur.replace("\n## Timeline", "\n## Timeline\n\n" + "\n".join(added), 1)
             else:
                 cur = cur.rstrip() + "\n\n## Timeline\n\n" + "\n".join(added) + "\n"
             write(cal_readme, cur)
@@ -1246,11 +1266,18 @@ def cmd_calendar(args):
         blocked = [i for i in all_items if 0 <= i["delta"] <= 28 and i["status"] == "open"
                    and (i["kind"] == "blocked" or (i["kind"] == "event" and i["delta"] <= 7 and i["time"]))]
         workouts = [i for i in all_items if -14 <= i["delta"] <= 14 and i["kind"] == "workout"]
+        coach_ctx = hk._extract_coach_context(idx) if hasattr(hk, "_extract_coach_context") else {}
+        if coach_ctx.get("metrics"):
+            say("=== ATHLETE PROFILE (from brain) ===")
+            for m in coach_ctx["metrics"]:
+                say(f"  {m['label']}: {m['value']}")
         say("=== GOALS & RACES (next 365 d) ===")
         for g in goals:
             k = f"goal:{g['subkind']}" if g["subkind"] else "goal"
             say(f"  {g['start'].isoformat()} (in {g['delta']} d / {g['delta'] / 7:.1f} w) [{k}] {g['what']}")
-        if not goals:
+        for mg in coach_ctx.get("macro_goals", []):
+            say(f"  [{mg.get('cat', 'macro')}] {mg['title']}: {mg['detail']}")
+        if not goals and not coach_ctx.get("macro_goals"):
             say("  (none)")
         say("=== BLOCKED & BUSY WINDOWS (next 28 d) ===")
         for b in blocked:

@@ -318,6 +318,32 @@ def emit_continue(agent, reason):
 
 # ---------------------------------------------------------------- session & calendar
 
+_KIND_ALIASES = {
+    "workout": ("workout", ""), "training": ("workout", ""), "cycling": ("workout", "cycling"),
+    "ride": ("workout", "cycling"), "rad": ("workout", "cycling"), "rennrad": ("workout", "cycling"),
+    "running": ("workout", "running"), "run": ("workout", "running"), "lauf": ("workout", "running"),
+    "strength": ("workout", "strength"), "kraft": ("workout", "strength"), "hypertrophy": ("workout", "strength"),
+    "hypertrophie": ("workout", "strength"), "gym": ("workout", "strength"), "swim": ("workout", "swim"),
+    "goal": ("goal", ""), "race": ("goal", "A"), "wettkampf": ("goal", "A"), "ziel": ("goal", ""),
+    "blocked": ("blocked", ""), "blocker": ("blocked", ""), "urlaub": ("blocked", "vacation"),
+    "vacation": ("blocked", "vacation"), "reise": ("blocked", "travel"), "trip": ("blocked", "travel"),
+    "busy": ("blocked", ""), "abwesend": ("blocked", ""),
+    "birthday": ("birthday", ""), "geburtstag": ("birthday", ""), "bday": ("birthday", ""),
+    "anniversary": ("birthday", "anniversary"), "jahrestag": ("birthday", "anniversary"),
+    "todo": ("todo", ""), "task": ("todo", ""), "aufgabe": ("todo", ""),
+    "deadline": ("deadline", ""), "frist": ("deadline", ""),
+    "event": ("event", ""), "termin": ("event", ""), "meeting": ("event", ""),
+}
+_CAL_STOP = {"und", "oder", "fuer", "für", "der", "die", "das", "mit", "bei", "von", "auf", "des", "dem", "den",
+             "ein", "eine", "monat", "monats", "jahr", "tag", "tage", "ab", "bis", "inkl", "bzw", "sowie", "pro",
+             "jonas", "lisa", "uhr", "euro", "soll", "eingang"}
+
+
+def _cal_tokens(text):
+    words = re.findall(r"[a-z0-9äöüß]{3,}", text.lower())
+    return {w for w in words if w not in _CAL_STOP}
+
+
 def _next_yearly(month, day, today):
     for y in (today.year, today.year + 1):
         try:
@@ -343,11 +369,18 @@ def _parse_cal_line(raw, rel, today, default_kind="deadline"):
     km = KIND_PREFIX.match(rest)
     kind, subkind = default_kind, ""
     if km:
-        kind = km.group(1).lower()
-        subkind = (km.group(2) or "").strip()
+        raw_k = km.group(1).lower()
+        raw_sub = (km.group(2) or "").strip()
+        mapped_k, mapped_sub = _KIND_ALIASES.get(raw_k, (raw_k, ""))
+        kind = mapped_k
+        subkind = raw_sub or mapped_sub
         rest = km.group(3).strip()
     elif re.search(r"\b(geburtstag|birthday)\b", rest, re.I):
         kind = "birthday"
+    elif re.search(r"\b(jahrestag|anniversary|hochzeitstag)\b", rest, re.I):
+        kind, subkind = "birthday", "anniversary"
+    elif d2_str and re.search(r"\b(urlaub|dienstreise|trainingslager|reise|blocked)\b", rest, re.I):
+        kind = "blocked"
     yearly = bool(re.match(r"^\s*(?:-\s*)?(?:\[[ xX-]\]\s*)?(?:yearly\s+|--)", raw, re.I)) or len(d1_str) == 5 or kind == "birthday"
     try:
         if len(d1_str) == 5:
@@ -371,9 +404,31 @@ def _parse_cal_line(raw, rel, today, default_kind="deadline"):
             "kind": kind, "subkind": subkind, "what": rest, "rel": rel}
 
 
+def _is_dup_cal_item(candidate, existing_items):
+    """Return True if candidate on the same date range is already represented (e.g. folder README + detail page)."""
+    c_start, c_end = candidate["start"], candidate["end"]
+    c_what = candidate["what"].lower().strip()
+    c_tokens = _cal_tokens(c_what)
+    c_area = candidate["rel"].split("/")[:2]
+    for ex in existing_items:
+        if ex["start"] != c_start or ex["end"] != c_end:
+            continue
+        if ex["what"].lower().strip() == c_what:
+            return True
+        ex_tokens = _cal_tokens(ex["what"])
+        if not c_tokens or not ex_tokens:
+            continue
+        overlap = len(c_tokens & ex_tokens)
+        min_len = max(min(len(c_tokens), len(ex_tokens)), 1)
+        same_area = (ex["rel"].split("/")[:2] == c_area) or ex["rel"].startswith("calendar/")
+        if (same_area and overlap >= 2 and overlap / min_len >= 0.35) or (overlap >= 3 and overlap / min_len >= 0.5):
+            return True
+    return False
+
+
 def calendar_items(idx, days=30, past_days=3650, include_done=False):
     today = dt.date.today()
-    items, seen = [], set()
+    items = []
     # 1. Central calendar files in brain/calendar/
     cal_dir = os.path.join(BRAIN, "calendar")
     if os.path.isdir(cal_dir):
@@ -400,57 +455,193 @@ def calendar_items(idx, days=30, past_days=3650, include_done=False):
                     continue
                 if not include_done and item["status"] != "open":
                     continue
-                if -past_days <= item["delta"] <= days:
-                    key = (item["start"], item["end"], item["what"].lower())
-                    if key not in seen:
-                        seen.add(key)
-                        items.append(item)
-    # 2. Decentralized `due:` frontmatter items across all brain pages
-    for rel, e in idx.items():
+                if -past_days <= item["delta"] <= days and not _is_dup_cal_item(item, items):
+                    items.append(item)
+    # 2. Decentralized `due:` frontmatter items across all brain pages (specific pages before folder READMEs)
+    ordered_idx = sorted(
+        idx.items(),
+        key=lambda kv: (1 if kv[0].endswith("/README.md") and not kv[0].startswith("self/") else 0, kv[0]),
+    )
+    for rel, e in ordered_idx:
         for raw in e.get("due", []):
             item = _parse_cal_line(raw, rel, today, default_kind="deadline")
             if not item:
                 continue
             if not include_done and item["status"] != "open":
                 continue
-            if -past_days <= item["delta"] <= days:
-                key = (item["start"], item["end"], item["what"].lower())
-                if key not in seen:
-                    seen.add(key)
-                    items.append(item)
+            if -past_days <= item["delta"] <= days and not _is_dup_cal_item(item, items):
+                items.append(item)
     return sorted(items, key=lambda x: (x["delta"], x["start"], x["time"], x["what"]))
 
 
+def _clean_md_inline(text):
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    text = text.replace("**", "").replace("`", "").strip()
+    return re.sub(r"\s*:\s*$", "", text).strip()
+
+
 def open_todos(include_done=False):
-    cal_readme = os.path.join(BRAIN, "calendar", "README.md")
-    if not os.path.isfile(cal_readme):
-        return []
-    try:
-        with open(cal_readme, encoding="utf-8", errors="replace") as fh:
-            lines = fh.read().splitlines()
-    except OSError:
-        return []
-    out, in_todos = [], False
+    out = []
     prio_rank = {"high": 0, "med": 1, "low": 2}
-    for line in lines:
-        if line.startswith("## "):
-            in_todos = "to-do" in line.lower() or "todo" in line.lower() or "aufgaben" in line.lower()
+
+    def _add_todo(status, prio, what, rel):
+        what_clean = _clean_md_inline(what)
+        if len(what_clean) < 4:
+            return
+        t_new = _cal_tokens(what_clean)
+        for ex in out:
+            if ex["what"].lower() == what_clean.lower():
+                return
+            t_ex = _cal_tokens(ex["what"])
+            if t_new and t_ex and len(t_new & t_ex) / max(min(len(t_new), len(t_ex)), 1) >= 0.6:
+                return
+        out.append({"status": status, "prio": prio, "what": what_clean, "rel": rel, "_r": prio_rank.get(prio, 1)})
+
+    cal_readme = os.path.join(BRAIN, "calendar", "README.md")
+    if os.path.isfile(cal_readme):
+        try:
+            with open(cal_readme, encoding="utf-8", errors="replace") as fh:
+                lines = fh.read().splitlines()
+        except OSError:
+            lines = []
+        in_todos = False
+        for line in lines:
+            if line.startswith("## "):
+                in_todos = any(w in line.lower() for w in ("to-do", "todo", "aufgaben", "backlog"))
+                continue
+            if DATE_ITEM.match(line):
+                continue
+            m = TODO_ITEM.match(line)
+            if not m:
+                continue
+            if not in_todos and not m.group(2):
+                continue
+            box = m.group(1).lower()
+            status = "done" if box == "x" else ("skipped" if box == "-" else "open")
+            if not include_done and status != "open":
+                continue
+            prio = (m.group(2) or "med").lower()
+            _add_todo(status, prio, m.group(3).strip(), "calendar/README.md")
+
+    # Also harvest open tasks from checklist/todo pages in brain/ so nothing is missed
+    for sub in ("areas", "projects", "self"):
+        sdir = os.path.join(BRAIN, sub)
+        if not os.path.isdir(sdir):
             continue
-        if DATE_ITEM.match(line):
-            continue
-        m = TODO_ITEM.match(line)
-        if not m:
-            continue
-        if not in_todos and not m.group(2):
-            continue
-        box = m.group(1).lower()
-        status = "done" if box == "x" else ("skipped" if box == "-" else "open")
-        if not include_done and status != "open":
-            continue
-        prio = (m.group(2) or "med").lower()
-        out.append({"status": status, "prio": prio, "what": m.group(3).strip(), "rel": "calendar/README.md",
-                    "_r": prio_rank.get(prio, 1)})
+        for dp, dns, fns in os.walk(sdir):
+            dns[:] = sorted(d for d in dns if not d.startswith(".") and d not in SKIP_DIRS)
+            for fn in sorted(fns):
+                if not fn.lower().endswith(".md"):
+                    continue
+                full = os.path.join(dp, fn)
+                rel = os.path.relpath(full, BRAIN).replace("\\", "/")
+                is_checklist_file = any(w in fn.lower() for w in ("todo", "checkliste", "aufgaben"))
+                try:
+                    with open(full, encoding="utf-8", errors="replace") as fh:
+                        lines = fh.read(HEAD_BYTES).splitlines()
+                except OSError:
+                    continue
+                in_open_sec = False
+                for line in lines:
+                    if line.startswith("#"):
+                        low_h = line.lower()
+                        in_open_sec = any(w in low_h for w in ("offene punkte", "offene to-dos", "open to-dos",
+                                                               "noch offen", "checkliste", "backlog"))
+                        if "erledigt" in low_h and "offen" not in low_h:
+                            in_open_sec = False
+                        continue
+                    if DATE_ITEM.match(line):
+                        continue
+                    tm = TODO_ITEM.match(line)
+                    if tm:
+                        box = tm.group(1).lower()
+                        status = "done" if box == "x" else ("skipped" if box == "-" else "open")
+                        if not include_done and status != "open":
+                            continue
+                        raw_w = tm.group(3).strip()
+                        if raw_w.startswith("(") or len(raw_w) < 4:
+                            continue
+                        _add_todo(status, (tm.group(2) or "med").lower(), raw_w, rel)
+                        continue
+                    if is_checklist_file and in_open_sec:
+                        nm = re.match(r"^\d+\.\s+\*\*(.+?)\*\*(.*)$", line.strip())
+                        if nm:
+                            headline = (nm.group(1) + " " + nm.group(2)).strip()
+                            if re.search(r"\b(erledigt|abgeschlossen|done)\b", headline, re.I):
+                                continue
+                            prio = "high" if re.search(r"\b(phase 5|nachziehen|nachtragen|frist)\b", headline, re.I) else "med"
+                            _add_todo("open", prio, headline, rel)
     return sorted(out, key=lambda x: (x["_r"], x["what"]))
+
+
+def _extract_coach_context(idx):
+    """Extract athlete physiology metrics, training schedule, and macro goals from brain/ (0 LLM tokens)."""
+    metrics, macro_goals, schedule = [], [], ""
+    seen_m, seen_g = set(), set()
+
+    def _add_m(label, val, icon=""):
+        val = _clean_md_inline(val)
+        if not val or label in seen_m:
+            return
+        seen_m.add(label)
+        metrics.append({"label": label, "value": val, "icon": icon})
+
+    def _add_g(title, detail="", cat="Macro-Goal", rel=""):
+        title = _clean_md_inline(title)
+        detail = _clean_md_inline(detail)
+        if not title or title.lower() in seen_g:
+            return
+        seen_g.add(title.lower())
+        macro_goals.append({"title": title, "detail": detail, "cat": cat, "rel": rel})
+
+    sport_tags = {"radsport", "sport", "cycling", "running", "gesundheit", "health", "training", "fitness"}
+    cand_rels = []
+    for rel, e in sorted(idx.items()):
+        tset = set(e.get("tags", []))
+        if rel.startswith("self/") or (tset & sport_tags) or any(w in rel.lower() for w in ("radsport", "sport", "training", "physiologie")):
+            cand_rels.append(rel)
+
+    for rel in cand_rels:
+        full = os.path.join(BRAIN, rel)
+        try:
+            with open(full, encoding="utf-8", errors="replace") as fh:
+                text = fh.read(HEAD_BYTES)
+        except OSError:
+            continue
+        for line in text.splitlines():
+            s = line.strip()
+            if s.startswith("|") and s.count("|") >= 3:
+                cells = [c.strip() for c in s.strip("|").split("|")]
+                k_low = cells[0].lower()
+                val = cells[1] if len(cells) > 1 else ""
+                if "ftp" in k_low:
+                    short_v = re.sub(r"\s*/\s*~?[\d,.]+\s*W/kg\s+auf.*$", ")", val)
+                    _add_m("FTP", short_v, "⚡")
+                elif "vo2max" in k_low:
+                    _add_m("VO₂max", val, "🫁")
+                elif "hauptsport" in k_low or "volumen" in k_low or "umfang" in k_low:
+                    _add_m("Volumen", val, "🚴")
+                elif "all-out" in k_low or "peaks" in k_low or "mmp" in k_low:
+                    _add_m("MMP Peaks", val.replace("\\|", "·"), "🔥")
+                elif "krafttraining" in k_low or "hypertrophie" in k_low:
+                    _add_m("Athletik & Kraft", val, "🏋️")
+                elif "körpermaße" in k_low or "biometrie" in k_low:
+                    _add_m("Biometrie", val, "⚖️")
+            if not schedule and re.search(r"\d{2}:\d{2}\s*[–-]\s*\d{2}:\d{2}.*(?:Vitalitäts|Rennrad|Workout|Training)", s, re.I):
+                m_sch = re.search(r"(\d{2}:\d{2}\s*[–-]\s*\d{2}:\d{2})", s)
+                if m_sch:
+                    schedule = f"{m_sch.group(1)} Uhr (Mo–Fr)"
+            if "Chronotyp" in s and "Schlaf" in s:
+                m_sl = re.search(r"(\d{2}:\d{2}\s*[–-]\s*\d{2}:\d{2})", s)
+                if m_sl:
+                    _add_m("Schlaf-Fenster", f"{m_sl.group(1)} Uhr", "🌙")
+            if any(w in s for w in ("Ausdauer-Motor:", "Oberkörper-Hypertrophie:")):
+                parts = s.lstrip("-* ").split(":", 1)
+                if len(parts) == 2:
+                    _add_g(parts[0], parts[1], "Physiologie-Säule", rel)
+            elif "Münsterland Giro" in s or ("Events & Ziele" in text and s.startswith("- **") and "Enge " not in s and "Indoor" not in s):
+                _add_g("Ziel-Events & Wettkämpfe", s.lstrip("-* "), "Wettkämpfe", rel)
+    return {"metrics": metrics, "macro_goals": macro_goals, "schedule": schedule or "17:00 – 20:00 Uhr"}
 
 
 def deadlines(idx, days=30):
@@ -474,89 +665,314 @@ def deadlines(idx, days=30):
 
 CAL_TEMPLATE = """<!DOCTYPE html>
 <html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="refresh" content="20">
 <title>Atlas · Calendar & Coach Hub</title>
 <style>
-:root{--bg:#0b0f17;--card:#131a26;--border:#222d40;--text:#e6edf7;--muted:#8b9bb4;--accent:#38bdf8;
---workout:#10b981;--workout-plan:#0ea5e9;--goal:#f59e0b;--blocked:#f43f5e;--event:#8b5cf6;--todo:#f97316;--bday:#ec4899}
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);padding:20px;line-height:1.4}
-.top{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:12px;margin-bottom:18px;padding-bottom:14px;border-bottom:1px solid var(--border)}
-h1{font-size:1.3rem;font-weight:700;display:flex;align-items:center;gap:10px}
-.badge-live{font-size:.72rem;background:#064e3b;color:#34d399;padding:3px 8px;border-radius:99px;font-weight:600}
-.controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-button{background:var(--card);color:var(--text);border:1px solid var(--border);padding:6px 12px;border-radius:8px;cursor:pointer;font-size:.82rem;font-weight:500}
-button:hover,button.active{border-color:var(--accent);background:#17253b;color:#fff}
-.layout{display:grid;grid-template-columns:1fr 340px;gap:18px}
-@media(max-width:1024px){.layout{grid-template-columns:1fr}}
-.grid-wrap{background:var(--card);border:1px solid var(--border);border-radius:12px;overflow:hidden}
-.dow{display:grid;grid-template-columns:repeat(7,1fr);background:#0f1520;border-bottom:1px solid var(--border)}
-.dow div{padding:8px;text-align:center;font-size:.75rem;color:var(--muted);font-weight:600;text-transform:uppercase}
-.days{display:grid;grid-template-columns:repeat(7,1fr);grid-auto-rows:minmax(108px,auto)}
-.day{border-right:1px solid var(--border);border-bottom:1px solid var(--border);padding:6px;display:flex;flex-direction:column;gap:4px}
-.day:nth-child(7n){border-right:none}
-.day.other{opacity:.35;background:#0d121c}
-.day.today{background:#152238;box-shadow:inset 0 0 0 1.5px var(--accent)}
-.dnum{font-size:.78rem;font-weight:600;color:var(--muted);margin-bottom:2px;display:flex;justify-content:space-between}
-.day.today .dnum{color:var(--accent)}
-.pill{font-size:.72rem;padding:3px 6px;border-radius:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;border-left:3px solid var(--accent);background:#1b2638}
-.pill.workout-done{border-color:var(--workout);background:#06392c;color:#a7f3d0}
-.pill.workout-open{border-color:var(--workout-plan);background:#0c2d48;color:#bae6fd}
-.pill.workout-skipped{border-color:#64748b;background:#1e293b;color:#94a3b8;text-decoration:line-through}
-.pill.goal{border-color:var(--goal);background:#3b2606;color:#fde68a;font-weight:600}
-.pill.blocked{border-color:var(--blocked);background:#3b0a18;color:#fecdd3}
-.pill.event{border-color:var(--event);background:#251447;color:#ddd6fe}
-.pill.todo,.pill.deadline{border-color:var(--todo);background:#3b1a06;color:#fed7aa}
-.pill.birthday{border-color:var(--bday);background:#3b0a28;color:#fbcfe8}
-.side{display:flex;flex-direction:column;gap:14px}
-.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:14px}
-.card h2{font-size:.88rem;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);margin-bottom:10px}
-.list{display:flex;flex-direction:column;gap:7px;max-height:280px;overflow-y:auto}
-.row{font-size:.8rem;padding:7px 9px;border-radius:7px;background:#0f1520;border:1px solid var(--border);display:flex;justify-content:space-between;gap:8px;align-items:flex-start}
-.tag{font-size:.68rem;padding:1px 6px;border-radius:4px;background:#1e293b;color:var(--muted);white-space:nowrap}
-.tag.high{background:#450a0a;color:#fca5a5}
-.tag.med{background:#451a03;color:#fdba74}
-.tag.goal{background:#451a03;color:#fde68a}
-.empty{font-size:.8rem;color:var(--muted);font-style:italic}
-</style></head><body>
-<div class="top">
-  <h1>📅 Atlas · Calendar & Coach Hub <span class="badge-live">Atlas-First · Live</span></h1>
-  <div class="controls">
-    <button id="f-all" class="active" onclick="setFilter('all')">Alle</button>
-    <button id="f-coach" onclick="setFilter('coach')">🚴 Coach View</button>
-    <button id="f-todo" onclick="setFilter('todo')">☑️ To-Dos & Fristen</button>
-    <span style="width:12px"></span>
-    <button onclick="moveMonth(-1)">◀</button>
-    <button onclick="goToday()" id="mlabel" style="min-width:140px;font-weight:700"></button>
-    <button onclick="moveMonth(1)">▶</button>
-  </div>
-</div>
-<div class="layout">
-  <div class="grid-wrap">
-    <div class="dow"><div>Mo</div><div>Di</div><div>Mi</div><div>Do</div><div>Fr</div><div>Sa</div><div>So</div></div>
-    <div class="days" id="grid"></div>
-  </div>
-  <div class="side">
-    <div class="card"><h2>🏆 Goals & Wettkämpfe</h2><div class="list" id="goals"></div></div>
-    <div class="card"><h2>📅 Nächste 14 Tage</h2><div class="list" id="agenda"></div></div>
-    <div class="card"><h2>☑️ Offene To-Dos (Backlog)</h2><div class="list" id="todos"></div></div>
-  </div>
-</div>
-<script>
-const DATA = __DATA_JSON__;
-let cur = new Date(DATA.today + "T00:00:00");
-let filter = "all";
-function setFilter(f){
-  filter = f;
-  for(const k of ['all','coach','todo']) document.getElementById('f-'+k).classList.toggle('active', k===f);
-  render();
+:root{
+  --bg:#070a0f;--surface:#0d121b;--surface-2:#121926;--surface-3:#182234;--border:rgba(255,255,255,0.075);
+  --border-hi:rgba(255,255,255,0.15);--text:#f1f5f9;--text-dim:#cbd5e1;--muted:#64748b;--muted-hi:#94a3b8;
+  --accent:#38bdf8;--accent-glow:rgba(56,189,248,0.16);
+  --workout:#10b981;--workout-bg:rgba(16,185,129,0.14);--workout-tx:#a7f3d0;
+  --plan:#0ea5e9;--plan-bg:rgba(14,165,233,0.14);--plan-tx:#bae6fd;
+  --goal:#f59e0b;--goal-bg:rgba(245,158,11,0.15);--goal-tx:#fde68a;
+  --blocked:#f43f5e;--blocked-bg:rgba(244,63,94,0.15);--blocked-tx:#fecdd3;
+  --event:#8b5cf6;--event-bg:rgba(139,92,246,0.15);--event-tx:#ddd6fe;
+  --deadline:#f97316;--deadline-bg:rgba(249,115,22,0.14);--deadline-tx:#fed7aa;
+  --todo:#38bdf8;--todo-bg:rgba(56,189,248,0.14);--todo-tx:#e0f2fe;
+  --bday:#ec4899;--bday-bg:rgba(236,72,153,0.15);--bday-tx:#fbcfe8;
+  --radius:12px;--radius-sm:8px
 }
-function moveMonth(d){ cur = new Date(cur.getFullYear(), cur.getMonth()+d, 1); render(); }
-function goToday(){ cur = new Date(DATA.today + "T00:00:00"); render(); }
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;background:var(--bg);color:var(--text);font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;font-size:14px;line-height:1.45;-webkit-font-smoothing:antialiased;font-variant-numeric:tabular-nums}
+body{background-image:radial-gradient(ellipse 80% 35% at 50% -10%,rgba(56,189,248,0.09),transparent);min-height:100vh}
+.shell{max-width:1760px;margin:0 auto;padding:16px 20px 32px;display:flex;flex-direction:column;gap:14px}
+@media(max-width:768px){.shell{padding:12px}}
+
+/* Topbar */
+.topbar{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:12px;padding:12px 16px;background:rgba(13,18,27,0.85);backdrop-filter:blur(12px);border:1px solid var(--border);border-radius:var(--radius);box-shadow:0 8px 30px rgba(0,0,0,0.35)}
+.brand{display:flex;align-items:center;gap:11px;min-width:0}
+.brand-icon{width:32px;height:32px;border-radius:9px;background:linear-gradient(135deg,#0284c7,#38bdf8);display:flex;align-items:center;justify-content:center;font-size:1rem;box-shadow:0 0 18px rgba(56,189,248,0.35);flex-shrink:0}
+.brand-title{font-size:1.05rem;font-weight:700;letter-spacing:-0.02em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.brand-sub{font-size:.72rem;color:var(--muted-hi);display:flex;align-items:center;gap:6px}
+.live-pill{display:inline-flex;align-items:center;gap:5px;font-size:.68rem;font-weight:600;color:#34d399;background:rgba(16,185,129,0.12);border:1px solid rgba(16,185,129,0.28);padding:2px 8px;border-radius:99px}
+.live-dot{width:6px;height:6px;border-radius:50%;background:#10b981;box-shadow:0 0 8px #10b981;animation:pulse 2.2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+
+.toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
+.seg{display:inline-flex;background:var(--surface-2);padding:3px;border-radius:9px;border:1px solid var(--border);gap:2px}
+.seg button{background:transparent;color:var(--muted-hi);border:none;padding:5px 11px;border-radius:6px;cursor:pointer;font-size:.78rem;font-weight:600;display:inline-flex;align-items:center;gap:6px;transition:all .15s ease;white-space:nowrap}
+.seg button:hover{color:var(--text);background:rgba(255,255,255,0.04)}
+.seg button.active{background:var(--surface-3);color:#fff;box-shadow:0 1px 4px rgba(0,0,0,0.4),inset 0 0 0 1px rgba(56,189,248,0.35)}
+.cnt{font-size:.66rem;padding:1px 5px;border-radius:99px;background:rgba(255,255,255,0.07);color:var(--text-dim);font-weight:600}
+.seg button.active .cnt{background:rgba(56,189,248,0.22);color:var(--accent)}
+
+.search-wrap{position:relative;display:flex;align-items:center}
+.search-in{background:var(--surface-2);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:5px 10px 5px 26px;font-size:.78rem;width:155px;transition:all .15s ease;outline:none}
+.search-in:focus{border-color:var(--accent);width:200px;background:var(--surface-3)}
+.search-ico{position:absolute;left:8px;font-size:.72rem;color:var(--muted);pointer-events:none}
+
+.nav-grp{display:inline-flex;align-items:center;background:var(--surface-2);border:1px solid var(--border);border-radius:9px;padding:2px}
+.nav-btn{background:transparent;color:var(--text-dim);border:none;padding:5px 9px;border-radius:6px;cursor:pointer;font-size:.78rem;font-weight:600;transition:all .15s}
+.nav-btn:hover{background:var(--surface-3);color:#fff}
+.nav-label{min-width:138px;text-align:center;font-weight:700;font-size:.82rem;color:var(--text);padding:0 8px;cursor:pointer}
+
+/* Telemetry & KPI Strip */
+.kpi-strip{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}
+@media(max-width:960px){.kpi-strip{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:520px){.kpi-strip{grid-template-columns:1fr}}
+.kpi{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:10px 13px;display:flex;flex-direction:column;gap:3px;min-width:0;position:relative;overflow:hidden}
+.kpi::before{content:"";position:absolute;top:0;left:0;right:0;height:2px;background:var(--kpi-color,var(--accent));opacity:.75}
+.kpi-lbl{font-size:.68rem;text-transform:uppercase;letter-spacing:.05em;color:var(--muted-hi);font-weight:600;display:flex;justify-content:space-between;align-items:center}
+.kpi-val{font-size:1.05rem;font-weight:700;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.kpi-sub{font-size:.72rem;color:var(--muted-hi);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+/* Athlete Telemetry Ribbon (Coach View) */
+.coach-ribbon{background:linear-gradient(180deg,rgba(16,185,129,0.08),rgba(13,18,27,0.9));border:1px solid rgba(16,185,129,0.25);border-radius:var(--radius);padding:11px 14px;display:none;flex-direction:column;gap:9px}
+.coach-ribbon.show{display:flex}
+.coach-hdr{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px}
+.coach-title{font-size:.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:#34d399;display:flex;align-items:center;gap:6px}
+.phys-chips{display:flex;flex-wrap:wrap;gap:7px}
+.phys-chip{background:rgba(15,23,42,0.85);border:1px solid rgba(255,255,255,0.09);border-radius:7px;padding:4px 9px;font-size:.74rem;display:inline-flex;align-items:center;gap:6px}
+.phys-chip span.k{color:var(--muted-hi);font-weight:500}
+.phys-chip strong.v{color:var(--text);font-weight:700}
+
+/* Main Workspace Layout */
+.workspace{display:grid;grid-template-columns:minmax(0,1fr) 360px;gap:14px;align-items:start}
+@media(max-width:1120px){.workspace{grid-template-columns:minmax(0,1fr)}}
+
+/* Calendar Grid Container */
+.cal-box{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;box-shadow:0 10px 30px rgba(0,0,0,0.3);min-width:0}
+
+/* Month View Grid — STRICT minmax(0,1fr) prevents column blowouts! */
+.dow-row{display:grid;grid-template-columns:32px repeat(7,minmax(0,1fr));background:var(--surface-2);border-bottom:1px solid var(--border)}
+.dow-cell{padding:8px 4px;text-align:center;font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted-hi)}
+.dow-cell.wknd{color:var(--muted)}
+.dow-cell.kw-hdr{font-size:.62rem;color:var(--muted);border-right:1px solid var(--border)}
+
+.month-grid{display:grid;grid-template-columns:32px repeat(7,minmax(0,1fr));grid-auto-rows:minmax(112px,auto)}
+@media(max-width:680px){
+  .dow-row,.month-grid{grid-template-columns:24px repeat(7,minmax(0,1fr))}
+  .month-grid{grid-auto-rows:minmax(92px,auto)}
+}
+.kw-cell{border-right:1px solid var(--border);border-bottom:1px solid var(--border);background:rgba(15,21,32,0.6);display:flex;align-items:flex-start;justify-content:center;padding-top:8px;font-size:.66rem;font-weight:600;color:var(--muted);cursor:pointer;user-select:none;transition:color .15s,background .15s}
+.kw-cell:hover{color:var(--accent);background:rgba(56,189,248,0.07)}
+
+.day{min-width:0;overflow:hidden;border-right:1px solid var(--border);border-bottom:1px solid var(--border);padding:6px;display:flex;flex-direction:column;gap:4px;position:relative;background:var(--surface);transition:background .12s ease;cursor:pointer}
+.day:nth-child(8n){border-right:none}
+.day.wknd{background:rgba(255,255,255,0.01)}
+.day.other{background:rgba(7,10,15,0.65)}
+.day.other .dnum-txt,.day.other .pill{opacity:.42}
+.day:hover{background:var(--surface-2)}
+.day.today{background:linear-gradient(180deg,rgba(56,189,248,0.09),rgba(13,18,27,0.95))}
+.day.today::before{content:"";position:absolute;top:0;left:0;right:0;height:2px;background:var(--accent);box-shadow:0 0 10px var(--accent)}
+
+.dhead{display:flex;justify-content:space-between;align-items:center;margin-bottom:2px;min-width:0}
+.dnum-txt{font-size:.76rem;font-weight:600;color:var(--muted-hi);display:inline-flex;align-items:center;gap:4px;line-height:1}
+.day.today .dnum-txt{background:var(--accent);color:#041019;font-weight:800;padding:3px 7px;border-radius:99px;box-shadow:0 0 12px rgba(56,189,248,0.45)}
+.today-tag{font-size:.58rem;font-weight:800;text-transform:uppercase;letter-spacing:.05em;color:var(--accent)}
+.dcount{font-size:.62rem;color:var(--muted);font-weight:600}
+
+/* Event Pills inside Day Cells */
+.pill{min-width:0;max-width:100%;overflow:hidden;padding:3.5px 6px;border-radius:5px;border-left:3px solid var(--accent);background:var(--surface-3);color:var(--text);font-size:.71rem;line-height:1.25;display:flex;flex-direction:column;gap:1px;cursor:pointer;transition:transform .1s ease,filter .12s ease}
+.pill:hover{filter:brightness(1.15);transform:translateY(-1px)}
+.pill-top{display:flex;align-items:center;gap:4px;min-width:0}
+.pill-ico{font-size:.68rem;flex-shrink:0;line-height:1}
+.pill-time{font-size:.63rem;font-weight:700;opacity:.85;flex-shrink:0}
+.pill-txt{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-word;white-space:normal;font-weight:500;min-width:0;flex:1}
+.pill-meta{font-size:.62rem;opacity:.75;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.more-pill{font-size:.66rem;font-weight:600;color:var(--accent);padding:2px 5px;border-radius:4px;background:rgba(56,189,248,0.08);text-align:center}
+
+.pill.workout-done{border-left-color:var(--workout);background:var(--workout-bg);color:var(--workout-tx)}
+.pill.workout-open{border-left-color:var(--plan);background:var(--plan-bg);color:var(--plan-tx)}
+.pill.workout-skipped{border-left-color:#64748b;background:rgba(100,116,139,0.12);color:#94a3b8;text-decoration:line-through}
+.pill.goal{border-left-color:var(--goal);background:var(--goal-bg);color:var(--goal-tx);font-weight:600}
+.pill.blocked{border-left-color:var(--blocked);background:var(--blocked-bg);color:var(--blocked-tx)}
+.pill.event{border-left-color:var(--event);background:var(--event-bg);color:var(--event-tx)}
+.pill.deadline{border-left-color:var(--deadline);background:var(--deadline-bg);color:var(--deadline-tx)}
+.pill.todo{border-left-color:var(--todo);background:var(--todo-bg);color:var(--todo-tx)}
+.pill.birthday{border-left-color:var(--bday);background:var(--bday-bg);color:var(--bday-tx)}
+
+/* Week View */
+.week-list{display:flex;flex-direction:column;divide-y:1px solid var(--border)}
+.wday-row{display:grid;grid-template-columns:130px minmax(0,1fr);border-bottom:1px solid var(--border);min-height:76px;transition:background .12s}
+.wday-row:last-child{border-bottom:none}
+.wday-row:hover{background:rgba(255,255,255,0.015)}
+.wday-row.today{background:linear-gradient(90deg,rgba(56,189,248,0.09),transparent)}
+@media(max-width:600px){.wday-row{grid-template-columns:92px minmax(0,1fr)}}
+.wday-left{padding:12px;border-right:1px solid var(--border);display:flex;flex-direction:column;gap:2px}
+.wday-dow{font-size:.72rem;font-weight:700;text-transform:uppercase;color:var(--muted-hi)}
+.wday-date{font-size:1.05rem;font-weight:800;color:var(--text)}
+.wday-row.today .wday-date{color:var(--accent)}
+.wday-right{padding:10px 12px;display:flex;flex-direction:column;gap:7px;justify-content:center;min-width:0}
+.wday-empty{font-size:.76rem;color:var(--muted);font-style:italic}
+
+/* Agenda View */
+.agenda-view{padding:14px;display:flex;flex-direction:column;gap:16px}
+.ag-group{display:flex;flex-direction:column;gap:7px}
+.ag-month-hdr{font-size:.76rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--accent);padding-bottom:4px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between}
+.ag-item{display:grid;grid-template-columns:105px minmax(0,1fr) auto;gap:12px;align-items:center;padding:10px 12px;background:var(--surface-2);border:1px solid var(--border);border-radius:9px;cursor:pointer;transition:border-color .15s,background .15s}
+.ag-item:hover{border-color:var(--border-hi);background:var(--surface-3)}
+@media(max-width:600px){.ag-item{grid-template-columns:82px minmax(0,1fr)}}
+.ag-date-col{display:flex;flex-direction:column}
+.ag-date-main{font-size:.8rem;font-weight:700;color:var(--text)}
+.ag-date-sub{font-size:.68rem;color:var(--muted-hi)}
+
+/* Sidebar */
+.side{display:flex;flex-direction:column;gap:12px;min-width:0}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:14px;display:flex;flex-direction:column;gap:10px;box-shadow:0 6px 20px rgba(0,0,0,0.25);min-width:0}
+.card-hdr{display:flex;justify-content:space-between;align-items:center;gap:8px}
+.card-title{font-size:.76rem;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--muted-hi);display:flex;align-items:center;gap:6px}
+.card-badge{font-size:.68rem;font-weight:600;padding:1px 7px;border-radius:99px;background:var(--surface-3);color:var(--text-dim)}
+.list{display:flex;flex-direction:column;gap:7px;max-height:320px;overflow-y:auto;padding-right:2px}
+.list::-webkit-scrollbar{width:5px}
+.list::-webkit-scrollbar-thumb{background:var(--surface-3);border-radius:99px}
+
+.row{font-size:.79rem;padding:9px 11px;border-radius:8px;background:var(--surface-2);border:1px solid var(--border);display:flex;justify-content:space-between;gap:10px;align-items:flex-start;cursor:pointer;transition:border-color .15s,background .15s;min-width:0}
+.row:hover{border-color:var(--border-hi);background:var(--surface-3)}
+.row-main{min-width:0;flex:1;display:flex;flex-direction:column;gap:3px}
+.row-title{font-weight:600;color:var(--text);word-break:break-word;line-height:1.3}
+.row-sub{font-size:.7rem;color:var(--muted-hi);display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.tag{font-size:.67rem;font-weight:600;padding:2px 7px;border-radius:5px;background:var(--surface-3);color:var(--text-dim);white-space:nowrap;flex-shrink:0}
+.tag.high,.tag.overdue{background:rgba(244,63,94,0.18);color:#fda4af;border:1px solid rgba(244,63,94,0.3)}
+.tag.med{background:rgba(249,115,22,0.16);color:#fdba74;border:1px solid rgba(249,115,22,0.3)}
+.tag.low{background:rgba(56,189,248,0.14);color:#bae6fd}
+.tag.goal{background:rgba(245,158,11,0.18);color:#fde68a;border:1px solid rgba(245,158,11,0.3)}
+.tag.ok{background:rgba(16,185,129,0.16);color:#6ee7b7;border:1px solid rgba(16,185,129,0.3)}
+.empty-box{font-size:.78rem;color:var(--muted-hi);padding:12px;border-radius:8px;background:rgba(255,255,255,0.02);border:1px dashed var(--border);display:flex;flex-direction:column;gap:6px}
+.code-hint{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.7rem;background:var(--bg);padding:5px 8px;border-radius:5px;color:var(--accent);border:1px solid var(--border);cursor:pointer}
+
+/* Modal */
+.modal-backdrop{position:fixed;inset:0;background:rgba(3,6,12,0.75);backdrop-filter:blur(6px);display:none;align-items:center;justify-content:center;padding:16px;z-index:100}
+.modal-backdrop.open{display:flex}
+.modal{background:var(--surface);border:1px solid var(--border-hi);border-radius:14px;max-width:540px;width:100%;padding:20px;box-shadow:0 24px 60px rgba(0,0,0,0.65);display:flex;flex-direction:column;gap:14px}
+.modal-top{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
+.modal-title{font-size:1.05rem;font-weight:700;color:var(--text);line-height:1.35}
+.modal-close{background:var(--surface-2);border:1px solid var(--border);color:var(--muted-hi);width:28px;height:28px;border-radius:7px;cursor:pointer;font-size:.9rem}
+.modal-close:hover{color:#fff;background:var(--surface-3)}
+.modal-meta{display:flex;flex-wrap:wrap;gap:8px}
+.modal-body{font-size:.84rem;color:var(--text-dim);background:var(--surface-2);padding:12px;border-radius:9px;border:1px solid var(--border);display:flex;flex-direction:column;gap:8px}
+.modal-actions{display:flex;justify-content:flex-end;gap:8px}
+.btn-act{background:var(--surface-3);color:var(--text);border:1px solid var(--border-hi);padding:6px 12px;border-radius:7px;font-size:.76rem;font-weight:600;cursor:pointer}
+.btn-act:hover{border-color:var(--accent);color:var(--accent)}
+</style></head><body>
+<div class="shell">
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-icon">📅</div>
+      <div>
+        <div class="brand-title">Atlas · Calendar & Coach Hub</div>
+        <div class="brand-sub">
+          <span class="live-pill"><span class="live-dot"></span>Atlas-First · Live</span>
+          <span id="today-sub"></span>
+        </div>
+      </div>
+    </div>
+    <div class="toolbar">
+      <div class="seg" role="tablist">
+        <button id="f-all" class="active" onclick="setFilter('all')">Alle <span class="cnt" id="cnt-all">0</span></button>
+        <button id="f-coach" onclick="setFilter('coach')">🚴 Coach View <span class="cnt" id="cnt-coach">0</span></button>
+        <button id="f-todo" onclick="setFilter('todo')">☑️ To-Dos & Fristen <span class="cnt" id="cnt-todo">0</span></button>
+      </div>
+      <div class="search-wrap">
+        <span class="search-ico">🔍</span>
+        <input id="q-in" class="search-in" type="search" placeholder="Filtern… (/)" oninput="setQuery(this.value)">
+      </div>
+      <div class="seg">
+        <button id="v-month" class="active" onclick="setLayout('month')">Monat</button>
+        <button id="v-week" onclick="setLayout('week')">Woche</button>
+        <button id="v-agenda" onclick="setLayout('agenda')">Agenda</button>
+      </div>
+      <div class="nav-grp">
+        <button class="nav-btn" onclick="stepNav(-1)" title="Zurück (◀)">◀</button>
+        <span class="nav-label" id="mlabel" onclick="goToday()" title="Springe zu Heute (T)"></span>
+        <button class="nav-btn" onclick="stepNav(1)" title="Vor (▶)">▶</button>
+        <button class="nav-btn" onclick="goToday()" style="border-left:1px solid var(--border);color:var(--accent)">Heute</button>
+      </div>
+    </div>
+  </header>
+
+  <section id="coach-ribbon" class="coach-ribbon">
+    <div class="coach-hdr">
+      <div class="coach-title">⚡ Athleten-Telemetrie & Physiologie-Profil (aus Brain)</div>
+      <div style="font-size:.72rem;color:var(--muted-hi)" id="coach-sched"></div>
+    </div>
+    <div class="phys-chips" id="phys-chips"></div>
+  </section>
+
+  <section class="kpi-strip" id="kpi-strip"></section>
+
+  <div class="workspace">
+    <main class="cal-box" id="cal-main"></main>
+    <aside class="side">
+      <div class="card"><div class="card-hdr"><div class="card-title" id="s1-title"></div><span class="card-badge" id="s1-cnt"></span></div><div class="list" id="s1-list"></div></div>
+      <div class="card"><div class="card-hdr"><div class="card-title" id="s2-title"></div><span class="card-badge" id="s2-cnt"></span></div><div class="list" id="s2-list"></div></div>
+      <div class="card"><div class="card-hdr"><div class="card-title" id="s3-title"></div><span class="card-badge" id="s3-cnt"></span></div><div class="list" id="s3-list"></div></div>
+    </aside>
+  </div>
+</div>
+
+<div class="modal-backdrop" id="modal-bg" onclick="if(event.target===this)closeModal()">
+  <div class="modal">
+    <div class="modal-top">
+      <div class="modal-title" id="m-title"></div>
+      <button class="modal-close" onclick="closeModal()">✕</button>
+    </div>
+    <div class="modal-meta" id="m-meta"></div>
+    <div class="modal-body" id="m-body"></div>
+    <div class="modal-actions">
+      <button class="btn-act" id="m-copy">📋 Quelle / Markdown kopieren</button>
+      <button class="btn-act" onclick="closeModal()">Schließen</button>
+    </div>
+  </div>
+</div>
+
+<script>
+let DATA = __DATA_JSON__;
+const MONTHS = ['Januar','Februar','März','April','Mai','Juni','Juli','August','September','Oktober','November','Dezember'];
+const MONTHS_SHORT = ['Jan','Feb','Mär','Apr','Mai','Jun','Jul','Aug','Sep','Okt','Nov','Dez'];
+const DOWS = ['Mo','Di','Mi','Do','Fr','Sa','So'];
+
+let cur = new Date(DATA.today + "T00:00:00");
+let filter = sessionStorage.getItem("atlas_cal_filter") || "all";
+let layout = sessionStorage.getItem("atlas_cal_layout") || "month";
+let query = "";
+
 function iso(d){ return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); }
+function parseIso(s){ const [y,m,d]=s.split('-').map(Number); return new Date(y,m-1,d); }
+function getKW(d){
+  const t = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+  const dayNum = t.getUTCDay() || 7;
+  t.setUTCDate(t.getUTCDate() + 4 - dayNum);
+  const yearStart = new Date(Date.UTC(t.getUTCFullYear(),0,1));
+  return Math.ceil((((t - yearStart) / 86400000) + 1)/7);
+}
+function fmtDateDE(s){
+  const [y,m,d] = s.split('-');
+  return `${d}.${m}.${y}`;
+}
+function esc(s){
+  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function compactTitle(what){
+  let s = String(what||'');
+  const mAmt = s.match(/(\\d[\\d.,]*\\s*€(?:\\s*\\/\\s*(?:Monat|M|Jahr|J|Quartal))?)/);
+  let main = s.replace(/\\s*\\((?:Eingang|doppeltes|übergesetzliche|30 Tage|seit \\d+|je \\d+).*?\\)/gi, '').trim();
+  if(main.length > 68 && main.includes('(')) main = main.split('(')[0].trim();
+  return {main: main || s, meta: mAmt ? mAmt[1] : ''};
+}
+function isCoachItem(it){
+  return ['workout','blocked','goal'].includes(it.kind) || (it.kind==='event' && Boolean(it.time));
+}
+function isTodoItem(it){
+  return ['todo','deadline'].includes(it.kind);
+}
 function keepItem(it){
-  if(filter==='coach') return ['workout','blocked','goal'].includes(it.kind) || (it.kind==='event' && it.time);
-  if(filter==='todo') return ['todo','deadline'].includes(it.kind);
+  if(filter==='coach' && !isCoachItem(it)) return false;
+  if(filter==='todo' && !isTodoItem(it)) return false;
+  if(query){
+    const q = query.toLowerCase();
+    const hay = `${it.what} ${it.kind} ${it.subkind||''} ${it.rel||''} ${it.start}`.toLowerCase();
+    if(!hay.includes(q)) return false;
+  }
   return true;
 }
 function pillClass(it){
@@ -564,56 +980,550 @@ function pillClass(it){
   return 'pill ' + it.kind;
 }
 function icon(it){
-  if(it.kind==='workout') return (it.status==='done'?'✓ ':it.status==='skipped'?'– ':'🚴 ');
-  if(it.kind==='goal') return '🏆 ';
-  if(it.kind==='blocked') return '🚫 ';
-  if(it.kind==='birthday') return '🎂 ';
-  if(it.kind==='todo'||it.kind==='deadline') return '☑️ ';
-  return '📅 ';
+  if(it.kind==='workout') return (it.status==='done'?'✓':it.status==='skipped'?'–':(it.subkind==='strength'?'🏋️':it.subkind==='running'?'🏃':'🚴'));
+  if(it.kind==='goal') return '🏆';
+  if(it.kind==='blocked') return '🚫';
+  if(it.kind==='birthday') return (it.subkind==='anniversary'?'❤️':'🎂');
+  if(it.kind==='deadline') return '⏳';
+  if(it.kind==='todo') return '☑️';
+  return '📅';
 }
-function render(){
+function deltaLabel(delta){
+  if(delta===0) return 'heute';
+  if(delta===1) return 'morgen';
+  if(delta===-1) return 'gestern';
+  return delta < 0 ? `vor ${-delta}d` : `in ${delta}d`;
+}
+function setFilter(f){
+  filter = f;
+  sessionStorage.setItem("atlas_cal_filter", f);
+  render();
+}
+function setLayout(l){
+  layout = l;
+  sessionStorage.setItem("atlas_cal_layout", l);
+  render();
+}
+function setQuery(q){
+  query = (q||'').trim();
+  render();
+}
+function stepNav(dir){
+  if(layout==='week'){
+    cur = new Date(cur.getFullYear(), cur.getMonth(), cur.getDate() + dir*7);
+  } else {
+    cur = new Date(cur.getFullYear(), cur.getMonth() + dir, 1);
+  }
+  render();
+}
+function goToday(){
+  cur = new Date(DATA.today + "T00:00:00");
+  render();
+}
+function openWeekOf(dateStr){
+  cur = parseIso(dateStr);
+  setLayout('week');
+}
+function showItemModal(idx){
+  const it = DATA.items[idx];
+  if(!it) return;
+  const bg = document.getElementById('modal-bg');
+  document.getElementById('m-title').textContent = `${icon(it)} ${it.what}`;
+  const kw = getKW(parseIso(it.start));
+  const kindLbl = it.subkind ? `${it.kind.toUpperCase()} · ${it.subkind.toUpperCase()}` : it.kind.toUpperCase();
+  document.getElementById('m-meta').innerHTML = `
+    <span class="tag goal">${esc(kindLbl)}</span>
+    <span class="tag">${esc(fmtDateDE(it.start))}${it.end!==it.start?' – '+esc(fmtDateDE(it.end)):''} · KW ${kw}</span>
+    ${it.time?`<span class="tag">🕒 ${esc(it.time)}</span>`:''}
+    <span class="tag ${it.delta<0?'overdue':'ok'}">${esc(deltaLabel(it.delta))} (${(it.delta/7).toFixed(1)}w)</span>
+  `;
+  document.getElementById('m-body').innerHTML = `
+    <div><strong>Beschreibung:</strong><br>${esc(it.what)}</div>
+    <div style="color:var(--muted-hi);font-size:.76rem"><strong>Quelle im Brain:</strong> <code>${esc(it.rel)}</code></div>
+  `;
+  const copyBtn = document.getElementById('m-copy');
+  copyBtn.onclick = () => {
+    navigator.clipboard.writeText(`${it.start} [${it.kind}] ${it.what} (${it.rel})`);
+    copyBtn.textContent = '✓ Kopiert!';
+    setTimeout(()=>copyBtn.textContent='📋 Quelle / Markdown kopieren', 1500);
+  };
+  bg.classList.add('open');
+}
+function showDayModal(ds){
+  const d = parseIso(ds);
+  const kw = getKW(d);
+  const dayItems = DATA.items.map((it,idx)=>({it,idx})).filter(x => keepItem(x.it) && x.it.start <= ds && ds <= x.it.end);
+  const bg = document.getElementById('modal-bg');
+  const dowName = DOWS[(d.getDay()+6)%7];
+  document.getElementById('m-title').textContent = `${dowName}, ${fmtDateDE(ds)} (KW ${kw})`;
+  document.getElementById('m-meta').innerHTML = `<span class="tag">${dayItems.length} Einträge</span>`;
+  const defKind = filter==='coach' ? 'workout:cycling' : (filter==='todo' ? 'todo' : 'event');
+  const snippet = `- [ ] ${ds} [${defKind}] `;
+  document.getElementById('m-body').innerHTML = (dayItems.length ? dayItems.map(({it,idx}) => `
+    <div class="row" onclick="showItemModal(${idx})">
+      <div class="row-main">
+        <div class="row-title">${icon(it)} ${it.time?esc(it.time)+' ':''}${esc(it.what)}</div>
+        <div class="row-sub"><span>${esc(it.kind)}${it.subkind?':'+esc(it.subkind):''}</span> · <span>${esc(it.rel)}</span></div>
+      </div>
+    </div>
+  `).join('') : '<div style="color:var(--muted-hi)">Keine Einträge an diesem Tag.</div>') + `
+    <div style="margin-top:6px;font-size:.73rem;color:var(--muted-hi)">Markdown-Vorlage für <code>brain/calendar/README.md</code>:</div>
+    <div class="code-hint" onclick="navigator.clipboard.writeText('${snippet}')">${esc(snippet)}… (Klicken zum Kopieren)</div>
+  `;
+  const copyBtn = document.getElementById('m-copy');
+  copyBtn.onclick = () => {
+    navigator.clipboard.writeText(snippet);
+    copyBtn.textContent = '✓ Vorlage kopiert!';
+    setTimeout(()=>copyBtn.textContent='📋 Quelle / Markdown kopieren', 1500);
+  };
+  bg.classList.add('open');
+}
+function closeModal(){ document.getElementById('modal-bg').classList.remove('open'); }
+
+function renderKPIs(){
+  const todayD = parseIso(DATA.today);
+  const kw = getKW(todayD);
+  const dow = DOWS[(todayD.getDay()+6)%7];
+  document.getElementById('today-sub').textContent = `${dow}, ${fmtDateDE(DATA.today)} · KW ${kw}`;
+
+  const coachRib = document.getElementById('coach-ribbon');
+  const coach = DATA.coach || {metrics:[], macro_goals:[], schedule:''};
+  if(filter==='coach'){
+    coachRib.classList.add('show');
+    document.getElementById('coach-sched').textContent = coach.schedule ? `🕒 Primäres Trainingsfenster: ${coach.schedule}` : '';
+    const chips = document.getElementById('phys-chips');
+    chips.innerHTML = (coach.metrics && coach.metrics.length) ? coach.metrics.map(m =>
+      `<div class="phys-chip"><span>${esc(m.icon||'⚡')}</span><span class="k">${esc(m.label)}:</span><strong class="v">${esc(m.value)}</strong></div>`
+    ).join('') : '<div class="phys-chip"><span class="k">Tipp:</span><strong class="v">Leistungsdaten in self/ oder radsport/ hinterlegen</strong></div>';
+  } else {
+    coachRib.classList.remove('show');
+  }
+
+  const kpiEl = document.getElementById('kpi-strip');
+  const openItems = DATA.items.filter(i => i.status==='open');
+  if(filter==='coach'){
+    const goals = openItems.filter(i => i.kind==='goal' && i.delta>=0);
+    const woDone = DATA.items.filter(i => i.kind==='workout' && i.delta>=-14 && i.delta<=14 && i.status==='done').length;
+    const woOpen = DATA.items.filter(i => i.kind==='workout' && i.delta>=0 && i.delta<=14 && i.status==='open').length;
+    const blockers = openItems.filter(i => i.delta>=0 && i.delta<=28 && (i.kind==='blocked' || (i.kind==='event' && i.time)));
+    const nextGoal = goals[0];
+    const macroCnt = (coach.macro_goals||[]).length;
+    kpiEl.innerHTML = `
+      <div class="kpi" style="--kpi-color:var(--goal)">
+        <div class="kpi-lbl"><span>🏆 Saisonziele & Rennen</span><span>${goals.length + macroCnt} aktiv</span></div>
+        <div class="kpi-val">${nextGoal ? esc(nextGoal.what) : (macroCnt ? esc(coach.macro_goals[0].title) : 'Off-Season / Basis')}</div>
+        <div class="kpi-sub">${nextGoal ? `Countdown: in ${nextGoal.delta}d (${(nextGoal.delta/7).toFixed(1)} Wochen)` : `${macroCnt} strategische Säulen im Brain`}</div>
+      </div>
+      <div class="kpi" style="--kpi-color:var(--workout)">
+        <div class="kpi-lbl"><span>🚴 Workouts (±14 Tage)</span><span>Compliance</span></div>
+        <div class="kpi-val">${woDone} erledigt · ${woOpen} geplant</div>
+        <div class="kpi-sub">${woDone+woOpen>0 ? 'Aus calendar/README.md' : 'Bereit für Wochenplanung (.zwo / Karoo)'}</div>
+      </div>
+      <div class="kpi" style="--kpi-color:${blockers.length?'var(--blocked)':'var(--workout)'}">
+        <div class="kpi-lbl"><span>🛡️ Trainings-Verfügbarkeit</span><span>28 Tage</span></div>
+        <div class="kpi-val">${28 - blockers.length} / 28 Tage frei</div>
+        <div class="kpi-sub">${blockers.length ? `${blockers.length} Blocker/Termine beachten` : 'Keine Reisen oder Blocker eingetragen'}</div>
+      </div>
+      <div class="kpi" style="--kpi-color:var(--plan)">
+        <div class="kpi-lbl"><span>⏱️ Fokus-Rhythmus</span><span>Chronotyp</span></div>
+        <div class="kpi-val">${esc(coach.schedule || '17:00 – 20:00 Uhr')}</div>
+        <div class="kpi-sub">8–10h/Woche Ausdauer + 1–3x Kraft</div>
+      </div>
+    `;
+  } else if(filter==='todo'){
+    const overdue = openItems.filter(i => isTodoItem(i) && i.delta<0);
+    const next30 = openItems.filter(i => isTodoItem(i) && i.delta>=0 && i.delta<=30);
+    const next365 = openItems.filter(i => isTodoItem(i) && i.delta>=0 && i.delta<=365);
+    const highTodos = DATA.todos.filter(t => t.prio==='high').length;
+    kpiEl.innerHTML = `
+      <div class="kpi" style="--kpi-color:${overdue.length?'var(--blocked)':'var(--workout)'}">
+        <div class="kpi-lbl"><span>⚠️ Überfällig</span><span>Status</span></div>
+        <div class="kpi-val">${overdue.length ? `${overdue.length} Frist(en)` : '0 Überfällig'}</div>
+        <div class="kpi-sub">${overdue.length ? esc(overdue[0].what) : 'Alle vergangenen Stichtage erledigt'}</div>
+      </div>
+      <div class="kpi" style="--kpi-color:var(--deadline)">
+        <div class="kpi-lbl"><span>⏳ Nächste 30 Tage</span><span>Fristen</span></div>
+        <div class="kpi-val">${next30.length} Stichtage</div>
+        <div class="kpi-sub">${next30[0] ? `Nächster: in ${next30[0].delta}d (${fmtDateDE(next30[0].start)})` : 'Keine Fristen in 30d'}</div>
+      </div>
+      <div class="kpi" style="--kpi-color:var(--todo)">
+        <div class="kpi-lbl"><span>☑️ Offene To-Dos</span><span>Backlog</span></div>
+        <div class="kpi-val">${DATA.todos.length} Aufgaben</div>
+        <div class="kpi-sub">${highTodos ? `${highTodos} mit hoher Priorität` : 'Aus calendar/ & Checklisten'}</div>
+      </div>
+      <div class="kpi" style="--kpi-color:var(--event)">
+        <div class="kpi-lbl"><span>📆 Jahres-Radar</span><span>365 Tage</span></div>
+        <div class="kpi-val">${next365.length} Meilensteine</div>
+        <div class="kpi-sub">Verträge, Steuern, Gehalt & Sparpläne</div>
+      </div>
+    `;
+  } else {
+    const next30 = openItems.filter(i => i.delta>=0 && i.delta<=30);
+    const nxt = next30[0] || openItems.find(i => i.delta>=0);
+    const bdays = openItems.filter(i => i.kind==='birthday' && i.delta>=0);
+    kpiEl.innerHTML = `
+      <div class="kpi" style="--kpi-color:var(--accent)">
+        <div class="kpi-lbl"><span>📍 Heute</span><span>KW ${kw}</span></div>
+        <div class="kpi-val">${dow}, ${fmtDateDE(DATA.today)}</div>
+        <div class="kpi-sub">${openItems.filter(i=>i.delta===0).length || 'Keine'} Termine heute</div>
+      </div>
+      <div class="kpi" style="--kpi-color:var(--deadline)">
+        <div class="kpi-lbl"><span>📅 Nächste 30 Tage</span><span>Horizont</span></div>
+        <div class="kpi-val">${next30.length} Einträge</div>
+        <div class="kpi-sub">${nxt ? `Als Nächstes: in ${nxt.delta}d (${fmtDateDE(nxt.start)})` : 'Freier Horizont'}</div>
+      </div>
+      <div class="kpi" style="--kpi-color:var(--todo)">
+        <div class="kpi-lbl"><span>☑️ To-Do Backlog</span><span>Offen</span></div>
+        <div class="kpi-val">${DATA.todos.length} Aufgaben</div>
+        <div class="kpi-sub">${DATA.todos[0] ? esc(DATA.todos[0].what) : 'Keine offenen Backlog-To-Dos'}</div>
+      </div>
+      <div class="kpi" style="--kpi-color:var(--bday)">
+        <div class="kpi-lbl"><span>🎂 Geburtstage & Ziele</span><span>365 Tage</span></div>
+        <div class="kpi-val">${bdays.length} Ehrentage</div>
+        <div class="kpi-sub">${bdays[0] ? `${esc(bdays[0].what)} (in ${bdays[0].delta}d)` : 'Alle Jahrestage synchronisiert'}</div>
+      </div>
+    `;
+  }
+}
+
+function renderMain(){
+  const mainEl = document.getElementById('cal-main');
   const y = cur.getFullYear(), m = cur.getMonth();
-  const months = ['Januar','Februar','März','April','Mai','Juni','Juli','August','September','Oktober','November','Dezember'];
-  document.getElementById('mlabel').textContent = months[m] + ' ' + y;
-  const first = new Date(y, m, 1);
-  const offset = (first.getDay() + 6) % 7;
-  const start = new Date(y, m, 1 - offset);
-  const grid = document.getElementById('grid');
-  grid.innerHTML = '';
-  for(let i=0;i<42;i++){
-    const d = new Date(start.getFullYear(), start.getMonth(), start.getDate()+i);
-    const ds = iso(d);
-    const cell = document.createElement('div');
-    cell.className = 'day' + (d.getMonth()!==m?' other':'') + (ds===DATA.today?' today':'');
-    cell.innerHTML = `<div class="dnum"><span>${d.getDate()}</span></div>`;
-    for(const it of DATA.items){
-      if(!keepItem(it)) continue;
-      if(it.start <= ds && ds <= it.end){
-        const p = document.createElement('div');
-        p.className = pillClass(it);
-        const t = it.time ? it.time+' ' : '';
-        p.title = `${it.start}${it.end!==it.start?'..'+it.end:''} ${t}[${it.kind}${it.subkind?':'+it.subkind:''}] ${it.what} (${it.rel})`;
-        p.textContent = icon(it) + t + it.what;
-        cell.appendChild(p);
+
+  if(layout==='month'){
+    document.getElementById('mlabel').textContent = `${MONTHS[m]} ${y}`;
+    const first = new Date(y, m, 1);
+    const offset = (first.getDay() + 6) % 7;
+    const start = new Date(y, m, 1 - offset);
+    const sixthWeekStart = new Date(start.getFullYear(), start.getMonth(), start.getDate() + 35);
+    const totalCells = (sixthWeekStart.getMonth() !== m) ? 35 : 42;
+
+    let html = `<div class="dow-row"><div class="dow-cell kw-hdr">KW</div>` +
+      DOWS.map((d,i)=>`<div class="dow-cell${i>=5?' wknd':''}">${d}</div>`).join('') +
+      `</div><div class="month-grid">`;
+
+    for(let i=0;i<totalCells;i++){
+      const d = new Date(start.getFullYear(), start.getMonth(), start.getDate()+i);
+      const ds = iso(d);
+      const dowIdx = i % 7;
+      if(dowIdx === 0){
+        const kw = getKW(d);
+        html += `<div class="kw-cell" onclick="openWeekOf('${ds}')" title="Wochenansicht KW ${kw} öffnen">${kw}</div>`;
+      }
+      const isOther = d.getMonth() !== m;
+      const isToday = ds === DATA.today;
+      const isWknd = dowIdx >= 5;
+      const dayMatches = [];
+      DATA.items.forEach((it, idx) => {
+        if(keepItem(it) && it.start <= ds && ds <= it.end) dayMatches.push({it, idx});
+      });
+      const dLabel = (d.getDate()===1 && !isToday) ? `1. ${MONTHS_SHORT[d.getMonth()]}` : d.getDate();
+      const shown = dayMatches.slice(0, 3);
+      const more = dayMatches.length - shown.length;
+
+      html += `<div class="day${isOther?' other':''}${isToday?' today':''}${isWknd?' wknd':''}" onclick="if(event.target===this||event.target.classList.contains('dhead')||event.target.classList.contains('dnum-txt'))showDayModal('${ds}')">`;
+      html += `<div class="dhead"><span class="dnum-txt">${dLabel}</span>${isToday?'<span class="today-tag">Heute</span>':(dayMatches.length>1?`<span class="dcount">${dayMatches.length}</span>`:'')}</div>`;
+      for(const {it, idx} of shown){
+        const c = compactTitle(it.what);
+        const spanInfo = it.start !== it.end ? ` (${it.start.slice(8)}–${it.end.slice(8)})` : '';
+        html += `<div class="${pillClass(it)}" onclick="event.stopPropagation();showItemModal(${idx})" title="${esc(it.what)} (${esc(it.rel)})">
+          <div class="pill-top">
+            <span class="pill-ico">${icon(it)}</span>
+            ${it.time?`<span class="pill-time">${esc(it.time)}</span>`:''}
+            <span class="pill-txt">${esc(c.main)}${esc(spanInfo)}</span>
+          </div>
+          ${c.meta?`<div class="pill-meta">${esc(c.meta)}</div>`:''}
+        </div>`;
+      }
+      if(more > 0){
+        html += `<div class="more-pill" onclick="event.stopPropagation();showDayModal('${ds}')">+${more} weitere</div>`;
+      }
+      html += `</div>`;
+    }
+    html += `</div>`;
+    mainEl.innerHTML = html;
+  } else if(layout==='week'){
+    const dowOffset = (cur.getDay() + 6) % 7;
+    const wStart = new Date(cur.getFullYear(), cur.getMonth(), cur.getDate() - dowOffset);
+    const wEnd = new Date(wStart.getFullYear(), wStart.getMonth(), wStart.getDate() + 6);
+    const kw = getKW(wStart);
+    document.getElementById('mlabel').textContent = `KW ${kw} · ${wStart.getDate()}. ${MONTHS_SHORT[wStart.getMonth()]} – ${wEnd.getDate()}. ${MONTHS_SHORT[wEnd.getMonth()]} ${wEnd.getFullYear()}`;
+
+    let html = `<div class="week-list">`;
+    for(let i=0;i<7;i++){
+      const d = new Date(wStart.getFullYear(), wStart.getMonth(), wStart.getDate()+i);
+      const ds = iso(d);
+      const isToday = ds === DATA.today;
+      const dayMatches = [];
+      DATA.items.forEach((it, idx) => {
+        if(keepItem(it) && it.start <= ds && ds <= it.end) dayMatches.push({it, idx});
+      });
+      html += `<div class="wday-row${isToday?' today':''}" onclick="if(event.target===this)showDayModal('${ds}')">
+        <div class="wday-left" onclick="showDayModal('${ds}')">
+          <span class="wday-dow">${DOWS[i]}${isToday?' · HEUTE':''}</span>
+          <span class="wday-date">${d.getDate()}. ${MONTHS_SHORT[d.getMonth()]}</span>
+        </div>
+        <div class="wday-right">`;
+      if(dayMatches.length){
+        for(const {it, idx} of dayMatches){
+          html += `<div class="row" onclick="showItemModal(${idx})">
+            <div class="row-main">
+              <div class="row-title">${icon(it)} ${it.time?`<strong>${esc(it.time)}</strong> `:''}${esc(it.what)}</div>
+              <div class="row-sub"><span>${esc(it.kind)}${it.subkind?':'+esc(it.subkind):''}</span> · <span>${esc(it.rel)}</span></div>
+            </div>
+            <span class="tag">${esc(deltaLabel(it.delta))}</span>
+          </div>`;
+        }
+      } else {
+        html += `<div class="wday-empty" onclick="showDayModal('${ds}')">${filter==='coach'?'Freies Trainingsfenster (Klicken für Workout-Vorlage)':'Keine Termine eingetragen'}</div>`;
+      }
+      html += `</div></div>`;
+    }
+    html += `</div>`;
+    mainEl.innerHTML = html;
+  } else {
+    document.getElementById('mlabel').textContent = `Agenda · ${cur.getFullYear()}`;
+    const groups = new Map();
+    DATA.items.forEach((it, idx) => {
+      if(!keepItem(it) || (it.delta < -14 && it.status !== 'open')) return;
+      const ym = it.start.slice(0, 7);
+      if(!groups.has(ym)) groups.set(ym, []);
+      groups.get(ym).push({it, idx});
+    });
+    if(!groups.size){
+      mainEl.innerHTML = `<div class="agenda-view"><div class="empty-box">Keine Einträge für diesen Filter gefunden.</div></div>`;
+    } else {
+      let html = `<div class="agenda-view">`;
+      for(const [ym, arr] of groups.entries()){
+        const [yy, mm] = ym.split('-').map(Number);
+        html += `<div class="ag-group"><div class="ag-month-hdr"><span>${MONTHS[mm-1]} ${yy}</span><span>${arr.length} Einträge</span></div>`;
+        for(const {it, idx} of arr){
+          const dObj = parseIso(it.start);
+          const dow = DOWS[(dObj.getDay()+6)%7];
+          html += `<div class="ag-item" onclick="showItemModal(${idx})">
+            <div class="ag-date-col">
+              <span class="ag-date-main">${dow}, ${fmtDateDE(it.start).slice(0,6)}</span>
+              <span class="ag-date-sub">KW ${getKW(dObj)}${it.time?' · '+esc(it.time):''}</span>
+            </div>
+            <div class="row-main">
+              <div class="row-title">${icon(it)} ${esc(it.what)}</div>
+              <div class="row-sub"><span>${esc(it.rel)}</span></div>
+            </div>
+            <span class="tag ${it.delta<0?'overdue':(it.kind==='goal'?'goal':'')}">${esc(deltaLabel(it.delta))}</span>
+          </div>`;
+        }
+        html += `</div>`;
+      }
+      html += `</div>`;
+      mainEl.innerHTML = html;
+    }
+  }
+}
+
+function renderSidebar(){
+  const s1T = document.getElementById('s1-title'), s1C = document.getElementById('s1-cnt'), s1L = document.getElementById('s1-list');
+  const s2T = document.getElementById('s2-title'), s2C = document.getElementById('s2-cnt'), s2L = document.getElementById('s2-list');
+  const s3T = document.getElementById('s3-title'), s3C = document.getElementById('s3-cnt'), s3L = document.getElementById('s3-list');
+  const coach = DATA.coach || {metrics:[], macro_goals:[], schedule:''};
+
+  if(filter==='coach'){
+    // Card 1: Goals & Macro Pillars
+    const datedGoals = DATA.items.map((it,idx)=>({it,idx})).filter(x => x.it.kind==='goal' && x.it.delta>=0 && x.it.status==='open');
+    const macros = coach.macro_goals || [];
+    s1T.textContent = '🏆 Saisonziele & Athletik-Fokus';
+    s1C.textContent = datedGoals.length + macros.length;
+    let gHtml = datedGoals.map(({it,idx}) => `
+      <div class="row" onclick="showItemModal(${idx})">
+        <div class="row-main">
+          <div class="row-title">🏆 ${esc(it.what)}</div>
+          <div class="row-sub">${fmtDateDE(it.start)} · ${esc(it.subkind||'Race')}</div>
+        </div>
+        <span class="tag goal">in ${it.delta}d (${(it.delta/7).toFixed(1)}w)</span>
+      </div>
+    `).join('');
+    gHtml += macros.map(m => `
+      <div class="row" style="cursor:default">
+        <div class="row-main">
+          <div class="row-title">🎯 ${esc(m.title)}</div>
+          <div class="row-sub">${esc(m.detail)}</div>
+        </div>
+        <span class="tag goal">${esc(m.cat||'Fokus')}</span>
+      </div>
+    `).join('');
+    s1L.innerHTML = gHtml || `<div class="empty-box">Keine Goals eingetragen.<div class="code-hint">- [ ] YYYY-MM-DD [goal:A] Rennen</div></div>`;
+
+    // Card 2: Workouts (-14d .. +14d)
+    const wos = DATA.items.map((it,idx)=>({it,idx})).filter(x => x.it.kind==='workout' && x.it.delta>=-14 && x.it.delta<=14);
+    s2T.textContent = '🚴 Trainingsblock (-14d bis +14d)';
+    s2C.textContent = wos.length;
+    s2L.innerHTML = wos.length ? wos.map(({it,idx}) => `
+      <div class="row" onclick="showItemModal(${idx})">
+        <div class="row-main">
+          <div class="row-title">${icon(it)} ${esc(it.what)}</div>
+          <div class="row-sub">${fmtDateDE(it.start)} · ${esc(it.subkind||'workout')}</div>
+        </div>
+        <span class="tag ${it.status==='done'?'ok':''}">${it.status==='done'?'✓ erledigt':deltaLabel(it.delta)}</span>
+      </div>
+    `).join('') : `<div class="empty-box">
+      <div>Noch keine Einzel-Workouts für diese Woche in <code>calendar/README.md</code> geplant.</div>
+      <div class="code-hint" onclick="navigator.clipboard.writeText('- [ ] ${DATA.today} [workout:cycling] 90m Zone 2 / SweetSpot')">📋 Workout-Zeile kopieren</div>
+    </div>`;
+
+    // Card 3: Blockers & Busy Windows (28d)
+    const blk = DATA.items.map((it,idx)=>({it,idx})).filter(x => x.it.delta>=0 && x.it.delta<=28 && x.it.status==='open' && (x.it.kind==='blocked' || (x.it.kind==='event' && x.it.time)));
+    s3T.textContent = '🚫 Blocker & Zeitfenster (28d)';
+    s3C.textContent = blk.length;
+    s3L.innerHTML = blk.length ? blk.map(({it,idx}) => `
+      <div class="row" onclick="showItemModal(${idx})">
+        <div class="row-main">
+          <div class="row-title">${icon(it)} ${it.time?esc(it.time)+' ':''}${esc(it.what)}</div>
+          <div class="row-sub">${fmtDateDE(it.start)}${it.end!==it.start?'..'+fmtDateDE(it.end):''}</div>
+        </div>
+        <span class="tag high">${deltaLabel(it.delta)}</span>
+      </div>
+    `).join('') : `<div class="empty-box" style="border-color:rgba(16,185,129,0.3);color:#a7f3d0">✅ 100 % freie Trainingsverfügbarkeit in den nächsten 28 Tagen (keine Sperrtermine).</div>`;
+  } else if(filter==='todo'){
+    // Card 1: Open Backlog To-Dos
+    s1T.textContent = '☑️ Offene To-Dos (Backlog)';
+    s1C.textContent = DATA.todos.length;
+    s1L.innerHTML = DATA.todos.length ? DATA.todos.map(t => `
+      <div class="row">
+        <div class="row-main">
+          <div class="row-title">${esc(t.what)}</div>
+          <div class="row-sub">${esc(t.rel)}</div>
+        </div>
+        <span class="tag ${esc(t.prio)}">${esc(t.prio)}</span>
+      </div>
+    `).join('') : `<div class="empty-box">Keine offenen Backlog-To-Dos.</div>`;
+
+    // Card 2: Upcoming Deadlines (Next 90d)
+    const d90 = DATA.items.map((it,idx)=>({it,idx})).filter(x => isTodoItem(x.it) && x.it.delta>=-7 && x.it.delta<=90 && x.it.status==='open');
+    s2T.textContent = '⏳ Fristen & Stichtage (90 Tage)';
+    s2C.textContent = d90.length;
+    s2L.innerHTML = d90.length ? d90.map(({it,idx}) => `
+      <div class="row" onclick="showItemModal(${idx})">
+        <div class="row-main">
+          <div class="row-title">${icon(it)} ${esc(it.what)}</div>
+          <div class="row-sub">${fmtDateDE(it.start)} · ${esc(it.rel)}</div>
+        </div>
+        <span class="tag ${it.delta<0?'overdue':(it.delta<=14?'med':'')}">${deltaLabel(it.delta)}</span>
+      </div>
+    `).join('') : `<div class="empty-box">Keine Fristen in den nächsten 90 Tagen.</div>`;
+
+    // Card 3: Long-term Deadlines (> 90d)
+    const dLong = DATA.items.map((it,idx)=>({it,idx})).filter(x => isTodoItem(x.it) && x.it.delta>90 && x.it.status==='open');
+    s3T.textContent = '📆 Langfristige Stichtage (> 90d)';
+    s3C.textContent = dLong.length;
+    s3L.innerHTML = dLong.length ? dLong.map(({it,idx}) => `
+      <div class="row" onclick="showItemModal(${idx})">
+        <div class="row-main">
+          <div class="row-title">${icon(it)} ${esc(it.what)}</div>
+          <div class="row-sub">${fmtDateDE(it.start)} · ${esc(it.rel)}</div>
+        </div>
+        <span class="tag">${deltaLabel(it.delta)}</span>
+      </div>
+    `).join('') : `<div class="empty-box">Keine langfristigen Fristen.</div>`;
+  } else {
+    // Default 'all' view:
+    // Card 1: Next 30 Days Agenda (matches settings.md deadline_days=30!)
+    const ag30 = DATA.items.map((it,idx)=>({it,idx})).filter(x => keepItem(x.it) && x.it.delta>=0 && x.it.delta<=30 && x.it.status==='open');
+    s1T.textContent = '📅 Nächste 30 Tage (Agenda)';
+    s1C.textContent = ag30.length;
+    s1L.innerHTML = ag30.length ? ag30.map(({it,idx}) => `
+      <div class="row" onclick="showItemModal(${idx})">
+        <div class="row-main">
+          <div class="row-title">${icon(it)} ${it.time?esc(it.time)+' ':''}${esc(it.what)}</div>
+          <div class="row-sub">${fmtDateDE(it.start)}${it.end!==it.start?'..'+fmtDateDE(it.end):''} · ${esc(it.rel)}</div>
+        </div>
+        <span class="tag ${it.delta<=7?'med':''}">${deltaLabel(it.delta)}</span>
+      </div>
+    `).join('') : `<div class="empty-box">Keine Einträge in den nächsten 30 Tagen.</div>`;
+
+    // Card 2: Open To-Dos (Backlog)
+    s2T.textContent = '☑️ Offene To-Dos & Checklisten';
+    s2C.textContent = DATA.todos.length;
+    s2L.innerHTML = DATA.todos.length ? DATA.todos.map(t => `
+      <div class="row">
+        <div class="row-main">
+          <div class="row-title">${esc(t.what)}</div>
+          <div class="row-sub">${esc(t.rel)}</div>
+        </div>
+        <span class="tag ${esc(t.prio)}">${esc(t.prio)}</span>
+      </div>
+    `).join('') : `<div class="empty-box">Keine offenen To-Dos.</div>`;
+
+    // Card 3: Goals, Birthdays & Milestones
+    const hi = DATA.items.map((it,idx)=>({it,idx})).filter(x => x.it.delta>=0 && x.it.status==='open' && (x.it.kind==='goal' || x.it.kind==='birthday' || x.it.delta>30));
+    s3T.textContent = '🏆 Ziele, Geburtstage & Ausblick';
+    s3C.textContent = hi.length;
+    s3L.innerHTML = hi.length ? hi.map(({it,idx}) => `
+      <div class="row" onclick="showItemModal(${idx})">
+        <div class="row-main">
+          <div class="row-title">${icon(it)} ${esc(it.what)}</div>
+          <div class="row-sub">${fmtDateDE(it.start)} · ${esc(it.rel)}</div>
+        </div>
+        <span class="tag ${it.kind==='goal'?'goal':''}">${deltaLabel(it.delta)}</span>
+      </div>
+    `).join('') : `<div class="empty-box">Keine weiteren Jahrestermine.</div>`;
+  }
+}
+
+function render(){
+  for(const k of ['all','coach','todo']){
+    const el = document.getElementById('f-'+k);
+    if(el) el.classList.toggle('active', k===filter);
+  }
+  for(const l of ['month','week','agenda']){
+    const el = document.getElementById('v-'+l);
+    if(el) el.classList.toggle('active', l===layout);
+  }
+  const coachCnt = DATA.items.filter(isCoachItem).length + ((DATA.coach&&DATA.coach.macro_goals)||[]).length;
+  const todoCnt = DATA.items.filter(isTodoItem).length + DATA.todos.length;
+  document.getElementById('cnt-all').textContent = DATA.items.length;
+  document.getElementById('cnt-coach').textContent = coachCnt;
+  document.getElementById('cnt-todo').textContent = todoCnt;
+
+  renderKPIs();
+  renderMain();
+  renderSidebar();
+}
+
+// Keyboard shortcuts
+document.addEventListener('keydown', e => {
+  if(e.target.tagName==='INPUT' || e.target.tagName==='TEXTAREA'){
+    if(e.key==='Escape') e.target.blur();
+    return;
+  }
+  if(e.key==='Escape') closeModal();
+  else if(e.key==='ArrowLeft') stepNav(-1);
+  else if(e.key==='ArrowRight') stepNav(1);
+  else if(e.key==='t' || e.key==='T') goToday();
+  else if(e.key==='1') setFilter('all');
+  else if(e.key==='2') setFilter('coach');
+  else if(e.key==='3') setFilter('todo');
+  else if(e.key==='m' || e.key==='M') setLayout('month');
+  else if(e.key==='w' || e.key==='W') setLayout('week');
+  else if(e.key==='a' || e.key==='A') setLayout('agenda');
+  else if(e.key==='/'){ e.preventDefault(); document.getElementById('q-in').focus(); }
+});
+
+// Seamless background live-sync (preserves filter, month & scroll state without page reload flash!)
+setInterval(async () => {
+  try {
+    const res = await fetch(window.location.href, {cache: 'no-store'});
+    if(!res.ok) return;
+    const html = await res.text();
+    const m = html.match(/let DATA = (\\{.*?\\});\\n/);
+    if(m){
+      const nextData = JSON.parse(m[1]);
+      if(JSON.stringify(nextData) !== JSON.stringify(DATA)){
+        DATA = nextData;
+        render();
       }
     }
-    grid.appendChild(cell);
-  }
-  const goalsEl = document.getElementById('goals');
-  const goals = DATA.items.filter(i => i.kind==='goal' && i.delta>=0 && i.status==='open');
-  goalsEl.innerHTML = goals.length ? goals.map(g =>
-    `<div class="row"><div><strong>${g.what}</strong><div style="color:var(--muted);font-size:.72rem">${g.start}</div></div><span class="tag goal">in ${g.delta}d (${(g.delta/7).toFixed(1)}w)</span></div>`
-  ).join('') : '<div class="empty">Keine Goals eingetragen</div>';
-  const agEl = document.getElementById('agenda');
-  const ag = DATA.items.filter(i => keepItem(i) && i.delta>=0 && i.delta<=14 && i.status==='open');
-  agEl.innerHTML = ag.length ? ag.map(a =>
-    `<div class="row"><div><strong>${icon(a)}${a.time?a.time+' ':''}${a.what}</strong><div style="color:var(--muted);font-size:.72rem">${a.start}${a.end!==a.start?'..'+a.end:''} · ${a.rel}</div></div><span class="tag">${a.delta===0?'heute':'in '+a.delta+'d'}</span></div>`
-  ).join('') : '<div class="empty">Keine Einträge in den nächsten 14 Tagen</div>';
-  const tdEl = document.getElementById('todos');
-  tdEl.innerHTML = DATA.todos.length ? DATA.todos.map(t =>
-    `<div class="row"><div>${t.what}</div><span class="tag ${t.prio}">${t.prio}</span></div>`
-  ).join('') : '<div class="empty">Keine offenen To-Dos</div>';
-}
+  } catch(_e){}
+}, 15000);
+
 render();
 </script></body></html>
 """
@@ -688,7 +1598,11 @@ def render_calendar_html(idx=None, start_server=False):
     serial = [{k: (v.isoformat() if isinstance(v, dt.date) else v) for k, v in it.items()} for it in raw_items]
     todos = [{"status": t["status"], "prio": t["prio"], "what": t["what"], "rel": t["rel"]}
              for t in open_todos(include_done=False)]
-    payload = {"today": dt.date.today().isoformat(), "items": serial, "todos": todos}
+    try:
+        coach = _extract_coach_context(idx)
+    except Exception:
+        coach = {"metrics": [], "macro_goals": [], "schedule": ""}
+    payload = {"today": dt.date.today().isoformat(), "items": serial, "todos": todos, "coach": coach}
     html = CAL_TEMPLATE.replace("__DATA_JSON__", json.dumps(payload, ensure_ascii=False))
     cache_dir = os.path.dirname(CAL_HTML)
     os.makedirs(cache_dir, exist_ok=True)
