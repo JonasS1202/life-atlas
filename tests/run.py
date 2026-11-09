@@ -592,10 +592,16 @@ class Coach(AtlasCase):
         self.assertIn("[feedback: RPE 7/10 — Beine top im Finale]", self.read(cal_path))
         self.assertNotIn("[feedback: pending]", self.read(cal_path))
 
-        # 4. Verify Coach Context Slicing & Hook Routing + Staleness Detection
+        # 4. Verify Coach Context Slicing, 1-Click Strava Connect Link & Hook Routing + Staleness Detection
+        auth_out = self.atlas("coach", "auth-strava").stdout
+        self.assertIn("/strava-connect", auth_out)
+        self.assertIn("client_id=91804", auth_out)
         ctx_out = self.atlas("coach", "context", "--mode", "plan-14d", "--no-sync").stdout
         self.assertIn("ATHLETE PROFILE & THRESHOLDS", ctx_out)
         self.assertIn("3-EPOCH POWER & PACE CURVE", ctx_out)
+        self.assertIn("/strava-connect", ctx_out)
+        cal_html = self.read(os.path.join(self.brain, "_atlas", "cache", "calendar.html"))
+        self.assertIn("/strava-connect", cal_html)
 
         # Add a new goal to trigger goals_hash staleness detection
         with open(cal_path, "a", encoding="utf-8") as fh:

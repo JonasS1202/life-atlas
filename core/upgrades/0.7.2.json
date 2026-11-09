@@ -1,0 +1,13 @@
+{
+  "dirs": ["coach", "coach/workouts"],
+  "skeleton_add": [
+    "coach/README.md",
+    "coach/profile.md",
+    "coach/macro-plan.md",
+    "coach/power-curve.md",
+    "coach/activities.md"
+  ],
+  "tags_add": [
+    ["sport", "Sport, endurance training, coaching, workouts, physiology", "training, laufen, running, triathlon, athletik"]
+  ]
+}

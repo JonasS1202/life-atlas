@@ -1450,6 +1450,8 @@ const MONTHS_SHORT = ['Jan','Feb','Mär','Apr','Mai','Jun','Jul','Aug','Sep','Ok
 const DOWS = ['Mo','Di','Mi','Do','Fr','Sa','So'];
 
 let cur = new Date(DATA.today + "T00:00:00");
+const _urlView = new URLSearchParams(window.location.search).get("view");
+if(_urlView && ["all","coach","todo"].includes(_urlView)) sessionStorage.setItem("atlas_cal_filter", _urlView);
 let filter = sessionStorage.getItem("atlas_cal_filter") || "all";
 let layout = sessionStorage.getItem("atlas_cal_layout") || "month";
 let query = "";
@@ -1669,7 +1671,10 @@ function renderKPIs(){
       <div><strong>🧭 Makro-Phase:</strong> <span style="color:var(--accent);font-weight:700">${esc(mp.active_phase||'Base')}</span> ${mp.updated?`<span style="color:var(--muted-hi)">(Stand ${esc(mp.updated)})</span>`:''}</div>
       <div class="macro-badges">
         <span class="tag ${mp.stale?'med':'ok'}">${mp.stale?'⚠ Makroplan fällig ('+esc(mp.stale_reason)+')':'✓ Makroplan aktuell'}</span>
-        <span class="tag ${coach.strava_connected?'ok':'low'}">${coach.strava_connected?'✓ Strava verbunden':'⚡ Strava via atlas.py coach auth-strava'}</span>
+        ${coach.strava_connected
+          ? `<span class="tag ok">✓ Strava verbunden (${coach.activities_count||0} Rides)</span><a href="/strava-sync" class="tag" style="background:rgba(56,189,248,0.14);color:var(--accent);border:1px solid rgba(56,189,248,0.35);text-decoration:none;cursor:pointer;font-weight:700">🔄 Strava Sync</a>`
+          : `<a href="/strava-connect" class="tag" style="background:rgba(252,76,2,0.18);color:#fdba74;border:1px solid rgba(252,76,2,0.45);text-decoration:none;cursor:pointer;font-weight:700">🧡 Mit Strava verbinden (1-Klick)</a>`
+        }
         ${fbPend?`<span class="tag med">💬 ${fbPend} Ride-Check-in(s) offen</span>`:''}
       </div>
     `;
@@ -2135,22 +2140,93 @@ render();
 """
 
 
-CAL_SERVER_SCRIPT = """import functools, http.server, os, sys
+CAL_SERVER_SCRIPT = """import functools, http.server, os, subprocess, sys, urllib.parse
 sys.stdout = sys.stderr = open(os.devnull, "w")
+PORT = int(sys.argv[1])
+CACHE_DIR = os.path.abspath(sys.argv[2])
+BRAIN_DIR = os.path.normpath(os.path.join(CACHE_DIR, "..", ".."))
+ATLAS_PY = os.path.join(BRAIN_DIR, "_atlas", "tools", "atlas.py")
+
+def _get_cid():
+    p = os.path.join(BRAIN_DIR, "_secrets", "strava.env")
+    if os.path.isfile(p):
+        try:
+            for line in open(p, encoding="utf-8"):
+                if line.strip().startswith("STRAVA_CLIENT_ID="):
+                    v = line.split("=", 1)[1].strip()
+                    if v:
+                        return v
+        except OSError:
+            pass
+    return "91804"
+
 class _QuietHandler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, *args, **kwargs):
         pass
-handler = functools.partial(_QuietHandler, directory=sys.argv[2])
-http.server.ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), handler).serve_forever()
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/healthz":
+            body = b"atlas-cal-v2"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if parsed.path == "/strava-connect":
+            cid = _get_cid()
+            redir = urllib.parse.quote(f"http://127.0.0.1:{PORT}/strava-callback", safe="")
+            url = (f"https://www.strava.com/oauth/authorize?client_id={cid}&response_type=code"
+                   f"&redirect_uri={redir}&approval_prompt=force&scope=read,activity:read,activity:read_all,profile:read_all")
+            self.send_response(302)
+            self.send_header("Location", url)
+            self.end_headers()
+            return
+        if parsed.path in ("/strava-callback", "/callback"):
+            qs = urllib.parse.parse_qs(parsed.query)
+            code = (qs.get("code") or [None])[0]
+            ok = False
+            if code and os.path.isfile(ATLAS_PY):
+                res = subprocess.run([sys.executable, "-I", ATLAS_PY, "coach", "auth-strava", "--code", code, "--execute"],
+                                     capture_output=True, text=True, timeout=90)
+                ok = res.returncode == 0
+            msg = "&#10003; Atlas Coach erfolgreich mit Strava verbunden &amp; synchronisiert!" if ok else "Strava-Verbindung fehlgeschlagen oder abgebrochen."
+            col = "#34d399" if ok else "#f43f5e"
+            body = (f"<!DOCTYPE html><html><head><meta charset='utf-8'><title>Atlas · Strava Connect</title></head>"
+                    f"<body style='font-family:Inter,sans-serif;background:#070a0f;color:{col};display:flex;align-items:center;"
+                    f"justify-content:center;height:100vh;margin:0'><div style='background:#0d121b;border:1px solid rgba(255,255,255,0.1);"
+                    f"padding:32px 40px;border-radius:14px;text-align:center;max-width:480px'><h2 style='margin:0 0 12px'>{msg}</h2>"
+                    f"<p style='color:#94a3b8;font-size:14px;margin:0 0 18px'>Weiterleitung zum Atlas Coach Dashboard…</p>"
+                    f"<a href='/calendar.html?view=coach' style='color:#38bdf8;font-weight:600;text-decoration:none'>Jetzt zum Coach Dashboard &rarr;</a>"
+                    f"</div><script>sessionStorage.setItem('atlas_cal_filter','coach');setTimeout(()=>location.href='/calendar.html?view=coach',900);</script>"
+                    f"</body></html>").encode("utf-8")
+            self.send_response(200 if ok else 400)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if parsed.path == "/strava-sync":
+            if os.path.isfile(ATLAS_PY):
+                subprocess.run([sys.executable, "-I", ATLAS_PY, "coach", "sync", "--days", "90", "--execute"],
+                               capture_output=True, text=True, timeout=90)
+            self.send_response(302)
+            self.send_header("Location", "/calendar.html?view=coach")
+            self.end_headers()
+            return
+        return super().do_GET()
+
+handler = functools.partial(_QuietHandler, directory=CACHE_DIR)
+http.server.ThreadingHTTPServer(("127.0.0.1", PORT), handler).serve_forever()
 """
 
 
 def _cal_http_ok(port):
-    """Verify the calendar server actually returns HTTP 200 (catches pythonw.exe stderr=None ERR_EMPTY_RESPONSE)."""
+    """Verify the calendar server returns HTTP 200 on /healthz (v2 with /strava-connect and /strava-callback)."""
     import urllib.request
     try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/calendar.html", timeout=0.25) as resp:
-            return resp.status == 200
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=0.25) as resp:
+            return resp.status == 200 and b"atlas-cal-v2" in resp.read()
     except Exception:
         return False
 
@@ -2171,14 +2247,21 @@ def _ensure_calendar_server(cache_dir, start_server=False):
     if _cal_http_ok(port):
         return f"http://127.0.0.1:{port}/calendar.html"
     if os.name == "nt":
-        # Clean up any legacy pythonw.exe -m http.server (v0.6.2-v0.6.5) whose sys.stderr=None caused ERR_EMPTY_RESPONSE
+        # Clean up any legacy pythonw.exe -m http.server or older _cal_server.py
         try:
-            kill_ps = ("Get-CimInstance Win32_Process -Filter \"Name LIKE 'python%' AND CommandLine LIKE '%http.server%'\" "
+            kill_ps = ("Get-CimInstance Win32_Process -Filter \"Name LIKE 'python%' AND (CommandLine LIKE '%http.server%' OR CommandLine LIKE '%_cal_server.py%')\" "
                        "| Invoke-CimMethod -MethodName Terminate | Out-Null")
             subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", kill_ps],
                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                            timeout=4, creationflags=0x08000000)
             time.sleep(0.15)
+        except Exception:
+            pass
+    else:
+        try:
+            subprocess.run(["pkill", "-f", "_cal_server.py"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=2)
+            time.sleep(0.1)
         except Exception:
             pass
     for cand in range(8765, 8795):

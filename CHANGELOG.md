@@ -2,6 +2,12 @@
 
 Written for users: `/atlas-update` shows the sections between the installed and the new version.
 
+## [0.7.2] - 2026-11-10
+
+- **Zero-Friction 1-Click Strava Connect (`/strava-connect` & Shared App `91804`):**
+  - **No API Keys or Developer Setup Required:** Atlas now ships pre-configured with the shared Vulpiq / Atlas Strava application (`client_id=91804`), so users never need to visit `strava.com/settings/api` or enter a `Client ID` / `Client Secret`.
+  - **Always-On Background OAuth Callback (`127.0.0.1:8765`):** Upgraded the background calendar server (`_cal_server.py`) with `/strava-connect`, `/strava-callback`, `/strava-sync`, and `/healthz` (`atlas-cal-v2`). Clicking `[🧡 Jetzt mit Strava verbinden (1-Klick)](http://127.0.0.1:8765/strava-connect)` in chat or in the Coach Dashboard (`calendar.html?view=coach`) redirects directly to Strava consent, exchanges the OAuth token in the background (`brain/_secrets/strava.env`), automatically syncs the last 90 days of rides + 1Hz streams + 3-epoch power curve, and lands back in the Coach Dashboard.
+
 ## [0.7.1] - 2026-11-09
 
 - **Hardened & Self-Bootstrapping Update Engine (`core-apply` / `/atlas-update`):**

@@ -24,22 +24,23 @@ python -I <ROOT>/brain/_atlas/tools/atlas.py coach context --mode auto
 (Or explicitly `--mode daily`, `--mode checkin`, `--mode plan-14d`, `--mode macro`, plus `--deep-dive YYYY-MM-DD` when
 the athlete references a specific older activity or event.)
 
-## 3. Step 1 · First-Time Setup & Strava Onboarding Check
+## 3. Step 1 · First-Time Setup & 1-Click Strava Connect
 
-If `atlas.py coach context` reports `STRAVA_STATUS: NOT_CONFIGURED`:
-1. Tell the user that connecting Strava enables automatic activity import, 1Hz power/pace curves across epochs, automatic
-   `[x]` calendar matching, and post-ride feedback check-ins.
-2. Guide them through creating/providing their Strava API credentials (`Client ID` & `Client Secret` from
-   `https://www.strava.com/settings/api`) and run:
-   ```bash
-   python -I <ROOT>/brain/_atlas/tools/atlas.py coach auth-strava --client-id <ID> --client-secret <SECRET> --execute
-   ```
-   This starts a local callback listener on `127.0.0.1:8766`, opens the browser for OAuth consent, stores tokens in
-   `brain/_secrets/strava.env`, and syncs the activity history:
-   ```bash
-   python -I <ROOT>/brain/_atlas/tools/atlas.py coach sync --execute
-   ```
-3. If `brain/coach/profile.md` still has placeholder values, ask for (or extract from `brain/` and Strava) their current
+If `atlas.py coach context` reports `Strava: NOT CONNECTED`:
+1. **Zero-Friction 1-Click OAuth (No API Keys Required):**
+   Atlas comes pre-configured with the official shared Vulpiq / Atlas Strava application (`client_id=91804`), and the local
+   background server (`http://127.0.0.1:8765`) handles `/strava-connect` and `/strava-callback` automatically.
+   **Never** ask the user to visit `strava.com/settings/api` or enter a `Client ID` / `Client Secret`!
+2. Simply include the clickable 1-click link printed by `atlas.py coach context` (or `atlas.py coach auth-strava`)
+   directly in your reply:
+   - **[🧡 Jetzt mit Strava verbinden (1-Klick)](http://127.0.0.1:8765/strava-connect)**
+   - Or tell them they can click **`🧡 Mit Strava verbinden (1-Klick)`** directly in the top banner of the
+     **[📅 Coach Dashboard](http://127.0.0.1:8765/calendar.html?view=coach)**.
+3. The moment the user clicks that link and clicks **"Autorisieren"** on Strava, the background server automatically
+   exchanges the OAuth token, stores it in `brain/_secrets/strava.env`, syncs the last 90 days of rides + 1Hz streams +
+   3-epoch power curve (`atlas.py coach sync --execute`), marks completed calendar workouts `[x]`, and redirects their
+   browser back to the Coach Dashboard.
+4. If `brain/coach/profile.md` still has placeholder values, ask for (or extract from `brain/` and Strava) their current
    thresholds, weekly time budget, and weekday/weekend training slots.
 
 ## 4. Step 2 · Ride Feedback Check-in (`[feedback: pending]`)
