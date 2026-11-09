@@ -2,6 +2,12 @@
 
 Written for users: `/atlas-update` shows the sections between the installed and the new version.
 
+## [0.6.6] - 2026-11-09
+
+- **Fixed `ERR_EMPTY_RESPONSE` on Native Windows (`pythonw.exe` `sys.stderr = None` Crash in `http.server`):**
+  - **Root Cause:** On native Windows installations, `pythonw.exe` runs in the Windows GUI subsystem without a console, setting `sys.stdout = None` and `sys.stderr = None`. When `pythonw.exe -I -m http.server` received `GET /calendar.html`, `BaseHTTPRequestHandler.send_response(200)` called `self.log_message()` $\rightarrow$ `sys.stderr.write(...)` *before* writing a single byte of the HTTP response, throwing `AttributeError: 'NoneType' object has no attribute 'write'` and closing the TCP socket immediately (`ERR_EMPTY_RESPONSE`). Meanwhile, raw TCP `socket.create_connection` still saw port `8765` as open.
+  - **Fix:** Replaced `-m http.server` with a dedicated `_cal_server.py` (`ThreadingHTTPServer` + `sys.stdout = sys.stderr = open(os.devnull, "w")` + silenced `log_message`), upgraded the health check from raw TCP connect to a real `HTTP 200` GET probe (`_cal_http_ok`), automatically terminates any legacy broken `pythonw.exe ... http.server` process squatting on port `8765` on Windows, and starts/verifies the calendar server on every `SessionStart` hook so direct browser opens always succeed.
+
 ## [0.6.5] - 2026-11-09
 
 - **Expert Frontend Overhaul of the Visual Calendar & Coach Hub (`calendar.html`):**

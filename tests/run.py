@@ -427,6 +427,36 @@ class Calendar(AtlasCase):
         self.assertIn("Eschborn-Frankfurt", html_content)
         self.assertIn("minmax(0,1fr)", html_content)
         self.assertNotIn("http-equiv=\"refresh\"", html_content)
+        # Verify CAL_SERVER_SCRIPT serves HTTP 200 even when stdout/stderr are None (Windows pythonw.exe behavior)
+        import socket, urllib.request
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            free_port = s.getsockname()[1]
+        srv_py = os.path.join(self.tmp, "_test_cal_srv.py")
+        with open(srv_py, "w", encoding="utf-8") as fh:
+            fh.write("import sys; sys.stdout = sys.stderr = None\n" +
+                     "import functools, http.server, os\n"
+                     "sys.stdout = sys.stderr = open(os.devnull, 'w')\n"
+                     "class _QuietHandler(http.server.SimpleHTTPRequestHandler):\n"
+                     "    def log_message(self, *args, **kwargs): pass\n"
+                     "handler = functools.partial(_QuietHandler, directory=sys.argv[2])\n"
+                     "http.server.ThreadingHTTPServer(('127.0.0.1', int(sys.argv[1])), handler).serve_forever()\n")
+        proc = subprocess.Popen([sys.executable, "-I", srv_py, str(free_port), os.path.dirname(html_path)],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            ok = False
+            for _ in range(20):
+                try:
+                    with urllib.request.urlopen(f"http://127.0.0.1:{free_port}/calendar.html", timeout=0.25) as r:
+                        if r.status == 200 and b"Eschborn-Frankfurt" in r.read():
+                            ok = True
+                            break
+                except Exception:
+                    time.sleep(0.05)
+            self.assertTrue(ok, "CAL_SERVER_SCRIPT failed to serve HTTP 200 under pythonw.exe stdout/stderr=None")
+        finally:
+            proc.terminate()
+            proc.wait(timeout=2)
 
 
 if __name__ == "__main__":

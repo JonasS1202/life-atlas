@@ -1529,6 +1529,26 @@ render();
 """
 
 
+CAL_SERVER_SCRIPT = """import functools, http.server, os, sys
+sys.stdout = sys.stderr = open(os.devnull, "w")
+class _QuietHandler(http.server.SimpleHTTPRequestHandler):
+    def log_message(self, *args, **kwargs):
+        pass
+handler = functools.partial(_QuietHandler, directory=sys.argv[2])
+http.server.ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), handler).serve_forever()
+"""
+
+
+def _cal_http_ok(port):
+    """Verify the calendar server actually returns HTTP 200 (catches pythonw.exe stderr=None ERR_EMPTY_RESPONSE)."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/calendar.html", timeout=0.25) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
 def _ensure_calendar_server(cache_dir, start_server=False):
     """Ensure a local HTTP server serves cache_dir so http://127.0.0.1:<port>/calendar.html opens rendered in browsers
     instead of as raw HTML source code in IDE editors (which intercept file:// links)."""
@@ -1542,11 +1562,19 @@ def _ensure_calendar_server(cache_dir, start_server=False):
         pass
     if not start_server or PROBE or os.environ.get("ATLAS_NO_CAL_SERVER"):
         return f"http://127.0.0.1:{port}/calendar.html"
-    try:
-        with socket.create_connection(("127.0.0.1", port), timeout=0.1):
-            return f"http://127.0.0.1:{port}/calendar.html"
-    except OSError:
-        pass
+    if _cal_http_ok(port):
+        return f"http://127.0.0.1:{port}/calendar.html"
+    if os.name == "nt":
+        # Clean up any legacy pythonw.exe -m http.server (v0.6.2-v0.6.5) whose sys.stderr=None caused ERR_EMPTY_RESPONSE
+        try:
+            kill_ps = ("Get-CimInstance Win32_Process -Filter \"Name LIKE 'python%' AND CommandLine LIKE '%http.server%'\" "
+                       "| Invoke-CimMethod -MethodName Terminate | Out-Null")
+            subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", kill_ps],
+                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=4, creationflags=0x08000000)
+            time.sleep(0.15)
+        except Exception:
+            pass
     for cand in range(8765, 8795):
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -1556,6 +1584,9 @@ def _ensure_calendar_server(cache_dir, start_server=False):
         except OSError:
             continue
     try:
+        srv_script = os.path.join(cache_dir, "_cal_server.py")
+        with open(srv_script, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(CAL_SERVER_SCRIPT)
         with open(port_file, "w", encoding="utf-8") as fh:
             fh.write(str(port))
         py_exe = sys.executable
@@ -1563,8 +1594,7 @@ def _ensure_calendar_server(cache_dir, start_server=False):
             pyw = os.path.join(os.path.dirname(py_exe), "pythonw.exe")
             if os.path.isfile(pyw):
                 py_exe = pyw
-        server_cmd = [py_exe, "-I", "-m", "http.server", str(port), "--bind", "127.0.0.1",
-                      "--directory", cache_dir]
+        server_cmd = [py_exe, "-I", srv_script, str(port), cache_dir]
         if os.name == "nt":
             # Antigravity/VS Code run_command on Windows uses a Job Object with KILL_ON_JOB_CLOSE that kills normal
             # child processes when atlas.py exits. Spawning via WMI Win32_Process.Create launches outside the Job Object.
@@ -1579,12 +1609,10 @@ def _ensure_calendar_server(cache_dir, start_server=False):
         else:
             subprocess.Popen(server_cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL, close_fds=True, start_new_session=True)
-        for _ in range(15):
-            try:
-                with socket.create_connection(("127.0.0.1", port), timeout=0.1):
-                    break
-            except OSError:
-                time.sleep(0.1)
+        for _ in range(20):
+            if _cal_http_ok(port):
+                break
+            time.sleep(0.1)
     except Exception:
         pass
     return f"http://127.0.0.1:{port}/calendar.html"
@@ -1719,7 +1747,7 @@ def session_text(cwd, session):
             parts.append(f"Open to-dos ({len(todos)} in brain/calendar/README.md): " + "; ".join(top))
         if not PROBE:
             try:
-                cal_uri = render_calendar_html(idx)
+                cal_uri = render_calendar_html(idx, start_server=True)
                 parts.append(f"Visual calendar: [📅 Kalender öffnen]({cal_uri}) (include this clickable link in the briefing)")
             except Exception:
                 pass
@@ -1757,6 +1785,11 @@ def session_text(cwd, session):
         lines.append("Atlas briefing (first chat today): give the user 3-6 short lines, then handle their request."
                      + ("\n" + "\n".join(parts) if parts else "\nNothing pending; say so in one line."))
     else:
+        if not PROBE:
+            try:
+                render_calendar_html(idx, start_server=True)
+            except Exception:
+                pass
         urgent = [d for d in due if d[1] <= 0]
         if urgent:
             lines.append("Due today/overdue (mention only if relevant or due today): " + "; ".join(
