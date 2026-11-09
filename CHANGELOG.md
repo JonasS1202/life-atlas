@@ -2,6 +2,17 @@
 
 Written for users: `/atlas-update` shows the sections between the installed and the new version.
 
+## [0.6.1] - 2026-11-09
+
+- **Zero-Token Visual Calendar & Coach Dashboard (`_atlas/cache/calendar.html` + `atlas.py calendar --open`):**
+  - Automatically renders an interactive, dark-mode HTML calendar & coach hub directly in Python (0 LLM tokens, < 2 ms)
+    on every session start, end of turn (`Stop` hook), and `atlas.py calendar` call.
+  - Features an interactive month grid with color-coded pills (workouts done/planned/skipped, multi-day blocked bars,
+    race goals, events, deadlines, birthdays), 1-click view filters (`Alle` | `🚴 Coach View` | `☑️ To-Dos & Fristen`),
+    goal week-countdowns, 14-day agenda, open to-do backlog, and live 20-second auto-refresh.
+  - Every briefing and `atlas.py calendar` output now includes a 1-click `[📅 Kalender öffnen](file:///...)` hyperlink,
+    and `atlas.py calendar --open` launches it automatically in the browser.
+
 ## [0.6.0] - 2026-11-09
 
 - **Atlas First Principle & Native Calendar/To-Do Core (`brain/calendar/README.md` + `atlas.py calendar`):**

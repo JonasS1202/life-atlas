@@ -1188,11 +1188,24 @@ def _calendar_init(root, brain, hk, execute):
         f"{len(harvest_timeline)} timeline item(s) and {len(harvest_todos)} open to-do(s) harvested from brain.")
 
 
+def _open_visual_calendar(hk, idx, open_now=False):
+    cal_uri = hk.render_calendar_html(idx)
+    say(f"Visual calendar: [📅 Kalender öffnen]({cal_uri})")
+    if open_now:
+        try:
+            import webbrowser
+            webbrowser.open(cal_uri)
+        except Exception:
+            pass
+    return cal_uri
+
+
 def cmd_calendar(args):
     root, brain = paths(args)
     hk = hook_module(brain)
     if args.init:
         _calendar_init(root, brain, hk, args.execute)
+        _open_visual_calendar(hk, hk.load_index(), getattr(args, "open", False))
         return
     today = dt.date.today()
     if args.sync_ics:
@@ -1219,6 +1232,7 @@ def cmd_calendar(args):
                 cur = cur.rstrip() + "\n\n## Timeline\n\n" + "\n".join(added) + "\n"
             write(cal_readme, cur)
             say("Applied to brain/calendar/README.md.")
+        _open_visual_calendar(hk, hk.load_index(), getattr(args, "open", False))
         return
     idx = hk.load_index()
     if getattr(args, "for_role", None) == "coach":
@@ -1247,6 +1261,7 @@ def cmd_calendar(args):
             say(f"  {box_map.get(w['status'], '[ ]')} {w['start'].isoformat()} [{k}] {w['what']}")
         if not workouts:
             say("  (none)")
+        _open_visual_calendar(hk, idx, getattr(args, "open", False))
         return
     horizon = 10 ** 6 if args.all else args.days
     items = hk.calendar_items(idx, days=horizon, past_days=365 if args.include_done else 3650,
@@ -1271,6 +1286,7 @@ def cmd_calendar(args):
         say("calendar: no upcoming items or open to-dos")
     if args.ics:
         _write_ics(args.ics, _deadlines(brain, None if args.all else args.days))
+    _open_visual_calendar(hk, idx, getattr(args, "open", False))
 
 
 # ================================================================= inventory
@@ -2377,6 +2393,7 @@ def main():
     p.add_argument("--include-done", action="store_true")
     p.add_argument("--for", dest="for_role", choices=("coach",), help="filtered view for a specific role (e.g. coach)")
     p.add_argument("--init", action="store_true", help="harvest existing dates, birthdays and open to-dos into calendar/README.md")
+    p.add_argument("--open", action="store_true", help="open the zero-token visual HTML calendar in the browser")
     p.add_argument("--ics", help="export calendar timeline to an .ics file")
     p.add_argument("--sync-ics", action="store_true", help="merge upcoming events from settings.md calendar_ics or --ics-source")
     p.add_argument("--ics-source", help="URL or file path of an .ics feed")

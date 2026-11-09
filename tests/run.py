@@ -412,6 +412,10 @@ class Calendar(AtlasCase):
         self.assertIn("90m SweetSpot", out_coach)
         self.assertNotIn("Steuerbelege 2025 sortieren", out_coach)
         self.assertNotIn("Max", out_coach)
+        self.assertIn("Visual calendar: [📅 Kalender öffnen](file://", out_all)
+        html_path = os.path.join(self.brain, "_atlas", "cache", "calendar.html")
+        self.assertTrue(os.path.isfile(html_path))
+        self.assertIn("Eschborn-Frankfurt", self.read(html_path))
 
 
 if __name__ == "__main__":
