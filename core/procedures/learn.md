@@ -8,8 +8,10 @@ one place (`INDEX.md` → *Where things go*), with `summary:` and `tags:`. If no
 ## Keep
 
 - **Life:** facts about people (who, relation, contact, birthdays), contracts and accounts (provider, numbers, cost,
-  term, notice period), devices, places, health basics the user shares; amounts and dates that matter (`due:`);
-  decisions and their reason; plans and goals; what the user said about themself (`self/`).
+  term, notice period), devices, places, health basics the user shares; amounts and dates that matter (`due:` on the
+  page or in `brain/calendar/README.md` under `## Timeline`); appointments, vacations/blocked periods (`[blocked]`),
+  race/macro goals (`[goal]`), planned workouts (`[workout]`), and open tasks (`## Open To-Dos` in
+  `brain/calendar/README.md`); decisions and their reason; plans and goals; what the user said about themself (`self/`).
 - **The user's ways:** preferences, rules ("from now on…", "never…"), corrections of Atlas (the lesson goes to `howto/`,
   the wrong page gets fixed), how they want answers.
 - **Code (project page):** gotchas found while debugging, how to build/test/deploy, decisions and why, what was

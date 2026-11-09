@@ -9,6 +9,7 @@ reminder: signals         # signals | every-turn | rare: when the stop hook asks
 deadline_days: 30         # how far ahead the briefing looks
 daily_log: on             # on | off: `Atlas:` lines into journal/<year>/<date>.md
 inbox_cloud:              # optional: a cloud folder the phone saves into; Atlas empties it into inbox/
+calendar_ics:             # optional: private .ics URL or path (Google/Apple Calendar) merged by atlas.py calendar
 ---
 # How Atlas works for {{USER_NAME}}
 

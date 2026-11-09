@@ -9,8 +9,11 @@ Everything else in Atlas may grow and be rebuilt by Atlas itself.
 1. **One entry point.** Atlas is one folder, `ROOT` (e.g. `C:\Atlas` or `~/Atlas`), opened as the project in Claude
    Code and as the workspace in Antigravity. Every chat starts there. Atlas routes each request to the right place:
    a project, the user's life, or a plain answer. The user never has to switch folders.
-2. **One brain.** Everything Atlas knows lives in `ROOT/brain/` as plain Markdown under Git. The agent folders
-   (`ROOT/.claude/`, `ROOT/.agents/`) and `ROOT/CLAUDE.md`, `ROOT/GEMINI.md` contain only wiring that points there.
+2. **One brain (Atlas First).** Everything Atlas knows — knowledge, calendar timeline, blocked dates, goals, workouts
+   and to-dos — lives first in `ROOT/brain/` as plain, versioned Markdown under Git. External services (Google/Apple
+   Calendar, Strava, smart trainers, cloud folders) are optional sync mirrors or sensors, never a dependency without
+   which Atlas is blind. The agent folders (`ROOT/.claude/`, `ROOT/.agents/`) and `ROOT/CLAUDE.md`, `ROOT/GEMINI.md`
+   contain only wiring that points there.
 3. **One place per thing.** Every person, contract, account, device, place, project and idea has exactly one canonical
    page. Other pages link to it instead of repeating it. `brain/INDEX.md` → *Where things go* decides where it lives.
 4. **Tokens are a budget.** Loaded in every chat: only the router (`brain/ROUTER.md`, aim < 6 KB, limit 10 KB), the
@@ -61,6 +64,7 @@ Everything else in Atlas may grow and be rebuilt by Atlas itself.
 | `brain/settings.md` | How Atlas behaves for this user (switches the hooks read, plus finer wishes) |
 | `brain/tags.md` | Tag vocabulary with meanings and synonyms |
 | `brain/self/` | Who the user is: profile, values, goals, patterns (deep mode only with consent) |
+| `brain/calendar/` | Central Atlas-First calendar & to-do hub: timeline (events, blocked dates, goals, workouts, deadlines, birthdays) and open to-dos |
 | `brain/skills/` | The user's own skills (from `/atlas-learn` or adopted), wired into both agents |
 | `brain/inbox/` | Drop zone; Atlas files what lands here and reports where it went |
 | `brain/journal/<year>/` | Dated things: daily logs (`<date>.md`, from `Atlas:` lines), conversations, events, decisions |

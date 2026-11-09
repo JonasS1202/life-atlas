@@ -17,5 +17,6 @@ search hook maps them to the tag, and `atlas.py check --fix` replaces them on pa
 | **person** | A person in the user's life | contact, kontakt |
 | **contract** | A contract, policy, subscription | vertrag, abo, police |
 | **deadline** | Something with a date that matters | frist, termin |
+| **calendar** | Calendar timeline, events, blocked dates, workouts, goals and to-dos | kalender, todo, aufgabe, event, workout |
 | **project** | An undertaking with an end, a code repository | projekt, repo |
 | **preference** | How the user wants things done | vorliebe, wunsch |

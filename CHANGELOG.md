@@ -2,6 +2,23 @@
 
 Written for users: `/atlas-update` shows the sections between the installed and the new version.
 
+## [0.6.0] - 2026-11-09
+
+- **Atlas First Principle & Native Calendar/To-Do Core (`brain/calendar/README.md` + `atlas.py calendar`):**
+  - Anchored **Atlas First** in `charter.md`: all knowledge, timeline events, blocked periods, race/macro goals,
+    workouts, and to-dos live first as open, versioned Markdown in `brain/`; external calendars and sensors are optional
+    sync mirrors.
+  - Added `brain/calendar/README.md` with two unified sections: `## Timeline` (supporting single dates, multi-day ranges
+    `YYYY-MM-DD..YYYY-MM-DD`, times `HH:MM`, yearly birthdays with automatic age calculation, status markers `[ ]` /
+    `[x]` / `[-]`, and category tags `[event]`, `[blocked]`, `[goal]`, `[workout]`, `[todo]`, `[birthday]`) and
+    `## Open To-Dos` (prioritized `[high]`, `[med]`, `[low]` tasks that move to `## Timeline` once scheduled).
+  - Automatically merges decentralized `due:` frontmatter items from all brain pages and supports `.ics` export
+    (`--ics`) and external Google/Apple Calendar `.ics` feed import (`--sync-ics` via `settings.md` → `calendar_ics`).
+  - Added role-filtered **Sportcoach view** (`atlas.py calendar --for coach`) that strips out everyday noise (birthdays,
+    contract renewals, general to-dos) and outputs only `GOALS & RACES`, `BLOCKED & BUSY WINDOWS`, and `WORKOUTS`.
+  - **Initialzündung (`atlas.py calendar --init --execute` & upgrade `0.6.0.json`):** Automatically scans existing
+    brains during `/atlas-update` to harvest birthdays, dates, and open `- [ ]` tasks into `brain/calendar/README.md`.
+
 ## [0.5.2] - 2026-11-09
 
 - **Fact-Check & Gap Radar (`/atlas-interview`):** Upgraded `procedures/interview.md` and `skills/atlas-interview/SKILL.md`

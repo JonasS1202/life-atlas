@@ -288,8 +288,8 @@ def cmd_init(args):
         else:
             shutil.copy2(s, d)
     write(os.path.join(brain, "ROUTER.md"), render(read(os.path.join(src, "core", "templates", "router.md")), values))
-    for d in ("inbox", "journal", "people", "areas", "projects", "howto", "self", "skills", "_secrets", "_archive",
-              os.path.join("_atlas", "memory"), os.path.join("_atlas", "migrations")):
+    for d in ("inbox", "journal", "people", "areas", "projects", "howto", "self", "calendar", "skills", "_secrets",
+              "_archive", os.path.join("_atlas", "memory"), os.path.join("_atlas", "migrations")):
         os.makedirs(os.path.join(brain, d), exist_ok=True)
     os.makedirs(os.path.join(root, "code"), exist_ok=True)
     mem = os.path.join(brain, "_atlas", "memory", "MEMORY.md")
@@ -752,7 +752,7 @@ def cmd_probe(args):
 # ================================================================= check
 
 LINK_RX = re.compile(r"\[[^\]]*\]\(([^)\s]+)\)")
-TICK_RX = re.compile(r"`((?:areas|projects|people|howto|journal|inbox|self|skills|_atlas)/[^`\s]+\.md)`")
+TICK_RX = re.compile(r"`((?:areas|projects|people|howto|journal|inbox|self|skills|calendar|_atlas)/[^`\s]+\.md)`")
 HUB_SKIP = ("journal/", "inbox/", "_archive/", "_secrets/", "_atlas/")
 
 
@@ -1023,21 +1023,254 @@ def cmd_deadlines(args):
     for when, delta, what, rel in items:
         say(f"{when}  ({'overdue ' + str(-delta) + ' d' if delta < 0 else 'in ' + str(delta) + ' d'})  {what}  [{rel}]")
     if args.ics:
-        lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//life-atlas//deadlines//EN", "CALSCALE:GREGORIAN"]
-        for when, _d, what, rel in items:
-            day = when.replace("-", "")
-            nxt = (dt.date.fromisoformat(when) + dt.timedelta(days=1)).strftime("%Y%m%d")
-            uid = hashlib.sha1(f"{when}|{what}|{rel}".encode("utf-8")).hexdigest()
-            summary = (what or rel).replace(",", "\\,").replace(";", "\\;")
-            lines += ["BEGIN:VEVENT", f"UID:{uid}@life-atlas",
-                      f"DTSTAMP:{dt.datetime.now(dt.timezone.utc):%Y%m%dT%H%M%SZ}",
-                      f"DTSTART;VALUE=DATE:{day}", f"DTEND;VALUE=DATE:{nxt}", f"SUMMARY:{summary}",
-                      f"DESCRIPTION:Atlas page: {rel}", "BEGIN:VALARM", "ACTION:DISPLAY", f"DESCRIPTION:{summary}",
-                      "TRIGGER:-P3D", "END:VALARM", "END:VEVENT"]
-        lines.append("END:VCALENDAR")
-        with open(args.ics, "w", encoding="utf-8", newline="\r\n") as fh:
-            fh.write("\n".join(lines) + "\n")
-        say(f"Wrote {len(items)} event(s) to {args.ics}")
+        _write_ics(args.ics, items)
+
+
+def _write_ics(ics_path, items):
+    lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//life-atlas//calendar//EN", "CALSCALE:GREGORIAN"]
+    for when, _d, what, rel in items:
+        day = when.replace("-", "")
+        nxt = (dt.date.fromisoformat(when) + dt.timedelta(days=1)).strftime("%Y%m%d")
+        uid = hashlib.sha1(f"{when}|{what}|{rel}".encode("utf-8")).hexdigest()
+        summary = (what or rel).replace(",", "\\,").replace(";", "\\;")
+        lines += ["BEGIN:VEVENT", f"UID:{uid}@life-atlas",
+                  f"DTSTAMP:{dt.datetime.now(dt.timezone.utc):%Y%m%dT%H%M%SZ}",
+                  f"DTSTART;VALUE=DATE:{day}", f"DTEND;VALUE=DATE:{nxt}", f"SUMMARY:{summary}",
+                  f"DESCRIPTION:Atlas page: {rel}", "BEGIN:VALARM", "ACTION:DISPLAY", f"DESCRIPTION:{summary}",
+                  "TRIGGER:-P3D", "END:VALARM", "END:VEVENT"]
+    lines.append("END:VCALENDAR")
+    with open(ics_path, "w", encoding="utf-8", newline="\r\n") as fh:
+        fh.write("\n".join(lines) + "\n")
+    say(f"Wrote {len(items)} event(s) to {ics_path}")
+
+
+def _parse_ics_text(text, today, horizon_days=90):
+    """Parse VEVENT blocks from an .ics string (stdlib only) into timeline lines."""
+    out = []
+    for block in re.findall(r"BEGIN:VEVENT(.*?)END:VEVENT", text, re.S):
+        unfolded = re.sub(r"\r?\n[ \t]", "", block)
+        dtstart = re.search(r"(?m)^DTSTART(?:;[^:]*)?:(\d{8})(?:T(\d{2})(\d{2}))?", unfolded)
+        dtend = re.search(r"(?m)^DTEND(?:;[^:]*)?:(\d{8})(?:T(\d{2})(\d{2}))?", unfolded)
+        summ = re.search(r"(?m)^SUMMARY(?:;[^:]*)?:(.+)$", unfolded)
+        if not dtstart or not summ:
+            continue
+        try:
+            s_date = dt.date.fromisoformat(f"{dtstart.group(1)[:4]}-{dtstart.group(1)[4:6]}-{dtstart.group(1)[6:8]}")
+        except ValueError:
+            continue
+        e_date = s_date
+        if dtend:
+            try:
+                ed = dt.date.fromisoformat(f"{dtend.group(1)[:4]}-{dtend.group(1)[4:6]}-{dtend.group(1)[6:8]}")
+                if not dtend.group(2) and ed > s_date:
+                    ed -= dt.timedelta(days=1)
+                if ed >= s_date:
+                    e_date = ed
+            except ValueError:
+                pass
+        delta = 0 if s_date <= today <= e_date else ((s_date - today).days if s_date > today else (e_date - today).days)
+        if not (0 <= delta <= horizon_days):
+            continue
+        t_part = ""
+        if dtstart.group(2):
+            t_part = f"{dtstart.group(2)}:{dtstart.group(3)} "
+            if dtend and dtend.group(2) and s_date == e_date:
+                t_part = f"{dtstart.group(2)}:{dtstart.group(3)}-{dtend.group(2)}:{dtend.group(3)} "
+        d_part = s_date.isoformat() if s_date == e_date else f"{s_date.isoformat()}..{e_date.isoformat()}"
+        title = summ.group(1).strip().replace("\\,", ",").replace("\\;", ";")
+        kind = "blocked" if s_date != e_date else "event"
+        out.append((s_date, f"- [ ] {d_part} {t_part}[{kind}] {title}"))
+    return [line for _d, line in sorted(out)]
+
+
+def _calendar_init(root, brain, hk, execute):
+    """Initialzündung: ensure calendar/README.md + INDEX.md link exist and harvest dates, birthdays & open to-dos."""
+    cal_readme = os.path.join(brain, "calendar", "README.md")
+    idx_file = os.path.join(brain, "INDEX.md")
+    values = _router_values(brain, root)
+    created_cal = False
+    if not os.path.isfile(cal_readme):
+        created_cal = True
+        tpl = (
+            "---\n"
+            "summary: Central calendar and to-do hub: timeline (events, blocked dates, goals, workouts, deadlines, birthdays) and open to-dos\n"
+            "tags: [atlas, calendar]\n"
+            "---\n"
+            "# Calendar & To-Dos\n\n"
+            f"Stand: {values['DATE']}. The Atlas-First calendar and task hub for {values['USER_NAME']}.\n\n"
+            "## Timeline\n\n"
+            "## Open To-Dos\n"
+        )
+        if execute:
+            write(cal_readme, tpl)
+    else:
+        tpl = read(cal_readme)
+    linked_index = False
+    if os.path.isfile(idx_file):
+        idx_text = read(idx_file)
+        if "calendar/README.md" not in idx_text:
+            linked_index = True
+            if execute:
+                if "| `self/` |" in idx_text:
+                    idx_text = idx_text.replace(
+                        "| `self/` |",
+                        "| `calendar/` | Central calendar timeline (events, blocked dates, goals, workouts, birthdays) & open to-dos | `calendar/README.md` |\n| `self/` |",
+                        1,
+                    )
+                else:
+                    idx_text = idx_text.rstrip() + "\n- Calendar & To-Dos: `calendar/README.md`\n"
+                write(idx_file, idx_text)
+    idx = hk.load_index()
+    existing_cal = tpl.lower()
+    existing_due = {raw.lower() for e in idx.values() for raw in e.get("due", [])}
+    harvest_timeline, harvest_todos = [], []
+    bday_rx = re.compile(r"(?i)\b(?:geburtstag|birthday|geboren|born)\b[^0-9\n]{0,25}(\d{4}-\d{2}-\d{2}|\d{1,2}\.\d{1,2}\.\d{4})")
+    task_rx = re.compile(r"^\s*-\s*\[\s\]\s+(.+)$")
+    for dp, dns, fns in os.walk(brain):
+        dns[:] = [d for d in dns if d not in (".git", "_secrets", "_archive", "_atlas", "calendar", "journal", "inbox")
+                  and not d.startswith(".")]
+        for fn in sorted(fns):
+            if not fn.lower().endswith(".md"):
+                continue
+            full = os.path.join(dp, fn)
+            rel = fwd(os.path.relpath(full, brain))
+            if rel in ("ROUTER.md", "INDEX.md", "settings.md", "tags.md", "glossary.md"):
+                continue
+            text = read(full)
+            title = idx.get(rel, {}).get("title") or os.path.splitext(fn)[0]
+            if rel.startswith(("people/", "self/")):
+                for m in bday_rx.finditer(text):
+                    raw_d = m.group(1)
+                    if "." in raw_d:
+                        dd, mm, yyyy = raw_d.split(".")
+                        iso = f"{int(yyyy):04d}-{int(mm):02d}-{int(dd):02d}"
+                    else:
+                        iso = raw_d
+                    entry = f"- [ ] {iso} [birthday] {title}"
+                    if iso.lower() not in existing_cal and not any(iso in d for d in existing_due):
+                        harvest_timeline.append(entry)
+                        existing_cal += "\n" + entry.lower()
+            for line in text.splitlines():
+                tm = task_rx.match(line)
+                if not tm:
+                    continue
+                task_text = tm.group(1).strip()
+                if len(task_text) < 4 or task_text.startswith("("):
+                    continue
+                if task_text.lower() in existing_cal:
+                    continue
+                dm = re.match(r"^(\d{4}-\d{2}-\d{2})\b\s*[-:–—]?\s*(.+)$", task_text)
+                if dm:
+                    entry = f"- [ ] {dm.group(1)} [todo] {dm.group(2).strip()} ({rel})"
+                    harvest_timeline.append(entry)
+                else:
+                    entry = f"- [ ] [med] {task_text} ({rel})"
+                    harvest_todos.append(entry)
+                existing_cal += "\n" + task_text.lower()
+    if execute and (harvest_timeline or harvest_todos):
+        cur = read(cal_readme)
+        if harvest_timeline:
+            if "## Timeline" in cur:
+                cur = cur.replace("## Timeline", "## Timeline\n\n" + "\n".join(harvest_timeline), 1)
+            else:
+                cur = cur.rstrip() + "\n\n## Timeline\n\n" + "\n".join(harvest_timeline) + "\n"
+        if harvest_todos:
+            if "## Open To-Dos" in cur:
+                cur = cur.replace("## Open To-Dos", "## Open To-Dos\n\n" + "\n".join(harvest_todos), 1)
+            else:
+                cur = cur.rstrip() + "\n\n## Open To-Dos\n\n" + "\n".join(harvest_todos) + "\n"
+        write(cal_readme, cur)
+    due_count = sum(len(e.get("due", [])) for e in idx.values())
+    say(f"calendar init ({'applied' if execute else 'dry-run'}): "
+        f"calendar/README.md {'created' if created_cal else 'exists'}, "
+        f"INDEX.md {'linked' if linked_index else 'ok'}, "
+        f"{due_count} decentralized due: item(s), "
+        f"{len(harvest_timeline)} timeline item(s) and {len(harvest_todos)} open to-do(s) harvested from brain.")
+
+
+def cmd_calendar(args):
+    root, brain = paths(args)
+    hk = hook_module(brain)
+    if args.init:
+        _calendar_init(root, brain, hk, args.execute)
+        return
+    today = dt.date.today()
+    if args.sync_ics:
+        src = args.ics_source or hk.settings().get("calendar_ics", "").strip()
+        if not src:
+            sys.exit("No .ics source: pass --ics-source <url_or_path> or set `calendar_ics:` in brain/settings.md.")
+        if re.match(r"^https?://", src):
+            import urllib.request
+            with urllib.request.urlopen(src, timeout=15) as resp:
+                ics_text = resp.read().decode("utf-8", errors="replace")
+        else:
+            ics_text = read(os.path.expanduser(src))
+        lines = _parse_ics_text(ics_text, today)
+        cal_readme = os.path.join(brain, "calendar", "README.md")
+        cur = read(cal_readme) if os.path.isfile(cal_readme) else ""
+        added = [ln for ln in lines if ln.lower() not in cur.lower()]
+        say(f"sync-ics: {len(lines)} upcoming event(s) in feed, {len(added)} new.")
+        for ln in added[:25]:
+            say(f"  {ln}")
+        if args.execute and added and os.path.isfile(cal_readme):
+            if "## Timeline" in cur:
+                cur = cur.replace("## Timeline", "## Timeline\n\n" + "\n".join(added), 1)
+            else:
+                cur = cur.rstrip() + "\n\n## Timeline\n\n" + "\n".join(added) + "\n"
+            write(cal_readme, cur)
+            say("Applied to brain/calendar/README.md.")
+        return
+    idx = hk.load_index()
+    if getattr(args, "for_role", None) == "coach":
+        all_items = hk.calendar_items(idx, days=365, past_days=14, include_done=True)
+        goals = [i for i in all_items if i["kind"] == "goal" and i["delta"] >= 0 and i["status"] == "open"]
+        blocked = [i for i in all_items if 0 <= i["delta"] <= 28 and i["status"] == "open"
+                   and (i["kind"] == "blocked" or (i["kind"] == "event" and i["delta"] <= 7 and i["time"]))]
+        workouts = [i for i in all_items if -14 <= i["delta"] <= 14 and i["kind"] == "workout"]
+        say("=== GOALS & RACES (next 365 d) ===")
+        for g in goals:
+            k = f"goal:{g['subkind']}" if g["subkind"] else "goal"
+            say(f"  {g['start'].isoformat()} (in {g['delta']} d / {g['delta'] / 7:.1f} w) [{k}] {g['what']}")
+        if not goals:
+            say("  (none)")
+        say("=== BLOCKED & BUSY WINDOWS (next 28 d) ===")
+        for b in blocked:
+            span = b["start"].isoformat() if b["start"] == b["end"] else f"{b['start'].isoformat()}..{b['end'].isoformat()}"
+            t = f" {b['time']}" if b["time"] else ""
+            say(f"  {span}{t} [{b['kind']}] {b['what']}")
+        if not blocked:
+            say("  (none)")
+        say("=== WORKOUTS (last 14 d .. next 14 d) ===")
+        box_map = {"open": "[ ]", "done": "[x]", "skipped": "[-]"}
+        for w in workouts:
+            k = f"workout:{w['subkind']}" if w["subkind"] else "workout"
+            say(f"  {box_map.get(w['status'], '[ ]')} {w['start'].isoformat()} [{k}] {w['what']}")
+        if not workouts:
+            say("  (none)")
+        return
+    horizon = 10 ** 6 if args.all else args.days
+    items = hk.calendar_items(idx, days=horizon, past_days=365 if args.include_done else 3650,
+                              include_done=args.include_done)
+    box_map = {"open": "[ ]", "done": "[x]", "skipped": "[-]"}
+    shown = 0
+    for it in items:
+        if not args.include_done and it["delta"] < 0 and it["kind"] not in ("todo", "deadline"):
+            continue
+        span = it["start"].isoformat() if it["start"] == it["end"] else f"{it['start'].isoformat()}..{it['end'].isoformat()}"
+        tag = f"overdue {-it['delta']} d" if it["delta"] < 0 else ("today" if it["delta"] == 0 else f"in {it['delta']} d")
+        k = f"{it['kind']}:{it['subkind']}" if it["subkind"] else it["kind"]
+        t = f"{it['time']} " if it["time"] else ""
+        say(f"{box_map.get(it['status'], '[ ]')} {span}  ({tag})  {t}[{k}] {it['what']}  [{it['rel']}]")
+        shown += 1
+    todos = hk.open_todos(include_done=args.include_done)
+    if todos:
+        say("Open To-Dos (undated):")
+        for td in todos:
+            say(f"  {box_map.get(td['status'], '[ ]')} [{td['prio']}] {td['what']}  [{td['rel']}]")
+    if shown == 0 and not todos:
+        say("calendar: no upcoming items or open to-dos")
+    if args.ics:
+        _write_ics(args.ics, _deadlines(brain, None if args.all else args.days))
 
 
 # ================================================================= inventory
@@ -2138,6 +2371,17 @@ def main():
     p.add_argument("--all", action="store_true")
     p.add_argument("--ics")
 
+    p = sub.add_parser("calendar")
+    p.add_argument("--days", type=int, default=30)
+    p.add_argument("--all", action="store_true")
+    p.add_argument("--include-done", action="store_true")
+    p.add_argument("--for", dest="for_role", choices=("coach",), help="filtered view for a specific role (e.g. coach)")
+    p.add_argument("--init", action="store_true", help="harvest existing dates, birthdays and open to-dos into calendar/README.md")
+    p.add_argument("--ics", help="export calendar timeline to an .ics file")
+    p.add_argument("--sync-ics", action="store_true", help="merge upcoming events from settings.md calendar_ics or --ics-source")
+    p.add_argument("--ics-source", help="URL or file path of an .ics feed")
+    p.add_argument("--execute", action="store_true")
+
     p = sub.add_parser("inventory")
     p.add_argument("--out", required=True)
     p.add_argument("--scan", help="folder to map (default: the home directory)")
@@ -2176,8 +2420,8 @@ def main():
     handlers = {"init": cmd_init, "routes": cmd_routes, "projects": cmd_projects, "index": cmd_index, "probe": cmd_probe,
                 "find": cmd_find, "mark": cmd_mark, "adopt": cmd_adopt, "code-sync": cmd_code_sync,
                 "core-accept": cmd_core_accept, "dev-check": cmd_dev_check, "dev-setup": cmd_dev_setup,
-                "check": cmd_check, "deadlines": cmd_deadlines, "inventory": cmd_inventory, "move": cmd_move,
-                "verify": cmd_verify, "undo": cmd_undo, "core-diff": cmd_core_diff, "state": cmd_state}
+                "check": cmd_check, "deadlines": cmd_deadlines, "calendar": cmd_calendar, "inventory": cmd_inventory,
+                "move": cmd_move, "verify": cmd_verify, "undo": cmd_undo, "core-diff": cmd_core_diff, "state": cmd_state}
     if args.cmd == "init" and not args.root:
         args.root = r"C:\Atlas" if os.name == "nt" else os.path.join("~", "Atlas")
     if args.cmd in ("wire", "unwire"):
@@ -2185,8 +2429,6 @@ def main():
     elif args.cmd == "core-apply":
         if args.rollback:
             cmd_core_rollback(args)
-        elif not args.source:
-            sys.exit("core-apply needs --source (or --rollback ID)")
         else:
             cmd_core_diff(args, apply=True)
     else:

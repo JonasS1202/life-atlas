@@ -8,8 +8,8 @@ counterpart.)
 
 ## 1. Open with the Gap Radar (3–5 bullet overview)
 
-Before asking your first question, scan `self/README.md`, `areas/`, `projects/`, `people/`, `atlas.py check`, and
-`atlas.py deadlines`. Check the core life pillars for missing or incomplete facts:
+Before asking your first question, scan `self/README.md`, `calendar/README.md`, `areas/`, `projects/`, `people/`,
+`atlas.py check`, and `atlas.py calendar`. Check the core life pillars for missing or incomplete facts:
 - **Finances & cashflow:** Income, fixed costs, savings/investments, budget structure, tax basics.
 - **Contracts & insurances:** Health, liability (Haftpflicht), disability (BU), car/home insurance, electricity,
   internet, mobile, subscriptions — specifically monthly/yearly costs, notice periods, and renewal dates (`due:`).

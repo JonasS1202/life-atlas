@@ -30,6 +30,7 @@ when an area or rule appears or moves, this page changes in the same turn. Write
 | Folder | Content | Entry |
 |---|---|---|
 | `self/` | Who the user is: profile, values, goals, patterns | `self/README.md` |
+| `calendar/` | Central calendar timeline (events, blocked dates, goals, workouts, birthdays) & open to-dos | `calendar/README.md` |
 | `settings.md` | How Atlas behaves: briefing, questions, rhythms, style (the user changes it in plain words) | – |
 | `tags.md` | Tag vocabulary with synonyms | – |
 | `glossary.md` | Terms, abbreviations, nicknames | – |
@@ -59,7 +60,8 @@ when an area or rule appears or moves, this page changes in the same turn. Write
 | A reusable script | `howto/scripts/` plus a line in its `README.md` |
 | A conversation, event, decision, finding with a date | `journal/<year>/<YYYY-MM-DD>_<topic>.md` |
 | A term, abbreviation, nickname | `glossary.md` |
-| A date that matters (notice period, renewal, appointment) | `due:` in the frontmatter of the page it belongs to |
+| A date that matters (notice period, renewal, appointment) | `due:` in the frontmatter of the page it belongs to, or `calendar/README.md` |
+| An appointment, blocked period (vacation/trip), race/macro goal, planned workout, or open to-do | `calendar/README.md` (`## Timeline` if dated, `## Open To-Dos` if undated) |
 | A password, PIN, API key the user gave | `_secrets/<topic>.env`; the page notes where |
 | A loose thought that fits nowhere yet | the closest area page; if several pile up, a new area |
 

@@ -371,6 +371,49 @@ class Dev(AtlasCase):
         self.assertIn("project 'Atlas Dev'", out)
 
 
+class Calendar(AtlasCase):
+    def test_calendar_todos_coach_and_init(self):
+        import datetime as dt
+        today = dt.date.today()
+        d_trip_s = (today + dt.timedelta(days=2)).isoformat()
+        d_trip_e = (today + dt.timedelta(days=4)).isoformat()
+        d_race = (today + dt.timedelta(days=60)).isoformat()
+        d_wo = (today + dt.timedelta(days=1)).isoformat()
+        d_bday = f"1995-{today.month:02d}-{today.day:02d}"
+        with open(os.path.join(self.brain, "people", "max.md"), "w", encoding="utf-8") as fh:
+            fh.write(f"---\nsummary: Bruder Max\ntags: [person]\n---\n# Max\n\nGeburtstag: {d_bday}\n")
+        os.makedirs(os.path.join(self.brain, "areas", "finanzen"), exist_ok=True)
+        with open(os.path.join(self.brain, "areas", "finanzen", "steuern.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nsummary: Steuern\ntags: [contract]\n---\n# Steuern\n\n- [ ] Steuerbelege 2025 sortieren\n")
+        res_init = self.atlas("calendar", "--init", "--execute").stdout
+        self.assertIn("harvested from brain", res_init)
+        cal_path = os.path.join(self.brain, "calendar", "README.md")
+        cal_text = self.read(cal_path)
+        self.assertIn("[birthday] Max", cal_text)
+        self.assertIn("Steuerbelege 2025 sortieren", cal_text)
+        cal_text = cal_text.replace(
+            "## Timeline",
+            "## Timeline\n\n"
+            f"- [ ] {d_trip_s}..{d_trip_e} [blocked] Dienstreise München\n"
+            f"- [ ] {d_race} [goal:A] Eschborn-Frankfurt (Sub 2:35h)\n"
+            f"- [ ] {d_wo} [workout:cycling] 90m SweetSpot (2x20m)\n",
+            1,
+        )
+        with open(cal_path, "w", encoding="utf-8") as fh:
+            fh.write(cal_text)
+        out_all = self.atlas("calendar", "--days", "90").stdout
+        self.assertIn("Dienstreise München", out_all)
+        self.assertIn("Eschborn-Frankfurt", out_all)
+        self.assertIn("Steuerbelege 2025 sortieren", out_all)
+        self.assertIn("Max", out_all)
+        out_coach = self.atlas("calendar", "--for", "coach").stdout
+        self.assertIn("Eschborn-Frankfurt", out_coach)
+        self.assertIn("Dienstreise München", out_coach)
+        self.assertIn("90m SweetSpot", out_coach)
+        self.assertNotIn("Steuerbelege 2025 sortieren", out_coach)
+        self.assertNotIn("Max", out_coach)
+
+
 if __name__ == "__main__":
     os.makedirs(BASE_DIR, exist_ok=True)
     prog = unittest.main(argv=[sys.argv[0], "-v", *sys.argv[1:]], exit=False)

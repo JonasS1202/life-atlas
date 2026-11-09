@@ -12,7 +12,8 @@ Goal: everything in `inbox/` (or in a folder the user names) ends up where it be
 2. Decide its place with `INDEX.md` → *Where things go*:
    - **Knowledge** (a fact, a contract's key data, a letter's content): write or update the page in its area, person
      or project, with `summary:` and `tags:` (from `tags.md`). Add `due:` items for every date that matters (notice
-     periods, payment dates, appointments).
+     periods, payment dates) and file appointments, trips/blocked dates, goals, workouts or open action items in
+     `brain/calendar/README.md`.
    - **The document itself** (PDF, scan, photo): it is evidence. Keep it next to its page:
      `areas/<area>/files/<YYYY-MM-DD>_<short-name>.<ext>` and link it from the page. Large media collections do not
      belong in Atlas; leave a pointer instead and ask the user where they want them.

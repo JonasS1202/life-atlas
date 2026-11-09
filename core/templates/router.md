@@ -33,7 +33,8 @@ If a project name is ambiguous, ask which one.
   the project page. Corrections and "from now on" wishes are always kept. Details: `brain/_atlas/procedures/learn.md`.
 - After a unit of work that changed or learned something, one line: `Atlas: <what changed where>` (or
   `Atlas: nothing new`); it also becomes the daily log. Not needed after every small coding step.
-- Dates that matter: `due: - YYYY-MM-DD what` in the page's frontmatter.
+- Dates, events, workouts, blocked days & to-dos: `brain/calendar/README.md` (or `due: - YYYY-MM-DD what` in a page's
+  frontmatter; `atlas.py calendar` merges both).
 - The user decides what is stored. Credentials only into `brain/_secrets/` (the page notes where). Never store what they
   say not to; record that wish in `brain/howto/`. If something seems unusual, ask once.
 - Antigravity's `/learn`: put its rules into `brain/howto/` and its skills into `brain/skills/`, never into `GEMINI.md`,

@@ -1,0 +1,13 @@
+{
+  "dirs": ["calendar"],
+  "skeleton_add": ["calendar/README.md"],
+  "settings_add": {
+    "calendar_ics": "          # optional: private .ics URL or path (Google/Apple Calendar) merged by atlas.py calendar"
+  },
+  "tags_add": [
+    ["calendar", "Calendar timeline, events, blocked dates, workouts, goals and to-dos", "kalender, todo, aufgabe, event, workout"]
+  ],
+  "notes": [
+    "Run `python -I <ROOT>/brain/_atlas/tools/atlas.py calendar --init --execute` (or `python3`) to harvest existing birthdays, dates and open to-dos from the brain into `brain/calendar/README.md` and link `calendar/README.md` in `brain/INDEX.md`, then tell the user what was imported."
+  ]
+}

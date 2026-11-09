@@ -34,7 +34,7 @@ STATE = os.path.join(BRAIN, "_atlas", "state.json")
 CACHE = os.path.join(BRAIN, "_atlas", "cache", "index.json")
 SKIP_DIRS = {".git", "_secrets", "_archive", "_atlas", "node_modules", "__pycache__", ".obsidian", ".trash"}
 TEXT_EXTS = {".md", ".txt"}
-CANONICAL = ("areas/", "projects/", "people/", "howto/", "self/", "glossary.md", "INDEX.md")
+CANONICAL = ("areas/", "projects/", "people/", "howto/", "self/", "calendar/", "glossary.md", "INDEX.md")
 MAX_HINTS = 5
 MAX_ROUTES = 3
 INDEX_BUDGET_S = 2.5   # hooks parse at most this long per call; `atlas.py index` builds the full cache
@@ -47,11 +47,15 @@ NAG_MINUTES = 15
 LEARN_SUGGEST_TURNS = 20
 MAINT_CHANGES = 50
 DEFAULTS = {"briefing": "daily", "questions": "per-briefing", "maintenance_days": "7", "reminder": "signals",
-            "deadline_days": "30", "daily_log": "on", "inbox_cloud": "", "evening_hour": "18"}
+            "deadline_days": "30", "daily_log": "on", "inbox_cloud": "", "calendar_ics": "", "evening_hour": "18"}
 MARKER = re.compile(r"(?mi)^[\s>*_`-]*atlas\s*\**\s*:")
 MARKER_LINE = re.compile(r"(?mi)^[\s>*_`-]*atlas\s*\**\s*:\s*(.+?)\s*$")
 AUTOMATED = re.compile(r"<task-notification>|\[SYSTEM NOTIFICATION|Subagent hand-back|<side-sessions-event>")
-DATE_ITEM = re.compile(r"^\s*(?:-\s*)?(\[[ xX]\]\s*)?(\d{4}-\d{2}-\d{2})\b\s*[-:–—]?\s*(.*)$")
+DATE_ITEM = re.compile(r"^\s*(?:-\s*)?(\[[ xX-]\]\s*)?(?:yearly\s+|--)?(\d{4}-\d{2}-\d{2}|\d{2}-\d{2})"
+                       r"(?:\.\.(\d{4}-\d{2}-\d{2}))?\b\s*[-:–—]?\s*(.*)$", re.I)
+TIME_PREFIX = re.compile(r"^(\d{1,2}:\d{2}(?:-\d{1,2}:\d{2})?)\s+(.*)$")
+KIND_PREFIX = re.compile(r"^\[([a-zA-Z]+)(?::([a-zA-Z0-9_-]+))?\]\s*(.*)$")
+TODO_ITEM = re.compile(r"^\s*-\s*\[([ xX-])\]\s*(?:\[(high|med|low)\]\s*)?(.+)$", re.I)
 TOKEN_ID = re.compile(r"\b(?=[A-Za-z0-9./-]*\d)[A-Za-z0-9][A-Za-z0-9./-]{3,}[A-Za-z0-9]\b")
 NAME_STOP = {"test", "tests", "app", "apps", "demo", "tmp", "temp", "notes", "misc", "code", "project", "projekt",
              "projects", "projekte", "readme", "main", "src", "docs", "data", "web", "api", "tool", "tools"}
@@ -243,7 +247,7 @@ def _priority(rel):
     """Parse order on a cold cache: routing registry first, then definitions, then the rest."""
     if rel.startswith("projects/") or rel in ("glossary.md", "tags.md", "settings.md"):
         return 0
-    return 1 if rel.startswith(("people/", "self/")) else 2
+    return 1 if rel.startswith(("people/", "self/", "calendar/")) else 2
 
 
 def load_index(budget=None):
@@ -311,24 +315,160 @@ def emit_continue(agent, reason):
     sys.stdout.write(json.dumps({"decision": decision, "reason": reason}))
 
 
-# ---------------------------------------------------------------- session
+# ---------------------------------------------------------------- session & calendar
+
+def _next_yearly(month, day, today):
+    for y in (today.year, today.year + 1):
+        try:
+            d = dt.date(y, month, day)
+        except ValueError:
+            d = dt.date(y, 2, 28)
+        if d >= today:
+            return d
+    return dt.date(today.year + 1, month, day)
+
+
+def _parse_cal_line(raw, rel, today, default_kind="deadline"):
+    m = DATE_ITEM.match(raw)
+    if not m:
+        return None
+    box = (m.group(1) or "").strip().lower()
+    status = "done" if box == "[x]" else ("skipped" if box == "[-]" else "open")
+    d1_str, d2_str, rest = m.group(2), m.group(3), m.group(4).strip()
+    tm = TIME_PREFIX.match(rest)
+    t_str = ""
+    if tm:
+        t_str, rest = tm.group(1), tm.group(2).strip()
+    km = KIND_PREFIX.match(rest)
+    kind, subkind = default_kind, ""
+    if km:
+        kind = km.group(1).lower()
+        subkind = (km.group(2) or "").strip()
+        rest = km.group(3).strip()
+    elif re.search(r"\b(geburtstag|birthday)\b", rest, re.I):
+        kind = "birthday"
+    yearly = bool(re.match(r"^\s*(?:-\s*)?(?:\[[ xX-]\]\s*)?(?:yearly\s+|--)", raw, re.I)) or len(d1_str) == 5 or kind == "birthday"
+    try:
+        if len(d1_str) == 5:
+            mm, dd = map(int, d1_str.split("-"))
+            start = end = _next_yearly(mm, dd, today)
+        else:
+            start = dt.date.fromisoformat(d1_str)
+            if yearly and not d2_str:
+                birth_year = start.year
+                start = end = _next_yearly(start.month, start.day, today)
+                if birth_year < start.year and f"{start.year - birth_year}" not in rest:
+                    rest = f"{rest} ({start.year - birth_year})"
+            else:
+                end = dt.date.fromisoformat(d2_str) if d2_str else start
+    except ValueError:
+        return None
+    if end < start:
+        end = start
+    delta = 0 if start <= today <= end else ((start - today).days if start > today else (end - today).days)
+    return {"start": start, "end": end, "delta": delta, "status": status, "time": t_str,
+            "kind": kind, "subkind": subkind, "what": rest, "rel": rel}
+
+
+def calendar_items(idx, days=30, past_days=3650, include_done=False):
+    today = dt.date.today()
+    items, seen = [], set()
+    # 1. Central calendar files in brain/calendar/
+    cal_dir = os.path.join(BRAIN, "calendar")
+    if os.path.isdir(cal_dir):
+        for fn in sorted(os.listdir(cal_dir)):
+            if not fn.lower().endswith(".md"):
+                continue
+            rel = f"calendar/{fn}"
+            try:
+                with open(os.path.join(cal_dir, fn), encoding="utf-8", errors="replace") as fh:
+                    lines = fh.read().splitlines()
+            except OSError:
+                continue
+            in_fm = False
+            for i, line in enumerate(lines):
+                if i == 0 and line.strip() == "---":
+                    in_fm = True
+                    continue
+                if in_fm:
+                    if line.strip() in ("---", "..."):
+                        in_fm = False
+                    continue
+                item = _parse_cal_line(line, rel, today, default_kind="event")
+                if not item:
+                    continue
+                if not include_done and item["status"] != "open":
+                    continue
+                if -past_days <= item["delta"] <= days:
+                    key = (item["start"], item["end"], item["what"].lower())
+                    if key not in seen:
+                        seen.add(key)
+                        items.append(item)
+    # 2. Decentralized `due:` frontmatter items across all brain pages
+    for rel, e in idx.items():
+        for raw in e.get("due", []):
+            item = _parse_cal_line(raw, rel, today, default_kind="deadline")
+            if not item:
+                continue
+            if not include_done and item["status"] != "open":
+                continue
+            if -past_days <= item["delta"] <= days:
+                key = (item["start"], item["end"], item["what"].lower())
+                if key not in seen:
+                    seen.add(key)
+                    items.append(item)
+    return sorted(items, key=lambda x: (x["delta"], x["start"], x["time"], x["what"]))
+
+
+def open_todos(include_done=False):
+    cal_readme = os.path.join(BRAIN, "calendar", "README.md")
+    if not os.path.isfile(cal_readme):
+        return []
+    try:
+        with open(cal_readme, encoding="utf-8", errors="replace") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return []
+    out, in_todos = [], False
+    prio_rank = {"high": 0, "med": 1, "low": 2}
+    for line in lines:
+        if line.startswith("## "):
+            in_todos = "to-do" in line.lower() or "todo" in line.lower() or "aufgaben" in line.lower()
+            continue
+        if DATE_ITEM.match(line):
+            continue
+        m = TODO_ITEM.match(line)
+        if not m:
+            continue
+        if not in_todos and not m.group(2):
+            continue
+        box = m.group(1).lower()
+        status = "done" if box == "x" else ("skipped" if box == "-" else "open")
+        if not include_done and status != "open":
+            continue
+        prio = (m.group(2) or "med").lower()
+        out.append({"status": status, "prio": prio, "what": m.group(3).strip(), "rel": "calendar/README.md",
+                    "_r": prio_rank.get(prio, 1)})
+    return sorted(out, key=lambda x: (x["_r"], x["what"]))
+
 
 def deadlines(idx, days=30):
     today = dt.date.today()
-    items = []
-    for rel, e in idx.items():
-        for raw in e.get("due", []):
-            m = DATE_ITEM.match(raw)
-            if not m or (m.group(1) or "").strip().lower() == "[x]":
-                continue
-            try:
-                when = dt.date.fromisoformat(m.group(2))
-            except ValueError:
-                continue
-            delta = (when - today).days
-            if delta <= days:
-                items.append((when, delta, m.group(3).strip(), rel))
-    return sorted(items)
+    out = []
+    for it in calendar_items(idx, days=days, past_days=3650, include_done=False):
+        if it["delta"] < 0 and it["kind"] not in ("todo", "deadline"):
+            continue
+        when = today if it["start"] <= today <= it["end"] else it["start"]
+        prefix = ""
+        if it["rel"].startswith("calendar/") and it["kind"] != "deadline":
+            k = f"{it['kind']}:{it['subkind']}" if it["subkind"] else it["kind"]
+            prefix = f"[{k}] "
+        if it["time"]:
+            prefix = f"{it['time']} {prefix}"
+        if it["start"] != it["end"]:
+            prefix = f"({it['start'].isoformat()}..{it['end'].isoformat()}) {prefix}"
+        out.append((when, it["delta"], (prefix + it["what"]).strip(), it["rel"]))
+    return sorted(out)
 
 
 def last_mark(kind):
@@ -429,7 +569,11 @@ def session_text(cwd, session):
             for when, delta, what, rel in due[:8]:
                 tag = f"OVERDUE {-delta} d" if delta < 0 else ("today" if delta == 0 else f"in {delta} d")
                 items.append(f"- {when.isoformat()} ({tag}): {what or '(no note)'}  [{_show(rel, cwd)}]")
-            parts.append("Deadlines:\n" + "\n".join(items))
+            parts.append("Calendar & deadlines:\n" + "\n".join(items))
+        todos = open_todos(include_done=False)
+        if todos:
+            top = [f"[{t['prio']}] {t['what']}" for t in todos[:5]]
+            parts.append(f"Open to-dos ({len(todos)} in brain/calendar/README.md): " + "; ".join(top))
         inbox = os.path.join(BRAIN, "inbox")
         waiting = [f for f in os.listdir(inbox) if not f.startswith(".") and f.lower() != "readme.md"] \
             if os.path.isdir(inbox) else []
