@@ -638,10 +638,13 @@ def _ensure_calendar_server(cache_dir, start_server=False):
     except OSError:
         pass
     for cand in range(8765, 8795):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            if s.connect_ex(("127.0.0.1", cand)) != 0:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(("127.0.0.1", cand))
                 port = cand
                 break
+        except OSError:
+            continue
     try:
         with open(port_file, "w", encoding="utf-8") as fh:
             fh.write(str(port))

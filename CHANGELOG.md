@@ -2,6 +2,11 @@
 
 Written for users: `/atlas-update` shows the sections between the installed and the new version.
 
+## [0.6.4] - 2026-11-09
+
+- **Reliable Local Port Binding in Linux & Container Environments (`s.bind`):**
+  Fixed candidate port scanning in `_ensure_calendar_server`. Replaced blocking `s.connect_ex` without timeout with `s.bind`, avoiding TCP SYN timeouts and hanging processes when scanning unmapped ports in container, sandbox or Linux loopback environments without RST.
+
 ## [0.6.3] - 2026-11-09
 
 - **Persistent Calendar Server on Windows (`Win32_Process.Create`):** Fixed `ERR_CONNECTION_REFUSED` on
