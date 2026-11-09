@@ -2,6 +2,17 @@
 
 Written for users: `/atlas-update` shows the sections between the installed and the new version.
 
+## [0.6.2] - 2026-11-09
+
+- **Rendered Browser View (`http://127.0.0.1:<port>/calendar.html`) & `/atlas-calendar` Skill:**
+  - Fixed IDE `file://` interception: Antigravity and VS Code open `file://` chat links as raw HTML source code in the
+    editor (`</> calendar.html`). Atlas now serves `_atlas/cache/calendar.html` via a lightweight local `http.server` on
+    `http://127.0.0.1:8765/calendar.html` so clicking `[📅 Atlas Kalender öffnen](http://127.0.0.1:8765/calendar.html)`
+    or running `atlas.py calendar --open` always opens the **rendered visual dashboard** in the browser.
+  - Added dedicated `/atlas-calendar` skill (`skills/atlas-calendar/SKILL.md` + `procedures/calendar.md`) and router rule
+    enforcing **Atlas First**: saying *"Öffne meinen Kalender"* always opens the native Atlas calendar and never redirects
+    to Google Calendar (`calendar.google.com`) or Apple Calendar.
+
 ## [0.6.1] - 2026-11-09
 
 - **Zero-Token Visual Calendar & Coach Dashboard (`_atlas/cache/calendar.html` + `atlas.py calendar --open`):**

@@ -7,7 +7,8 @@ cloud inbox from settings), `atlas.py check` for maintenance/update/backup lines
 Give the user **3 to 6 short lines**, most urgent first:
 1. Overdue and due-today items (events, workouts, blocked days, to-dos, deadlines), then the next dates within the
    horizon, plus top `[high]` open to-dos from `brain/calendar/README.md`. Always include the clickable visual calendar
-   link `[📅 Kalender öffnen](file:///.../brain/_atlas/cache/calendar.html)` printed by the hook or `atlas.py calendar`.
+   link `[📅 Atlas Kalender öffnen](http://127.0.0.1:.../calendar.html)` printed by the hook or `atlas.py calendar`
+   (never use a `file://` link).
 2. Inbox: how many items wait; offer `/atlas-sort`.
 3. One line each only if due: maintenance (do it after their first request), update check, backup, items outside Atlas
    (Antigravity `/learn`) to adopt.

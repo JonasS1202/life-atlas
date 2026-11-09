@@ -1189,15 +1189,20 @@ def _calendar_init(root, brain, hk, execute):
 
 
 def _open_visual_calendar(hk, idx, open_now=False):
-    cal_uri = hk.render_calendar_html(idx)
-    say(f"Visual calendar: [📅 Kalender öffnen]({cal_uri})")
+    cal_url = hk.render_calendar_html(idx, start_server=True)
+    say(f"Visual calendar: [📅 Atlas Kalender öffnen]({cal_url})")
     if open_now:
         try:
-            import webbrowser
-            webbrowser.open(cal_uri)
+            if os.name == "nt":
+                os.startfile(cal_url)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", cal_url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                import webbrowser
+                webbrowser.open(cal_url)
         except Exception:
             pass
-    return cal_uri
+    return cal_url
 
 
 def cmd_calendar(args):

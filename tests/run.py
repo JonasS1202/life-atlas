@@ -18,6 +18,7 @@ import unittest
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC_TOOL = os.path.join(REPO, "core", "tools", "atlas.py")
 BASE_DIR = os.path.join(os.path.expanduser("~"), ".atlas-tests")
+os.environ["ATLAS_NO_CAL_SERVER"] = "1"
 
 
 def fwd(p):
@@ -412,7 +413,7 @@ class Calendar(AtlasCase):
         self.assertIn("90m SweetSpot", out_coach)
         self.assertNotIn("Steuerbelege 2025 sortieren", out_coach)
         self.assertNotIn("Max", out_coach)
-        self.assertIn("Visual calendar: [📅 Kalender öffnen](file://", out_all)
+        self.assertIn("Visual calendar: [📅 Atlas Kalender öffnen](http://127.0.0.1:", out_all)
         html_path = os.path.join(self.brain, "_atlas", "cache", "calendar.html")
         self.assertTrue(os.path.isfile(html_path))
         self.assertIn("Eschborn-Frankfurt", self.read(html_path))

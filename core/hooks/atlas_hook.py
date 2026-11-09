@@ -619,9 +619,47 @@ render();
 """
 
 
-def render_calendar_html(idx=None):
-    """Generate brain/_atlas/cache/calendar.html (0 LLM tokens) and return its file:// URI."""
-    import pathlib
+def _ensure_calendar_server(cache_dir, start_server=False):
+    """Ensure a local HTTP server serves cache_dir so http://127.0.0.1:<port>/calendar.html opens rendered in browsers
+    instead of as raw HTML source code in IDE editors (which intercept file:// links)."""
+    import socket
+    port_file = os.path.join(cache_dir, "cal_port.txt")
+    port = 8765
+    try:
+        with open(port_file, encoding="utf-8") as fh:
+            port = int(fh.read().strip())
+    except (OSError, ValueError):
+        pass
+    if not start_server or PROBE or os.environ.get("ATLAS_NO_CAL_SERVER"):
+        return f"http://127.0.0.1:{port}/calendar.html"
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+            return f"http://127.0.0.1:{port}/calendar.html"
+    except OSError:
+        pass
+    for cand in range(8765, 8795):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            if s.connect_ex(("127.0.0.1", cand)) != 0:
+                port = cand
+                break
+    try:
+        with open(port_file, "w", encoding="utf-8") as fh:
+            fh.write(str(port))
+        kw = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL,
+              "close_fds": True}
+        if os.name == "nt":
+            kw["creationflags"] = 0x08000000 | 0x00000200  # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+        else:
+            kw["start_new_session"] = True
+        subprocess.Popen([sys.executable, "-I", "-m", "http.server", str(port), "--bind", "127.0.0.1",
+                          "--directory", cache_dir], **kw)
+    except Exception:
+        pass
+    return f"http://127.0.0.1:{port}/calendar.html"
+
+
+def render_calendar_html(idx=None, start_server=False):
+    """Generate brain/_atlas/cache/calendar.html (0 LLM tokens) and return its rendered http://127.0.0.1 URL."""
     if idx is None:
         idx = load_index(budget=INDEX_BUDGET_S)
     raw_items = calendar_items(idx, days=365, past_days=90, include_done=True)
@@ -630,13 +668,14 @@ def render_calendar_html(idx=None):
              for t in open_todos(include_done=False)]
     payload = {"today": dt.date.today().isoformat(), "items": serial, "todos": todos}
     html = CAL_TEMPLATE.replace("__DATA_JSON__", json.dumps(payload, ensure_ascii=False))
-    os.makedirs(os.path.dirname(CAL_HTML), exist_ok=True)
+    cache_dir = os.path.dirname(CAL_HTML)
+    os.makedirs(cache_dir, exist_ok=True)
     try:
         with open(CAL_HTML, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(html)
     except OSError:
         pass
-    return pathlib.Path(os.path.abspath(CAL_HTML)).as_uri()
+    return _ensure_calendar_server(cache_dir, start_server=start_server)
 
 
 def last_mark(kind):

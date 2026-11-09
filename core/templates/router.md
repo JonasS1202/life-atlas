@@ -34,8 +34,9 @@ If a project name is ambiguous, ask which one.
 - After a unit of work that changed or learned something, one line: `Atlas: <what changed where>` (or
   `Atlas: nothing new`); it also becomes the daily log. Not needed after every small coding step.
 - Dates, events, workouts, blocked days & to-dos: `brain/calendar/README.md` (or `due: - YYYY-MM-DD what` in a page's
-  frontmatter; `atlas.py calendar` merges both and renders `[📅 Kalender öffnen](file:///.../brain/_atlas/cache/calendar.html)`
-  — include that link or run `atlas.py calendar --open` whenever showing or updating the calendar).
+  frontmatter). **Atlas First:** "my calendar" (`öffne meinen Kalender`) is ALWAYS the native Atlas calendar via
+  `/atlas-calendar` (`atlas.py calendar --open` → `http://127.0.0.1:8765/calendar.html`), NEVER Google/Apple Calendar
+  web URLs and NEVER `file://` HTML links.
 - The user decides what is stored. Credentials only into `brain/_secrets/` (the page notes where). Never store what they
   say not to; record that wish in `brain/howto/`. If something seems unusual, ask once.
 - Antigravity's `/learn`: put its rules into `brain/howto/` and its skills into `brain/skills/`, never into `GEMINI.md`,
@@ -48,8 +49,8 @@ If a project name is ambiguous, ask which one.
 - Files outside Atlas move only by written plan with the user's go (`brain/_atlas/procedures/move.md`). Never delete.
   Never open credential stores (browser passwords, keychains, private keys) on your own.
 - Write content in {{LANGUAGE}}; core folder names stay English.
-- Skills: `/atlas-brief` · `/atlas-sort` · `/atlas-learn` · `/atlas-interview` · `/atlas-deep` · `/atlas-maintain` ·
-  `/atlas-check` · `/atlas-update` · `/atlas-adopt-repo`. Tool: `python -I brain/_atlas/tools/atlas.py`.
+- Skills: `/atlas-brief` · `/atlas-calendar` · `/atlas-sort` · `/atlas-learn` · `/atlas-interview` · `/atlas-deep` ·
+  `/atlas-maintain` · `/atlas-check` · `/atlas-update` · `/atlas-adopt-repo`. Tool: `python -I brain/_atlas/tools/atlas.py`.
 
 <!-- atlas:core:end -->
 
