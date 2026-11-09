@@ -2,6 +2,13 @@
 
 Written for users: `/atlas-update` shows the sections between the installed and the new version.
 
+## [0.6.3] - 2026-11-09
+
+- **Persistent Calendar Server on Windows (`Win32_Process.Create`):** Fixed `ERR_CONNECTION_REFUSED` on
+  `http://127.0.0.1:8765/calendar.html` in Antigravity on Windows, where the IDE's command runner kills child processes
+  in its Job Object as soon as `atlas.py` exits. The local calendar server now spawns outside the Job Object via WMI and
+  verifies the socket is listening before opening the right-hand browser pane.
+
 ## [0.6.2] - 2026-11-09
 
 - **Rendered Browser View (`http://127.0.0.1:<port>/calendar.html`) & `/atlas-calendar` Skill:**

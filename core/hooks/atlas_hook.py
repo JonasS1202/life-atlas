@@ -645,14 +645,33 @@ def _ensure_calendar_server(cache_dir, start_server=False):
     try:
         with open(port_file, "w", encoding="utf-8") as fh:
             fh.write(str(port))
-        kw = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL,
-              "close_fds": True}
+        py_exe = sys.executable
         if os.name == "nt":
-            kw["creationflags"] = 0x08000000 | 0x00000200  # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+            pyw = os.path.join(os.path.dirname(py_exe), "pythonw.exe")
+            if os.path.isfile(pyw):
+                py_exe = pyw
+        server_cmd = [py_exe, "-I", "-m", "http.server", str(port), "--bind", "127.0.0.1",
+                      "--directory", cache_dir]
+        if os.name == "nt":
+            # Antigravity/VS Code run_command on Windows uses a Job Object with KILL_ON_JOB_CLOSE that kills normal
+            # child processes when atlas.py exits. Spawning via WMI Win32_Process.Create launches outside the Job Object.
+            cmdline = subprocess.list2cmdline(server_cmd).replace("'", "''")
+            wdir = cache_dir.replace("'", "''")
+            ps = (f"$si = New-CimInstance -ClientOnly -ClassName Win32_ProcessStartup -Property @{{ShowWindow=[uint16]0}}; "
+                  f"Invoke-CimMethod -ClassName Win32_Process -MethodName Create "
+                  f"-Arguments @{{CommandLine='{cmdline}'; CurrentDirectory='{wdir}'; ProcessStartupInformation=$si}} | Out-Null")
+            subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", ps],
+                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=5, creationflags=0x08000000)
         else:
-            kw["start_new_session"] = True
-        subprocess.Popen([sys.executable, "-I", "-m", "http.server", str(port), "--bind", "127.0.0.1",
-                          "--directory", cache_dir], **kw)
+            subprocess.Popen(server_cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, close_fds=True, start_new_session=True)
+        for _ in range(15):
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                    break
+            except OSError:
+                time.sleep(0.1)
     except Exception:
         pass
     return f"http://127.0.0.1:{port}/calendar.html"
