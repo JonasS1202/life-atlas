@@ -96,6 +96,7 @@ to file what was learned (always after a learning signal, otherwise throttled).
 | `/atlas-brief` | what is due, in 3–6 lines |
 | `/atlas-calendar` | open and manage the native Atlas-First visual calendar and to-do hub |
 | `/atlas-coach` | (coach module) Cycling, Running & Strength coach: macro periodization, 14d workouts, `.zwo` export, Strava sync |
+| `/atlas-mail` | multi-account IMAP mail client & organizer: read-only inbox/search/audit + safety-gated `move` (`target_folder`), `trash`, `flags` & `labels` |
 | `/atlas-sort` | file the inbox (and the cloud inbox), or bring a messy folder into Atlas |
 | `/atlas-learn` | review this chat: file facts, propose rules and skills |
 | `/atlas-interview` | structured fact-check & gap radar (finances, contracts, insurances, dates, projects) |
@@ -105,7 +106,7 @@ to file what was learned (always after a learning signal, otherwise throttled).
 | `/atlas-update` | agent changes, core updates, self-healing |
 | `/atlas-adopt-repo` | (developer module) bring a repository under Atlas |
 
-The engine: `python -I brain/_atlas/tools/atlas.py <init|wire|unwire|routes|projects|index|find|probe|check|deadlines|calendar|coach|inventory|move|verify|undo|mark|adopt|code-sync|core-diff|core-apply|state>`.
+The engine: `python -I brain/_atlas/tools/atlas.py <init|wire|unwire|routes|projects|index|find|probe|check|deadlines|calendar|coach|mail|inventory|move|verify|undo|mark|adopt|code-sync|core-diff|core-apply|state>`.
 
 ## Updates and development
 

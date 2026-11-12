@@ -21,6 +21,8 @@ Commands
   probe       run the registered hooks with sample input and check their output
   check       verify the charter: sizes, links, reachability, duplicates, secrets, Git, backup, hooks, registry
   deadlines   list `due:` items; `--ics FILE` writes a calendar file
+  mail        multi-account IMAP mail engine (`accounts`, `folders`, `list`, `read`, `search`, `audit`, plus
+              safety-gated `move` to `target_folder`, `copy`, `trash`, `delete`, `flags`, `labels`, `mkdir`)
   inventory   read-only map of the computer (names, sizes, types, markers; never file contents or credential stores)
   move        execute a move/copy plan with checksums, journal and undo; `verify` and `undo` work on the journal
   core-diff   three-way comparison of this core with a life-atlas checkout (what updates, what stays, conflicts)
@@ -534,6 +536,11 @@ def _skill_changes(brain, target_dir, remove):
                 out.append((os.path.join(target_dir, name), None, f"remove skill {name}"))
             continue
         text = render(read(os.path.join(folder, "SKILL.md")), values)
+        grown_md = os.path.join(brain, "skills", name, "SKILL.md")
+        if os.path.isfile(grown_md) and os.path.normcase(os.path.abspath(os.path.join(folder, "SKILL.md"))) != os.path.normcase(os.path.abspath(grown_md)):
+            note = f"\nAlso read `{fwd(grown_md)}` for user-specific accounts, rules, and context mappings.\n"
+            if fwd(grown_md) not in text:
+                text = text.rstrip("\n") + "\n" + note
         if not os.path.exists(dst) or read(dst) != text:
             out.append((dst, text, f"skill {name}"))
         for extra in os.listdir(folder):  # supporting files of grown skills
@@ -3597,6 +3604,19 @@ def cmd_state(args):
     say(json.dumps(get_state(brain), indent=2, ensure_ascii=False))
 
 
+def cmd_mail(args, extra_argv=None):
+    """Delegate `atlas.py mail ...` to `atlas_mail.py` in the same tools directory."""
+    root, _brain = paths(args)
+    mail_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "atlas_mail.py")
+    if not os.path.isfile(mail_script):
+        sys.exit(f"Missing mail engine: {mail_script}")
+    mail_args = list(extra_argv or [])
+    if "--root" not in mail_args and "-h" not in mail_args and "--help" not in mail_args:
+        mail_args = ["--root", root] + mail_args
+    res = subprocess.run([sys.executable, "-I", mail_script] + mail_args)
+    sys.exit(res.returncode)
+
+
 # ================================================================= main
 
 def main():
@@ -3605,6 +3625,20 @@ def main():
             stream.reconfigure(encoding="utf-8", errors="replace")  # agents read this output; avoid code-page mojibake
         except (AttributeError, ValueError):
             pass
+    # Intercept `atlas.py [--root ROOT] mail ...` before top-level `-h` or flag parsing swallows mail flags
+    argv = sys.argv[1:]
+    if "mail" in argv:
+        idx = argv.index("mail")
+        pre = argv[:idx]
+        if all(x in ("--root",) or not x.startswith("-") or pre[max(0, i - 1)] == "--root" for i, x in enumerate(pre)):
+            root_val = None
+            for i, tok in enumerate(pre):
+                if tok == "--root" and i + 1 < len(pre):
+                    root_val = pre[i + 1]
+                elif tok.startswith("--root="):
+                    root_val = tok.split("=", 1)[1]
+            ns = argparse.Namespace(root=root_val)
+            cmd_mail(ns, argv[idx + 1:])
     ap = argparse.ArgumentParser(prog="atlas.py", description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     ap.add_argument("--root", help="the Atlas folder (default: the one this tool is installed in, or $ATLAS_ROOT)")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -3728,6 +3762,8 @@ def main():
 
     p = sub.add_parser("state")
     p.add_argument("--set", nargs="*", help="key=value (value 'now' = current time)")
+
+    sub.add_parser("mail", help="multi-account IMAP client & safety-gated organizer (delegates to atlas_mail.py)")
 
     args = ap.parse_args()
     handlers = {"init": cmd_init, "routes": cmd_routes, "projects": cmd_projects, "index": cmd_index, "probe": cmd_probe,

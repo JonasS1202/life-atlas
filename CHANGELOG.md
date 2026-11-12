@@ -2,6 +2,17 @@
 
 Written for users: `/atlas-update` shows the sections between the installed and the new version.
 
+## [0.8.0] - 2026-11-11
+
+- **Native Multi-Account IMAP Mail Engine (`/atlas-mail`, `atlas_mail.py`, `atlas.py mail`):**
+  - **Zero-Dependency Multi-Account IMAP Client (`core/tools/atlas_mail.py`):** Built on Python's standard library (`imaplib`) with credentials stored strictly in git-ignored `brain/_secrets/mail.env` (`chmod 600`). Supports `atlas.py mail init` for 1-step template creation across Gmail / Google Workspace, iCloud, Microsoft 365 / Outlook, Posteo, Mailbox.org, Fastmail, GMX, Web.de, T-Online, Strato, IONOS, and custom IMAP servers.
+  - **Read-Only First Inspection & Auditing (`readonly=True` + `BODY.PEEK[]`):** `accounts`, `folders`, `list`, `read`, `search`, and deduplicated multi-folder `audit` strictly open mailboxes in read-only mode and fetch via `BODY.PEEK[]`, ensuring unread states (`\Seen`) are never mutated when Atlas scans or extracts attachments (`--save-attachments`).
+  - **3-Stage Safety-Gated Write & Organization Tools (`MOVE`, `COPY`, `TRASH`, `DELETE`, `FLAGS`, `LABELS`, `MKDIR`):**
+    - **`move` & `copy` (`target_folder`):** Moves or copies messages by UID into any `target_folder` (with automatic RFC 3501 §5.1.3 Modified UTF-7 encoding/decoding and `--create-folder` support) using atomic **RFC 6851 `UID MOVE`** when supported by the server, or safe fallback (`COPY` + `STORE (\Deleted)` + **RFC 4315 `UID EXPUNGE`**).
+    - **`trash` (Soft-Delete) vs. `delete --hard`:** Automatically detects the account's Trash folder via **RFC 6154 `\Trash`** special-use flags (or localized names like `[Gmail]/Papierkorb`, `[Gmail]/Trash`, `Trash`, `Papierkorb`, `Deleted Items`) for recoverable soft-deletion.
+    - **`flags` & `labels`:** Inspects (read-only) or modifies **RFC 3501 IMAP `FLAGS`** (`--read`, `--unread`, `--star`, `--unstar`, `--answered`, `--add-flags`, `--remove-flags`, `--set-flags`) and **Gmail `X-GM-LABELS`** (`X-GM-EXT-1` / `--use-keywords`).
+    - **Multi-Stage Safety Gate:** Enforces per-account `MAIL_<ID>_ALLOW_WRITE` guards, mandatory read-only Pre-Flight Previews of affected UIDs (Subject, From, Date, current `FLAGS`/`LABELS`, and `target_folder`), `--dry-run` mode, and blocks non-interactive write execution (`CONFIRMATION_REQUIRED`) unless explicitly confirmed by the user (`--yes`).
+
 ## [0.7.2] - 2026-11-10
 
 - **Zero-Friction 1-Click Strava Connect (`/strava-connect` & Shared App `91804`):**

@@ -19,5 +19,6 @@ search hook maps them to the tag, and `atlas.py check --fix` replaces them on pa
 | **deadline** | Something with a date that matters | frist, termin |
 | **calendar** | Calendar timeline, events, blocked dates, workouts, goals and to-dos | kalender, todo, aufgabe, event, workout |
 | **sport** | Sport, endurance training, coaching, workouts, physiology | training, laufen, running, triathlon, athletik |
+| **mail** | Emails, postboxes, IMAP accounts, correspondence | email, e-mail, postfach |
 | **project** | An undertaking with an end, a code repository | projekt, repo |
 | **preference** | How the user wants things done | vorliebe, wunsch |

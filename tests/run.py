@@ -622,6 +622,228 @@ class Coach(AtlasCase):
         self.assertNotIn("skill descriptions total", chk, chk)
 
 
+class Mail(AtlasCase):
+    def test_mail_imap_readonly_and_safety_gated_write_tools(self):
+        import socketserver
+        import threading
+
+        state = {
+            "examine_count": 0,
+            "select_rw_count": 0,
+            "folders": {
+                "INBOX": {
+                    "flags": r"\HasNoChildren",
+                    "messages": {
+                        "101": {
+                            "flags": [],
+                            "labels": ["Inbox"],
+                            "raw": (
+                                b"From: Finanzamt <finanzamt@example.de>\r\n"
+                                b"To: test@example.com\r\n"
+                                b"Subject: Steuerbescheid 2026\r\n"
+                                b"Date: Wed, 11 Nov 2026 10:00:00 +0100\r\n"
+                                b"Message-ID: <msg-101@example.de>\r\n"
+                                b"Content-Type: text/plain; charset=utf-8\r\n\r\n"
+                                b"Bitte pruefen Sie Ihren Steuerbescheid.\r\n"
+                            ),
+                        },
+                        "102": {
+                            "flags": [r"\Seen"],
+                            "labels": [],
+                            "raw": (
+                                b"From: Newsletter <news@example.com>\r\n"
+                                b"To: test@example.com\r\n"
+                                b"Subject: Weekly Digest\r\n"
+                                b"Date: Wed, 11 Nov 2026 11:00:00 +0100\r\n"
+                                b"Message-ID: <msg-102@example.com>\r\n"
+                                b"Content-Type: text/plain; charset=utf-8\r\n\r\n"
+                                b"Unsubscribe anytime.\r\n"
+                            ),
+                        },
+                    },
+                },
+                "Papierkorb": {"flags": r"\Trash \HasNoChildren", "messages": {}},
+                "Entw&APw-rfe": {"flags": r"\Drafts \HasNoChildren", "messages": {}},
+            },
+        }
+
+        class MockIMAPHandler(socketserver.StreamRequestHandler):
+            def send_line(self, line: str) -> None:
+                self.wfile.write((line + "\r\n").encode("utf-8"))
+                self.wfile.flush()
+
+            def handle(self) -> None:
+                cur_folder = "INBOX"
+                self.send_line("* OK [CAPABILITY IMAP4rev1 MOVE UIDPLUS X-GM-EXT-1] MockIMAP Ready")
+                while True:
+                    raw_line = self.rfile.readline()
+                    if not raw_line:
+                        break
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line:
+                        continue
+                    parts = line.split(" ", 2)
+                    tag = parts[0]
+                    cmd = parts[1].upper() if len(parts) > 1 else ""
+                    rest = parts[2] if len(parts) > 2 else ""
+
+                    if cmd == "CAPABILITY":
+                        self.send_line("* CAPABILITY IMAP4rev1 MOVE UIDPLUS X-GM-EXT-1")
+                        self.send_line(f"{tag} OK CAPABILITY completed")
+                    elif cmd == "LOGIN":
+                        self.send_line(f"{tag} OK LOGIN completed")
+                    elif cmd == "LIST":
+                        for fname, fdata in state["folders"].items():
+                            self.send_line(f'* LIST ({fdata["flags"]}) "/" "{fname}"')
+                        self.send_line(f"{tag} OK LIST completed")
+                    elif cmd in ("EXAMINE", "SELECT"):
+                        fname = rest.strip().strip('"')
+                        if fname not in state["folders"]:
+                            self.send_line(f"{tag} NO No such mailbox")
+                            continue
+                        cur_folder = fname
+                        if cmd == "EXAMINE":
+                            state["examine_count"] += 1
+                        else:
+                            state["select_rw_count"] += 1
+                        cnt = len(state["folders"][cur_folder]["messages"])
+                        self.send_line(f"* {cnt} EXISTS")
+                        rw = "READ-ONLY" if cmd == "EXAMINE" else "READ-WRITE"
+                        self.send_line(f"{tag} OK [{rw}] {cmd} completed")
+                    elif cmd == "CREATE":
+                        fname = rest.strip().strip('"')
+                        state["folders"].setdefault(fname, {"flags": r"\HasNoChildren", "messages": {}})
+                        self.send_line(f"{tag} OK CREATE completed")
+                    elif cmd == "UID":
+                        sub_parts = rest.split(" ", 2)
+                        sub_cmd = sub_parts[0].upper()
+                        sub_rest = sub_parts[1] if len(sub_parts) == 2 else (sub_parts[1] + " " + sub_parts[2] if len(sub_parts) > 2 else "")
+                        msgs = state["folders"][cur_folder]["messages"]
+                        if sub_cmd == "SEARCH":
+                            uids = [
+                                u for u, m in sorted(msgs.items())
+                                if ("UNSEEN" not in sub_rest.upper() or r"\Seen" not in m["flags"])
+                            ]
+                            self.send_line("* SEARCH " + " ".join(uids) if uids else "* SEARCH")
+                            self.send_line(f"{tag} OK UID SEARCH completed")
+                        elif sub_cmd == "FETCH":
+                            uid, _spec = sub_rest.split(" ", 1)
+                            if uid not in msgs:
+                                self.send_line(f"{tag} OK UID FETCH empty")
+                                continue
+                            m = msgs[uid]
+                            f_str = " ".join(m["flags"])
+                            l_str = " ".join(f'"{x}"' for x in m["labels"])
+                            payload = m["raw"]
+                            header_resp = f"* 1 FETCH (UID {uid} FLAGS ({f_str}) X-GM-LABELS ({l_str}) BODY[] {{{len(payload)}}}"
+                            self.wfile.write((header_resp + "\r\n").encode("utf-8"))
+                            self.wfile.write(payload)
+                            self.wfile.write(b")\r\n")
+                            self.wfile.flush()
+                            self.send_line(f"{tag} OK UID FETCH completed")
+                        elif sub_cmd == "MOVE":
+                            uid_set, tgt_raw = sub_rest.split(" ", 1)
+                            tgt = tgt_raw.strip().strip('"')
+                            if tgt not in state["folders"]:
+                                self.send_line(f"{tag} NO Target mailbox does not exist")
+                                continue
+                            for u in uid_set.split(","):
+                                if u in msgs:
+                                    state["folders"][tgt]["messages"][u] = msgs.pop(u)
+                            self.send_line(f"{tag} OK UID MOVE completed")
+                        elif sub_cmd == "STORE":
+                            st_parts = sub_rest.split(" ", 2)
+                            uid_set, op, val_raw = st_parts[0], st_parts[1].upper(), st_parts[2].strip()
+                            inner = val_raw.strip("()").replace('"', "").split()
+                            for u in uid_set.split(","):
+                                if u not in msgs:
+                                    continue
+                                if "X-GM-LABELS" in op:
+                                    if op.startswith("+"):
+                                        for item in inner:
+                                            if item not in msgs[u]["labels"]:
+                                                msgs[u]["labels"].append(item)
+                                    elif op.startswith("-"):
+                                        msgs[u]["labels"] = [x for x in msgs[u]["labels"] if x not in inner]
+                                    else:
+                                        msgs[u]["labels"] = list(inner)
+                                else:
+                                    if op.startswith("+"):
+                                        for item in inner:
+                                            if item not in msgs[u]["flags"]:
+                                                msgs[u]["flags"].append(item)
+                                    elif op.startswith("-"):
+                                        msgs[u]["flags"] = [x for x in msgs[u]["flags"] if x not in inner]
+                                    else:
+                                        msgs[u]["flags"] = list(inner)
+                            self.send_line(f"{tag} OK UID STORE completed")
+                    elif cmd == "LOGOUT":
+                        self.send_line("* BYE MockIMAP logging out")
+                        self.send_line(f"{tag} OK LOGOUT completed")
+                        break
+                    else:
+                        self.send_line(f"{tag} OK {cmd} completed")
+
+        srv = socketserver.ThreadingTCPServer(("127.0.0.1", 0), MockIMAPHandler)
+        srv.daemon_threads = True
+        port = srv.server_address[1]
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            # 1. Test `atlas.py mail init`
+            init_out = self.atlas("mail", "init", "-a", "WORK", "--label", "Work Account", "--host", "127.0.0.1",
+                                  "--port", str(port), "--user", "test@example.com", "--password", "secret123").stdout
+            self.assertIn("MAIL_WORK_*", init_out)
+            env_file = os.path.join(self.brain, "_secrets", "mail.env")
+            with open(env_file, "a", encoding="utf-8") as fh:
+                fh.write('MAIL_WORK_SSL="false"\n')
+
+            # 2. Test Read-Only `accounts`, `folders` (UTF-7 decoding), `list`, `read`, `search`
+            acc_out = self.atlas("mail", "accounts").stdout
+            self.assertIn("Status: OK | INBOX: 2 | IMAP: MOVE,UIDPLUS,X-GM-EXT-1", acc_out)
+            fld_out = self.atlas("mail", "folders", "-a", "work").stdout
+            self.assertIn("Entwürfe", fld_out)
+            self.assertIn("Papierkorb", fld_out)
+
+            lst_out = self.atlas("mail", "list", "-a", "work", "--unread").stdout
+            self.assertIn("UID 101 [UNSEEN]", lst_out)
+            self.assertIn("Steuerbescheid 2026", lst_out)
+            # Ensure read-only commands NEVER opened a folder in read-write mode (SELECT)
+            self.assertEqual(state["select_rw_count"], 0)
+            self.assertGreater(state["examine_count"], 0)
+
+            # 3. Test Safety Gate: calling `move` without `--yes` in non-interactive mode MUST block with exit code 2
+            res_blocked = self.atlas("mail", "move", "101", "-t", "Steuern & Belege", "-a", "work", "--create-folder", check=False)
+            self.assertEqual(res_blocked.returncode, 2)
+            self.assertIn("SAFETY GATE", res_blocked.stderr)
+            self.assertEqual(state["select_rw_count"], 0)
+            self.assertIn("101", state["folders"]["INBOX"]["messages"])
+
+            # 4. Test `--dry-run` exits 0 and shows preview without mutating mailbox
+            res_dry = self.atlas("mail", "trash", "102", "-a", "work", "--dry-run")
+            self.assertIn("[DRY-RUN]", res_dry.stdout)
+            self.assertEqual(state["select_rw_count"], 0)
+
+            # 5. Test approved write operations with `--yes`: FLAGS, LABELS, MOVE to target_folder, TRASH
+            self.atlas("mail", "flags", "101", "-a", "work", "--read", "--star", "--yes")
+            self.assertIn(r"\Seen", state["folders"]["INBOX"]["messages"]["101"]["flags"])
+            self.assertIn(r"\Flagged", state["folders"]["INBOX"]["messages"]["101"]["flags"])
+
+            self.atlas("mail", "labels", "101", "-a", "work", "--add", "Finanzamt", "--yes")
+            self.assertIn("Finanzamt", state["folders"]["INBOX"]["messages"]["101"]["labels"])
+
+            self.atlas("mail", "move", "101", "-t", "Steuern & Belege", "-a", "work", "--create-folder", "--yes")
+            self.assertNotIn("101", state["folders"]["INBOX"]["messages"])
+            self.assertIn("101", state["folders"]["Steuern &- Belege"]["messages"])
+
+            self.atlas("mail", "trash", "102", "-a", "work", "--yes")
+            self.assertNotIn("102", state["folders"]["INBOX"]["messages"])
+            self.assertIn("102", state["folders"]["Papierkorb"]["messages"])
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+
 if __name__ == "__main__":
     os.makedirs(BASE_DIR, exist_ok=True)
     prog = unittest.main(argv=[sys.argv[0], "-v", *sys.argv[1:]], exit=False)
