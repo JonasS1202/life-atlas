@@ -27,12 +27,23 @@ import re
 import subprocess
 import sys
 import time
+import traceback
+
+sys.dont_write_bytecode = True
+
+_TOOLS_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools"))
+if _TOOLS_DIR not in sys.path:
+    sys.path.insert(0, _TOOLS_DIR)
+from atlas_lib import cal_engine, coach_engine, graph_engine
 
 BRAIN = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 PROBE = bool(os.environ.get("ATLAS_PROBE"))  # set by `atlas.py probe`: run, but change nothing
 STATE = os.path.join(BRAIN, "_atlas", "state.json")
-CACHE = os.path.join(BRAIN, "_atlas", "cache", "index.json")
+CACHE = os.path.join(BRAIN, "_atlas", "cache", "index.sqlite")
 CAL_HTML = os.path.join(BRAIN, "_atlas", "cache", "calendar.html")
+ERR_LOG = os.path.join(BRAIN, "_atlas", "cache", "hook_errors.log")
+CONFLICTS_FILE = os.path.join(BRAIN, "_atlas", "conflicts.json")
+MAX_ERR_LOG_BYTES = 50_000
 SKIP_DIRS = {".git", "_secrets", "_archive", "_atlas", "node_modules", "__pycache__", ".obsidian", ".trash"}
 TEXT_EXTS = {".md", ".txt"}
 CANONICAL = ("areas/", "projects/", "people/", "howto/", "self/", "calendar/", "coach/", "glossary.md", "INDEX.md")
@@ -109,6 +120,59 @@ def _age_days(iso):
         return (_now() - then).total_seconds() / 86400
     except ValueError:
         return None
+
+
+def _log_hook_error(where, exc):
+    """Append a bounded diagnostic entry to `_atlas/cache/hook_errors.log` (strictly <= MAX_ERR_LOG_BYTES, fail-open)."""
+    try:
+        os.makedirs(os.path.dirname(ERR_LOG), exist_ok=True)
+        stamp = _now_iso()
+        err_msg = str(exc).splitlines()[0].strip() if str(exc) else ""
+        header = f"[{stamp}] {where}: {type(exc).__name__}" + (f": {err_msg}" if err_msg else "")
+        tb_lines = [ln.rstrip() for ln in traceback.format_exception(type(exc), exc, exc.__traceback__)[-4:]]
+        entry = (header[:400] + "\n  " + "\n  ".join(tb_lines)[:1200]).rstrip() + "\n"
+        entry_b = entry.encode("utf-8", errors="replace")[:MAX_ERR_LOG_BYTES]
+        old_b = b""
+        if os.path.isfile(ERR_LOG):
+            try:
+                with open(ERR_LOG, "rb") as fh:
+                    old_b = fh.read()
+            except OSError:
+                old_b = b""
+        combined = old_b + entry_b
+        if len(combined) > MAX_ERR_LOG_BYTES:
+            tail = combined[-MAX_ERR_LOG_BYTES:]
+            nl = tail.find(b"\n[")
+            if nl >= 0:
+                combined = tail[nl + 1:]
+            else:
+                nl2 = tail.find(b"\n")
+                combined = tail[nl2 + 1:] if nl2 >= 0 and nl2 + 1 < len(tail) else tail
+        with open(ERR_LOG, "wb") as fh:
+            fh.write(combined[:MAX_ERR_LOG_BYTES])
+    except Exception:
+        pass
+
+
+def _recent_hook_error(st):
+    """Return `(iso, summary)` when a fresh hook error (< 24h) newer than `last_error_notified` exists."""
+    if not os.path.isfile(ERR_LOG):
+        return None
+    try:
+        with open(ERR_LOG, encoding="utf-8", errors="replace") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return None
+    notified = str((st or {}).get("last_error_notified") or "")
+    for line in reversed(lines):
+        m = re.match(r"^\[([^\]]+)\]\s+(.+)$", line)
+        if m:
+            iso, summ = m.group(1).strip(), m.group(2).strip()
+            age = _age_days(iso)
+            if age is not None and age < 1.0 and iso > notified:
+                return iso, summ[:200]
+            return None
+    return None
 
 
 def _root():
@@ -252,48 +316,12 @@ def _priority(rel):
 
 
 def load_index(budget=None):
-    """Cached metadata of every page. Only new or changed files are parsed. With `budget` (seconds) parsing stops in
-    time and the partial cache is saved; the next call continues (a huge import never makes the hook time out)."""
-    start = time.monotonic()
-    try:
-        with open(CACHE, encoding="utf-8") as fh:
-            cached = json.load(fh)
-        old = cached.get("files", {}) if cached.get("version") == 2 else {}
-    except (OSError, ValueError):
-        old = {}
-    files, todo = {}, []
-    for dp, dns, fns in os.walk(BRAIN):
-        dns[:] = sorted(d for d in dns if d not in SKIP_DIRS and not d.startswith("."))
-        for fn in fns:
-            if os.path.splitext(fn)[1].lower() not in TEXT_EXTS:
-                continue
-            full = os.path.join(dp, fn)
-            rel = os.path.relpath(full, BRAIN).replace("\\", "/")
-            try:
-                st = os.stat(full)
-            except OSError:
-                continue
-            sig = [int(st.st_mtime), st.st_size]
-            prev = old.get(rel)
-            if prev and prev.get("sig") == sig:
-                files[rel] = prev
-            else:
-                todo.append((_priority(rel), rel, full, sig))
-    changed = len(files) != len(old)
-    for _p, rel, full, sig in sorted(todo):
-        if budget is not None and time.monotonic() - start > budget:
-            break
-        entry = _parse(full, rel)
-        if entry is not None:
-            entry["sig"] = sig
-            files[rel] = entry
-            changed = True
-    if changed:
-        try:
-            _save_json(CACHE, {"version": 2, "files": files})
-        except OSError:
-            pass
-    return files
+    """Cached metadata & graph of every page in SQLite (`_atlas/cache/index.sqlite`).
+
+    Only new or changed files are parsed. With `budget` (seconds) parsing stops in time and the partial cache is saved;
+    the next call continues. Corrupt or schema-outdated databases self-heal automatically.
+    """
+    return graph_engine.sync_index(BRAIN, budget=budget, db_path=CACHE)
 
 
 # ---------------------------------------------------------------- output per agent
@@ -336,7 +364,7 @@ _KIND_ALIASES = {
 }
 _CAL_STOP = {"und", "oder", "fuer", "für", "der", "die", "das", "mit", "bei", "von", "auf", "des", "dem", "den",
              "ein", "eine", "monat", "monats", "jahr", "tag", "tage", "ab", "bis", "inkl", "bzw", "sowie", "pro",
-             "jonas", "lisa", "uhr", "euro", "soll", "eingang"}
+             "uhr", "euro", "soll", "eingang"}
 
 
 def _cal_tokens(text):
@@ -442,6 +470,7 @@ def calendar_items(idx, days=30, past_days=3650, include_done=False):
             except OSError:
                 continue
             in_fm = False
+            in_fence = False
             for i, line in enumerate(lines):
                 if i == 0 and line.strip() == "---":
                     in_fm = True
@@ -450,9 +479,16 @@ def calendar_items(idx, days=30, past_days=3650, include_done=False):
                     if line.strip() in ("---", "..."):
                         in_fm = False
                     continue
+                if re.match(r"^\s*(`{3,}|~{3,})", line):
+                    in_fence = not in_fence
+                    continue
+                if in_fence:
+                    continue
                 item = _parse_cal_line(line, rel, today, default_kind="event")
                 if not item:
                     continue
+                item["line"] = i + 1
+                item["can_toggle"] = bool(re.match(r"^\s*(?:[-*+]|\d+\.)?\s*\[[ xX-]\]\s+", line))
                 if not include_done and item["status"] != "open":
                     continue
                 if -past_days <= item["delta"] <= days and not _is_dup_cal_item(item, items):
@@ -467,6 +503,8 @@ def calendar_items(idx, days=30, past_days=3650, include_done=False):
             item = _parse_cal_line(raw, rel, today, default_kind="deadline")
             if not item:
                 continue
+            item["line"] = 0
+            item["can_toggle"] = False
             if not include_done and item["status"] != "open":
                 continue
             if -past_days <= item["delta"] <= days and not _is_dup_cal_item(item, items):
@@ -484,7 +522,7 @@ def open_todos(include_done=False):
     out = []
     prio_rank = {"high": 0, "med": 1, "low": 2}
 
-    def _add_todo(status, prio, what, rel):
+    def _add_todo(status, prio, what, rel, line_no=0, can_toggle=False):
         what_clean = _clean_md_inline(what)
         if len(what_clean) < 4:
             return
@@ -495,7 +533,15 @@ def open_todos(include_done=False):
             t_ex = _cal_tokens(ex["what"])
             if t_new and t_ex and len(t_new & t_ex) / max(min(len(t_new), len(t_ex)), 1) >= 0.6:
                 return
-        out.append({"status": status, "prio": prio, "what": what_clean, "rel": rel, "_r": prio_rank.get(prio, 1)})
+        out.append({
+            "status": status,
+            "prio": prio,
+            "what": what_clean,
+            "rel": rel,
+            "line": line_no,
+            "can_toggle": can_toggle,
+            "_r": prio_rank.get(prio, 1),
+        })
 
     cal_readme = os.path.join(BRAIN, "calendar", "README.md")
     if os.path.isfile(cal_readme):
@@ -505,7 +551,13 @@ def open_todos(include_done=False):
         except OSError:
             lines = []
         in_todos = False
-        for line in lines:
+        in_fence = False
+        for idx_ln, line in enumerate(lines, 1):
+            if re.match(r"^\s*(`{3,}|~{3,})", line):
+                in_fence = not in_fence
+                continue
+            if in_fence:
+                continue
             if line.startswith("## "):
                 in_todos = any(w in line.lower() for w in ("to-do", "todo", "aufgaben", "backlog"))
                 continue
@@ -521,7 +573,7 @@ def open_todos(include_done=False):
             if not include_done and status != "open":
                 continue
             prio = (m.group(2) or "med").lower()
-            _add_todo(status, prio, m.group(3).strip(), "calendar/README.md")
+            _add_todo(status, prio, m.group(3).strip(), "calendar/README.md", line_no=idx_ln, can_toggle=True)
 
     # Also harvest open tasks from checklist/todo pages in brain/ so nothing is missed
     for sub in ("areas", "projects", "self"):
@@ -542,7 +594,13 @@ def open_todos(include_done=False):
                 except OSError:
                     continue
                 in_open_sec = False
-                for line in lines:
+                in_fence = False
+                for idx_ln, line in enumerate(lines, 1):
+                    if re.match(r"^\s*(`{3,}|~{3,})", line):
+                        in_fence = not in_fence
+                        continue
+                    if in_fence:
+                        continue
                     if line.startswith("#"):
                         low_h = line.lower()
                         in_open_sec = any(w in low_h for w in ("offene punkte", "offene to-dos", "open to-dos",
@@ -561,7 +619,7 @@ def open_todos(include_done=False):
                         raw_w = tm.group(3).strip()
                         if raw_w.startswith("(") or len(raw_w) < 4:
                             continue
-                        _add_todo(status, (tm.group(2) or "med").lower(), raw_w, rel)
+                        _add_todo(status, (tm.group(2) or "med").lower(), raw_w, rel, line_no=idx_ln, can_toggle=True)
                         continue
                     if is_checklist_file and in_open_sec:
                         nm = re.match(r"^\d+\.\s+\*\*(.+?)\*\*(.*)$", line.strip())
@@ -570,7 +628,7 @@ def open_todos(include_done=False):
                             if re.search(r"\b(erledigt|abgeschlossen|done)\b", headline, re.I):
                                 continue
                             prio = "high" if re.search(r"\b(phase 5|nachziehen|nachtragen|frist)\b", headline, re.I) else "med"
-                            _add_todo("open", prio, headline, rel)
+                            _add_todo("open", prio, headline, rel, line_no=idx_ln, can_toggle=False)
     return sorted(out, key=lambda x: (x["_r"], x["what"]))
 
 
@@ -1063,12 +1121,13 @@ def _extract_coach_context(idx, cal_items=None):
     sport_tags = {"radsport", "sport", "cycling", "running", "gesundheit", "health", "training", "fitness"}
     cand_rels = []
     prof_full = os.path.join(BRAIN, "coach", "profile.md")
+    prof_txt_full = ""
     prof_customized = False
     if os.path.isfile(prof_full):
         try:
             with open(prof_full, encoding="utf-8", errors="replace") as fh:
-                ptxt = fh.read(4000)
-            prof_customized = not ("186 cm" in ptxt and "75.0 kg" in ptxt) and "— cm · — kg" not in ptxt
+                prof_txt_full = fh.read(HEAD_BYTES)
+            prof_customized = not coach_engine.is_untouched_skeleton_profile(prof_txt_full)
         except OSError:
             pass
     # Prioritize customized brain/coach/profile.md first so canonical coach thresholds take precedence
@@ -1135,7 +1194,55 @@ def _extract_coach_context(idx, cal_items=None):
 
     macro = parse_macro_plan(cal_items=cal_items)
     c_state = load_coach_state()
+    rdy_txt = ""
+    rdy_full = os.path.join(BRAIN, "coach", "readiness.md")
+    if os.path.isfile(rdy_full):
+        try:
+            with open(rdy_full, encoding="utf-8", errors="replace") as fh:
+                rdy_txt = fh.read(HEAD_BYTES)
+        except OSError:
+            pass
+    try:
+        tel = coach_engine.build_coach_telemetry(
+            profile_text=prof_txt_full,
+            activities=c_state["activities"],
+            readiness_text=rdy_txt,
+            cal_items=cal_items,
+            strava_connected=c_state["strava_connected"],
+            fallback_ftp=ftp_watts,
+        )
+        tel_compact = {k: v for k, v in tel.items() if k != "curves"}
+        raw_pc = c_state["power_curve"]
+        if isinstance(raw_pc, dict) and ("fresh" in raw_pc or "fatigued" in raw_pc):
+            p_curve = raw_pc
+        else:
+            fresh_fmt = {
+                dur: {ep: f"{w}W" for ep, w in (ep_map or {}).items() if w}
+                for dur, ep_map in (tel["curves"].get("fresh") or {}).items()
+                if any((ep_map or {}).values())
+            }
+            fatig_fmt = {
+                dur: {ep: f"{w}W" for ep, w in (ep_map or {}).items() if w}
+                for dur, ep_map in (tel["curves"].get("fatigued_1500kj") or {}).items()
+                if any((ep_map or {}).values())
+            }
+            p_curve = {"fresh": fresh_fmt, "fatigued": fatig_fmt} if (fresh_fmt or fatig_fmt) else {}
+        dur_tiers = tel["curves"].get("durability_tiers", {})
+        s_curve = c_state["pace_curve"] or {
+            d: {ep: pair[1] for ep, pair in ep_map.items()}
+            for d, ep_map in (tel["curves"].get("run_splits") or {}).items()
+            if ep_map
+        }
+        depth = tel["depth"]
+    except Exception:
+        tel_compact = {}
+        p_curve = c_state["power_curve"]
+        dur_tiers = {}
+        s_curve = c_state["pace_curve"]
+        depth = "standard"
+
     return {
+        "depth": depth,
         "metrics": metrics,
         "ftp_watts": ftp_watts,
         "macro_goals": macro_goals,
@@ -1143,9 +1250,11 @@ def _extract_coach_context(idx, cal_items=None):
         "macro": macro,
         "strava_connected": c_state["strava_connected"],
         "pending_feedback": c_state["pending_feedback"],
-        "power_curve": c_state["power_curve"],
-        "pace_curve": c_state["pace_curve"],
+        "power_curve": p_curve,
+        "durability_tiers": dur_tiers,
+        "pace_curve": s_curve,
         "activities_count": len(c_state["activities"]),
+        "telemetry": tel_compact,
     }
 
 
@@ -1168,1158 +1277,48 @@ def deadlines(idx, days=30):
     return sorted(out)
 
 
-CAL_TEMPLATE = """<!DOCTYPE html>
-<html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Atlas · Calendar & Coach Hub</title>
-<style>
-:root{
-  --bg:#070a0f;--surface:#0d121b;--surface-2:#121926;--surface-3:#182234;--border:rgba(255,255,255,0.075);
-  --border-hi:rgba(255,255,255,0.15);--text:#f1f5f9;--text-dim:#cbd5e1;--muted:#64748b;--muted-hi:#94a3b8;
-  --accent:#38bdf8;--accent-glow:rgba(56,189,248,0.16);
-  --workout:#10b981;--workout-bg:rgba(16,185,129,0.14);--workout-tx:#a7f3d0;
-  --plan:#0ea5e9;--plan-bg:rgba(14,165,233,0.14);--plan-tx:#bae6fd;
-  --goal:#f59e0b;--goal-bg:rgba(245,158,11,0.15);--goal-tx:#fde68a;
-  --blocked:#f43f5e;--blocked-bg:rgba(244,63,94,0.15);--blocked-tx:#fecdd3;
-  --event:#8b5cf6;--event-bg:rgba(139,92,246,0.15);--event-tx:#ddd6fe;
-  --deadline:#f97316;--deadline-bg:rgba(249,115,22,0.14);--deadline-tx:#fed7aa;
-  --todo:#38bdf8;--todo-bg:rgba(56,189,248,0.14);--todo-tx:#e0f2fe;
-  --bday:#ec4899;--bday-bg:rgba(236,72,153,0.15);--bday-tx:#fbcfe8;
-  --radius:12px;--radius-sm:8px
-}
-*{box-sizing:border-box;margin:0;padding:0}
-html,body{height:100%;background:var(--bg);color:var(--text);font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;font-size:14px;line-height:1.45;-webkit-font-smoothing:antialiased;font-variant-numeric:tabular-nums}
-body{background-image:radial-gradient(ellipse 80% 35% at 50% -10%,rgba(56,189,248,0.09),transparent);min-height:100vh}
-.shell{max-width:1760px;margin:0 auto;padding:16px 20px 32px;display:flex;flex-direction:column;gap:14px}
-@media(max-width:768px){.shell{padding:12px}}
-
-/* Topbar */
-.topbar{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:12px;padding:12px 16px;background:rgba(13,18,27,0.85);backdrop-filter:blur(12px);border:1px solid var(--border);border-radius:var(--radius);box-shadow:0 8px 30px rgba(0,0,0,0.35)}
-.brand{display:flex;align-items:center;gap:11px;min-width:0}
-.brand-icon{width:32px;height:32px;border-radius:9px;background:linear-gradient(135deg,#0284c7,#38bdf8);display:flex;align-items:center;justify-content:center;font-size:1rem;box-shadow:0 0 18px rgba(56,189,248,0.35);flex-shrink:0}
-.brand-title{font-size:1.05rem;font-weight:700;letter-spacing:-0.02em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.brand-sub{font-size:.72rem;color:var(--muted-hi);display:flex;align-items:center;gap:6px}
-.live-pill{display:inline-flex;align-items:center;gap:5px;font-size:.68rem;font-weight:600;color:#34d399;background:rgba(16,185,129,0.12);border:1px solid rgba(16,185,129,0.28);padding:2px 8px;border-radius:99px}
-.live-dot{width:6px;height:6px;border-radius:50%;background:#10b981;box-shadow:0 0 8px #10b981;animation:pulse 2.2s infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
-
-.toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
-.seg{display:inline-flex;background:var(--surface-2);padding:3px;border-radius:9px;border:1px solid var(--border);gap:2px}
-.seg button{background:transparent;color:var(--muted-hi);border:none;padding:5px 11px;border-radius:6px;cursor:pointer;font-size:.78rem;font-weight:600;display:inline-flex;align-items:center;gap:6px;transition:all .15s ease;white-space:nowrap}
-.seg button:hover{color:var(--text);background:rgba(255,255,255,0.04)}
-.seg button.active{background:var(--surface-3);color:#fff;box-shadow:0 1px 4px rgba(0,0,0,0.4),inset 0 0 0 1px rgba(56,189,248,0.35)}
-.cnt{font-size:.66rem;padding:1px 5px;border-radius:99px;background:rgba(255,255,255,0.07);color:var(--text-dim);font-weight:600}
-.seg button.active .cnt{background:rgba(56,189,248,0.22);color:var(--accent)}
-
-.search-wrap{position:relative;display:flex;align-items:center}
-.search-in{background:var(--surface-2);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:5px 10px 5px 26px;font-size:.78rem;width:155px;transition:all .15s ease;outline:none}
-.search-in:focus{border-color:var(--accent);width:200px;background:var(--surface-3)}
-.search-ico{position:absolute;left:8px;font-size:.72rem;color:var(--muted);pointer-events:none}
-
-.nav-grp{display:inline-flex;align-items:center;background:var(--surface-2);border:1px solid var(--border);border-radius:9px;padding:2px}
-.nav-btn{background:transparent;color:var(--text-dim);border:none;padding:5px 9px;border-radius:6px;cursor:pointer;font-size:.78rem;font-weight:600;transition:all .15s}
-.nav-btn:hover{background:var(--surface-3);color:#fff}
-.nav-label{min-width:138px;text-align:center;font-weight:700;font-size:.82rem;color:var(--text);padding:0 8px;cursor:pointer}
-
-/* Telemetry & KPI Strip */
-.kpi-strip{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}
-@media(max-width:960px){.kpi-strip{grid-template-columns:repeat(2,minmax(0,1fr))}}
-@media(max-width:520px){.kpi-strip{grid-template-columns:1fr}}
-.kpi{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:10px 13px;display:flex;flex-direction:column;gap:3px;min-width:0;position:relative;overflow:hidden}
-.kpi::before{content:"";position:absolute;top:0;left:0;right:0;height:2px;background:var(--kpi-color,var(--accent));opacity:.75}
-.kpi-lbl{font-size:.68rem;text-transform:uppercase;letter-spacing:.05em;color:var(--muted-hi);font-weight:600;display:flex;justify-content:space-between;align-items:center}
-.kpi-val{font-size:1.05rem;font-weight:700;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.kpi-sub{font-size:.72rem;color:var(--muted-hi);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-
-/* Athlete Telemetry Ribbon (Coach View) */
-.coach-ribbon{background:linear-gradient(180deg,rgba(16,185,129,0.08),rgba(13,18,27,0.9));border:1px solid rgba(16,185,129,0.25);border-radius:var(--radius);padding:11px 14px;display:none;flex-direction:column;gap:9px}
-.coach-ribbon.show{display:flex}
-.coach-hdr{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px}
-.coach-title{font-size:.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:#34d399;display:flex;align-items:center;gap:6px}
-.phys-chips{display:flex;flex-wrap:wrap;gap:7px}
-.phys-chip{background:rgba(15,23,42,0.85);border:1px solid rgba(255,255,255,0.09);border-radius:7px;padding:4px 9px;font-size:.74rem;display:inline-flex;align-items:center;gap:6px}
-.phys-chip span.k{color:var(--muted-hi);font-weight:500}
-.phys-chip strong.v{color:var(--text);font-weight:700}
-.macro-banner{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px;padding:7px 10px;border-radius:8px;background:rgba(15,23,42,0.75);border:1px solid rgba(56,189,248,0.2);font-size:.74rem}
-.macro-badges{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
-.kw-phase{font-size:.54rem;font-weight:700;text-transform:uppercase;padding:1px 4px;border-radius:3px;background:rgba(56,189,248,0.16);color:var(--accent);margin-top:3px;letter-spacing:.03em;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.wko-bars{display:flex;align-items:flex-end;gap:1.5px;height:12px;margin-top:3px;padding:1px 2px;background:rgba(0,0,0,0.25);border-radius:3px;overflow:hidden}
-.wko-bar{min-width:2px;border-radius:1px 1px 0 0;opacity:.92}
-.fb-badge{font-size:.58rem;font-weight:700;padding:0 4px;border-radius:3px;margin-left:auto;flex-shrink:0}
-.fb-badge.ok{background:rgba(16,185,129,0.2);color:#6ee7b7}
-.fb-badge.warn{background:rgba(245,158,11,0.22);color:#fde68a}
-.pcurve-tbl{width:100%;border-collapse:collapse;font-size:.71rem;margin-top:4px}
-.pcurve-tbl th,.pcurve-tbl td{padding:4px 6px;text-align:right;border-bottom:1px solid var(--border)}
-.pcurve-tbl th:first-child,.pcurve-tbl td:first-child{text-align:left;font-weight:700;color:var(--muted-hi)}
-.pcurve-tbl th{font-size:.64rem;text-transform:uppercase;color:var(--muted)}
-
-/* Main Workspace Layout */
-.workspace{display:grid;grid-template-columns:minmax(0,1fr) 360px;gap:14px;align-items:start}
-@media(max-width:1120px){.workspace{grid-template-columns:minmax(0,1fr)}}
-
-/* Calendar Grid Container */
-.cal-box{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;box-shadow:0 10px 30px rgba(0,0,0,0.3);min-width:0}
-
-/* Month View Grid — STRICT minmax(0,1fr) prevents column blowouts! */
-.dow-row{display:grid;grid-template-columns:32px repeat(7,minmax(0,1fr));background:var(--surface-2);border-bottom:1px solid var(--border)}
-.dow-cell{padding:8px 4px;text-align:center;font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted-hi)}
-.dow-cell.wknd{color:var(--muted)}
-.dow-cell.kw-hdr{font-size:.62rem;color:var(--muted);border-right:1px solid var(--border)}
-
-.month-grid{display:grid;grid-template-columns:32px repeat(7,minmax(0,1fr));grid-auto-rows:minmax(112px,auto)}
-@media(max-width:680px){
-  .dow-row,.month-grid{grid-template-columns:24px repeat(7,minmax(0,1fr))}
-  .month-grid{grid-auto-rows:minmax(92px,auto)}
-}
-.kw-cell{border-right:1px solid var(--border);border-bottom:1px solid var(--border);background:rgba(15,21,32,0.6);display:flex;flex-direction:column;align-items:center;justify-content:flex-start;padding:7px 2px 4px;font-size:.66rem;font-weight:600;color:var(--muted);cursor:pointer;user-select:none;transition:color .15s,background .15s}
-.kw-cell:hover{color:var(--accent);background:rgba(56,189,248,0.07)}
-
-.day{min-width:0;overflow:hidden;border-right:1px solid var(--border);border-bottom:1px solid var(--border);padding:6px;display:flex;flex-direction:column;gap:4px;position:relative;background:var(--surface);transition:background .12s ease;cursor:pointer}
-.day:nth-child(8n){border-right:none}
-.day.wknd{background:rgba(255,255,255,0.01)}
-.day.other{background:rgba(7,10,15,0.65)}
-.day.other .dnum-txt,.day.other .pill{opacity:.42}
-.day:hover{background:var(--surface-2)}
-.day.today{background:linear-gradient(180deg,rgba(56,189,248,0.09),rgba(13,18,27,0.95))}
-.day.today::before{content:"";position:absolute;top:0;left:0;right:0;height:2px;background:var(--accent);box-shadow:0 0 10px var(--accent)}
-
-.dhead{display:flex;justify-content:space-between;align-items:center;margin-bottom:2px;min-width:0}
-.dnum-txt{font-size:.76rem;font-weight:600;color:var(--muted-hi);display:inline-flex;align-items:center;gap:4px;line-height:1}
-.day.today .dnum-txt{background:var(--accent);color:#041019;font-weight:800;padding:3px 7px;border-radius:99px;box-shadow:0 0 12px rgba(56,189,248,0.45)}
-.today-tag{font-size:.58rem;font-weight:800;text-transform:uppercase;letter-spacing:.05em;color:var(--accent)}
-.dcount{font-size:.62rem;color:var(--muted);font-weight:600}
-
-/* Event Pills inside Day Cells */
-.pill{min-width:0;max-width:100%;overflow:hidden;padding:3.5px 6px;border-radius:5px;border-left:3px solid var(--accent);background:var(--surface-3);color:var(--text);font-size:.71rem;line-height:1.25;display:flex;flex-direction:column;gap:1px;cursor:pointer;transition:transform .1s ease,filter .12s ease}
-.pill:hover{filter:brightness(1.15);transform:translateY(-1px)}
-.pill-top{display:flex;align-items:center;gap:4px;min-width:0}
-.pill-ico{font-size:.68rem;flex-shrink:0;line-height:1}
-.pill-time{font-size:.63rem;font-weight:700;opacity:.85;flex-shrink:0}
-.pill-txt{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-word;white-space:normal;font-weight:500;min-width:0;flex:1}
-.pill-meta{font-size:.62rem;opacity:.75;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.more-pill{font-size:.66rem;font-weight:600;color:var(--accent);padding:2px 5px;border-radius:4px;background:rgba(56,189,248,0.08);text-align:center}
-
-.pill.workout-done{border-left-color:var(--workout);background:var(--workout-bg);color:var(--workout-tx)}
-.pill.workout-open{border-left-color:var(--plan);background:var(--plan-bg);color:var(--plan-tx)}
-.pill.workout-skipped{border-left-color:#64748b;background:rgba(100,116,139,0.12);color:#94a3b8;text-decoration:line-through}
-.pill.goal{border-left-color:var(--goal);background:var(--goal-bg);color:var(--goal-tx);font-weight:600}
-.pill.blocked{border-left-color:var(--blocked);background:var(--blocked-bg);color:var(--blocked-tx)}
-.pill.event{border-left-color:var(--event);background:var(--event-bg);color:var(--event-tx)}
-.pill.deadline{border-left-color:var(--deadline);background:var(--deadline-bg);color:var(--deadline-tx)}
-.pill.todo{border-left-color:var(--todo);background:var(--todo-bg);color:var(--todo-tx)}
-.pill.birthday{border-left-color:var(--bday);background:var(--bday-bg);color:var(--bday-tx)}
-
-/* Week View */
-.week-list{display:flex;flex-direction:column;divide-y:1px solid var(--border)}
-.wday-row{display:grid;grid-template-columns:130px minmax(0,1fr);border-bottom:1px solid var(--border);min-height:76px;transition:background .12s}
-.wday-row:last-child{border-bottom:none}
-.wday-row:hover{background:rgba(255,255,255,0.015)}
-.wday-row.today{background:linear-gradient(90deg,rgba(56,189,248,0.09),transparent)}
-@media(max-width:600px){.wday-row{grid-template-columns:92px minmax(0,1fr)}}
-.wday-left{padding:12px;border-right:1px solid var(--border);display:flex;flex-direction:column;gap:2px}
-.wday-dow{font-size:.72rem;font-weight:700;text-transform:uppercase;color:var(--muted-hi)}
-.wday-date{font-size:1.05rem;font-weight:800;color:var(--text)}
-.wday-row.today .wday-date{color:var(--accent)}
-.wday-right{padding:10px 12px;display:flex;flex-direction:column;gap:7px;justify-content:center;min-width:0}
-.wday-empty{font-size:.76rem;color:var(--muted);font-style:italic}
-
-/* Agenda View */
-.agenda-view{padding:14px;display:flex;flex-direction:column;gap:16px}
-.ag-group{display:flex;flex-direction:column;gap:7px}
-.ag-month-hdr{font-size:.76rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--accent);padding-bottom:4px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between}
-.ag-item{display:grid;grid-template-columns:105px minmax(0,1fr) auto;gap:12px;align-items:center;padding:10px 12px;background:var(--surface-2);border:1px solid var(--border);border-radius:9px;cursor:pointer;transition:border-color .15s,background .15s}
-.ag-item:hover{border-color:var(--border-hi);background:var(--surface-3)}
-@media(max-width:600px){.ag-item{grid-template-columns:82px minmax(0,1fr)}}
-.ag-date-col{display:flex;flex-direction:column}
-.ag-date-main{font-size:.8rem;font-weight:700;color:var(--text)}
-.ag-date-sub{font-size:.68rem;color:var(--muted-hi)}
-
-/* Sidebar */
-.side{display:flex;flex-direction:column;gap:12px;min-width:0}
-.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:14px;display:flex;flex-direction:column;gap:10px;box-shadow:0 6px 20px rgba(0,0,0,0.25);min-width:0}
-.card-hdr{display:flex;justify-content:space-between;align-items:center;gap:8px}
-.card-title{font-size:.76rem;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--muted-hi);display:flex;align-items:center;gap:6px}
-.card-badge{font-size:.68rem;font-weight:600;padding:1px 7px;border-radius:99px;background:var(--surface-3);color:var(--text-dim)}
-.list{display:flex;flex-direction:column;gap:7px;max-height:320px;overflow-y:auto;padding-right:2px}
-.list::-webkit-scrollbar{width:5px}
-.list::-webkit-scrollbar-thumb{background:var(--surface-3);border-radius:99px}
-
-.row{font-size:.79rem;padding:9px 11px;border-radius:8px;background:var(--surface-2);border:1px solid var(--border);display:flex;justify-content:space-between;gap:10px;align-items:flex-start;cursor:pointer;transition:border-color .15s,background .15s;min-width:0}
-.row:hover{border-color:var(--border-hi);background:var(--surface-3)}
-.row-main{min-width:0;flex:1;display:flex;flex-direction:column;gap:3px}
-.row-title{font-weight:600;color:var(--text);word-break:break-word;line-height:1.3}
-.row-sub{font-size:.7rem;color:var(--muted-hi);display:flex;flex-wrap:wrap;gap:6px;align-items:center}
-.tag{font-size:.67rem;font-weight:600;padding:2px 7px;border-radius:5px;background:var(--surface-3);color:var(--text-dim);white-space:nowrap;flex-shrink:0}
-.tag.high,.tag.overdue{background:rgba(244,63,94,0.18);color:#fda4af;border:1px solid rgba(244,63,94,0.3)}
-.tag.med{background:rgba(249,115,22,0.16);color:#fdba74;border:1px solid rgba(249,115,22,0.3)}
-.tag.low{background:rgba(56,189,248,0.14);color:#bae6fd}
-.tag.goal{background:rgba(245,158,11,0.18);color:#fde68a;border:1px solid rgba(245,158,11,0.3)}
-.tag.ok{background:rgba(16,185,129,0.16);color:#6ee7b7;border:1px solid rgba(16,185,129,0.3)}
-.empty-box{font-size:.78rem;color:var(--muted-hi);padding:12px;border-radius:8px;background:rgba(255,255,255,0.02);border:1px dashed var(--border);display:flex;flex-direction:column;gap:6px}
-.code-hint{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.7rem;background:var(--bg);padding:5px 8px;border-radius:5px;color:var(--accent);border:1px solid var(--border);cursor:pointer}
-
-/* Modal */
-.modal-backdrop{position:fixed;inset:0;background:rgba(3,6,12,0.75);backdrop-filter:blur(6px);display:none;align-items:center;justify-content:center;padding:16px;z-index:100}
-.modal-backdrop.open{display:flex}
-.modal{background:var(--surface);border:1px solid var(--border-hi);border-radius:14px;max-width:540px;width:100%;padding:20px;box-shadow:0 24px 60px rgba(0,0,0,0.65);display:flex;flex-direction:column;gap:14px}
-.modal-top{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
-.modal-title{font-size:1.05rem;font-weight:700;color:var(--text);line-height:1.35}
-.modal-close{background:var(--surface-2);border:1px solid var(--border);color:var(--muted-hi);width:28px;height:28px;border-radius:7px;cursor:pointer;font-size:.9rem}
-.modal-close:hover{color:#fff;background:var(--surface-3)}
-.modal-meta{display:flex;flex-wrap:wrap;gap:8px}
-.modal-body{font-size:.84rem;color:var(--text-dim);background:var(--surface-2);padding:12px;border-radius:9px;border:1px solid var(--border);display:flex;flex-direction:column;gap:8px}
-.modal-actions{display:flex;justify-content:flex-end;gap:8px}
-.btn-act{background:var(--surface-3);color:var(--text);border:1px solid var(--border-hi);padding:6px 12px;border-radius:7px;font-size:.76rem;font-weight:600;cursor:pointer}
-.btn-act:hover{border-color:var(--accent);color:var(--accent)}
-</style></head><body>
-<div class="shell">
-  <header class="topbar">
-    <div class="brand">
-      <div class="brand-icon">📅</div>
-      <div>
-        <div class="brand-title">Atlas · Calendar & Coach Hub</div>
-        <div class="brand-sub">
-          <span class="live-pill"><span class="live-dot"></span>Atlas-First · Live</span>
-          <span id="today-sub"></span>
-        </div>
-      </div>
-    </div>
-    <div class="toolbar">
-      <div class="seg" role="tablist">
-        <button id="f-all" class="active" onclick="setFilter('all')">Alle <span class="cnt" id="cnt-all">0</span></button>
-        <button id="f-coach" onclick="setFilter('coach')">🚴 Coach View <span class="cnt" id="cnt-coach">0</span></button>
-        <button id="f-todo" onclick="setFilter('todo')">☑️ To-Dos & Fristen <span class="cnt" id="cnt-todo">0</span></button>
-      </div>
-      <div class="search-wrap">
-        <span class="search-ico">🔍</span>
-        <input id="q-in" class="search-in" type="search" placeholder="Filtern… (/)" oninput="setQuery(this.value)">
-      </div>
-      <div class="seg">
-        <button id="v-month" class="active" onclick="setLayout('month')">Monat</button>
-        <button id="v-week" onclick="setLayout('week')">Woche</button>
-        <button id="v-agenda" onclick="setLayout('agenda')">Agenda</button>
-      </div>
-      <div class="nav-grp">
-        <button class="nav-btn" onclick="stepNav(-1)" title="Zurück (◀)">◀</button>
-        <span class="nav-label" id="mlabel" onclick="goToday()" title="Springe zu Heute (T)"></span>
-        <button class="nav-btn" onclick="stepNav(1)" title="Vor (▶)">▶</button>
-        <button class="nav-btn" onclick="goToday()" style="border-left:1px solid var(--border);color:var(--accent)">Heute</button>
-      </div>
-    </div>
-  </header>
-
-  <section id="coach-ribbon" class="coach-ribbon">
-    <div class="coach-hdr">
-      <div class="coach-title">⚡ Athleten-Telemetrie & Physiologie-Profil (aus Brain)</div>
-      <div style="font-size:.72rem;color:var(--muted-hi)" id="coach-sched"></div>
-    </div>
-    <div class="macro-banner" id="macro-banner"></div>
-    <div class="phys-chips" id="phys-chips"></div>
-  </section>
-
-  <section class="kpi-strip" id="kpi-strip"></section>
-
-  <div class="workspace">
-    <main class="cal-box" id="cal-main"></main>
-    <aside class="side">
-      <div class="card"><div class="card-hdr"><div class="card-title" id="s1-title"></div><span class="card-badge" id="s1-cnt"></span></div><div class="list" id="s1-list"></div></div>
-      <div class="card"><div class="card-hdr"><div class="card-title" id="s2-title"></div><span class="card-badge" id="s2-cnt"></span></div><div class="list" id="s2-list"></div></div>
-      <div class="card"><div class="card-hdr"><div class="card-title" id="s3-title"></div><span class="card-badge" id="s3-cnt"></span></div><div class="list" id="s3-list"></div></div>
-    </aside>
-  </div>
-</div>
-
-<div class="modal-backdrop" id="modal-bg" onclick="if(event.target===this)closeModal()">
-  <div class="modal">
-    <div class="modal-top">
-      <div class="modal-title" id="m-title"></div>
-      <button class="modal-close" onclick="closeModal()">✕</button>
-    </div>
-    <div class="modal-meta" id="m-meta"></div>
-    <div class="modal-body" id="m-body"></div>
-    <div class="modal-actions">
-      <button class="btn-act" id="m-copy">📋 Quelle / Markdown kopieren</button>
-      <button class="btn-act" onclick="closeModal()">Schließen</button>
-    </div>
-  </div>
-</div>
-
-<script>
-let DATA = __DATA_JSON__;
-const MONTHS = ['Januar','Februar','März','April','Mai','Juni','Juli','August','September','Oktober','November','Dezember'];
-const MONTHS_SHORT = ['Jan','Feb','Mär','Apr','Mai','Jun','Jul','Aug','Sep','Okt','Nov','Dez'];
-const DOWS = ['Mo','Di','Mi','Do','Fr','Sa','So'];
-
-let cur = new Date(DATA.today + "T00:00:00");
-const _urlView = new URLSearchParams(window.location.search).get("view");
-if(_urlView && ["all","coach","todo"].includes(_urlView)) sessionStorage.setItem("atlas_cal_filter", _urlView);
-let filter = sessionStorage.getItem("atlas_cal_filter") || "all";
-let layout = sessionStorage.getItem("atlas_cal_layout") || "month";
-let query = "";
-
-function iso(d){ return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); }
-function parseIso(s){ const [y,m,d]=s.split('-').map(Number); return new Date(y,m-1,d); }
-function getKW(d){
-  const t = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
-  const dayNum = t.getUTCDay() || 7;
-  t.setUTCDate(t.getUTCDate() + 4 - dayNum);
-  const yearStart = new Date(Date.UTC(t.getUTCFullYear(),0,1));
-  return Math.ceil((((t - yearStart) / 86400000) + 1)/7);
-}
-function fmtDateDE(s){
-  const [y,m,d] = s.split('-');
-  return `${d}.${m}.${y}`;
-}
-function esc(s){
-  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-}
-function compactTitle(what){
-  let s = String(what||'');
-  const mAmt = s.match(/(\\d[\\d.,]*\\s*€(?:\\s*\\/\\s*(?:Monat|M|Jahr|J|Quartal))?)/);
-  let main = s.replace(/\\s*\\((?:Eingang|doppeltes|übergesetzliche|30 Tage|seit \\d+|je \\d+).*?\\)/gi, '').trim();
-  if(main.length > 68 && main.includes('(')) main = main.split('(')[0].trim();
-  return {main: main || s, meta: mAmt ? mAmt[1] : ''};
-}
-function isCoachItem(it){
-  return ['workout','blocked','goal'].includes(it.kind) || (it.kind==='event' && Boolean(it.time));
-}
-function isTodoItem(it){
-  return ['todo','deadline'].includes(it.kind);
-}
-function keepItem(it){
-  if(filter==='coach' && !isCoachItem(it)) return false;
-  if(filter==='todo' && !isTodoItem(it)) return false;
-  if(query){
-    const q = query.toLowerCase();
-    const hay = `${it.what} ${it.kind} ${it.subkind||''} ${it.rel||''} ${it.start}`.toLowerCase();
-    if(!hay.includes(q)) return false;
-  }
-  return true;
-}
-function pillClass(it){
-  if(it.kind==='workout') return 'pill workout-' + it.status;
-  return 'pill ' + it.kind;
-}
-function icon(it){
-  if(it.kind==='workout') return (it.status==='done'?'✓':it.status==='skipped'?'–':(it.subkind==='strength'?'🏋️':it.subkind==='running'?'🏃':'🚴'));
-  if(it.kind==='goal') return '🏆';
-  if(it.kind==='blocked') return '🚫';
-  if(it.kind==='birthday') return (it.subkind==='anniversary'?'❤️':'🎂');
-  if(it.kind==='deadline') return '⏳';
-  if(it.kind==='todo') return '☑️';
-  return '📅';
-}
-function deltaLabel(delta){
-  if(delta===0) return 'heute';
-  if(delta===1) return 'morgen';
-  if(delta===-1) return 'gestern';
-  return delta < 0 ? `vor ${-delta}d` : `in ${delta}d`;
-}
-function setFilter(f){
-  filter = f;
-  sessionStorage.setItem("atlas_cal_filter", f);
-  render();
-}
-function setLayout(l){
-  layout = l;
-  sessionStorage.setItem("atlas_cal_layout", l);
-  render();
-}
-function setQuery(q){
-  query = (q||'').trim();
-  render();
-}
-function stepNav(dir){
-  if(layout==='week'){
-    cur = new Date(cur.getFullYear(), cur.getMonth(), cur.getDate() + dir*7);
-  } else {
-    cur = new Date(cur.getFullYear(), cur.getMonth() + dir, 1);
-  }
-  render();
-}
-function goToday(){
-  cur = new Date(DATA.today + "T00:00:00");
-  render();
-}
-function openWeekOf(dateStr){
-  cur = parseIso(dateStr);
-  setLayout('week');
-}
-function zoneColor(z){
-  if(z<=1) return '#64748b';
-  if(z===2) return '#38bdf8';
-  if(z===3) return '#10b981';
-  if(z===4) return '#f59e0b';
-  if(z===5) return '#f43f5e';
-  return '#a855f7';
-}
-function renderWkoBars(it, tall=false){
-  const blks = it.visual_blocks || [];
-  if(!blks.length) return '';
-  const tot = blks.reduce((s,b)=>s+(b.sec||60), 0) || 1;
-  const h = tall ? 28 : 11;
-  return `<div class="wko-bars" style="height:${h}px" title="Intervall-Struktur (${it.total_min||0} min)">` +
-    blks.map(b => {
-      const wPct = Math.max(2, (b.sec/tot)*100);
-      const hPct = Math.min(100, Math.max(22, Math.round((b.pct||0.65)*78)));
-      return `<div class="wko-bar" style="width:${wPct.toFixed(1)}%;height:${hPct}%;background:${zoneColor(b.zone||2)}" title="${esc(b.label||'Block')}"></div>`;
-    }).join('') + `</div>`;
-}
-function downloadZwo(idx){
-  const it = DATA.items[idx];
-  if(!it || !it.zwo_xml) return;
-  const blob = new Blob([it.zwo_xml], {type: 'application/xml'});
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = it.zwo_filename || `${it.start}_workout.zwo`;
-  document.body.appendChild(a);
-  a.click();
-  setTimeout(()=>{ document.body.removeChild(a); URL.revokeObjectURL(url); }, 150);
-}
-function kwPhaseMap(){
-  const m = (DATA.coach && DATA.coach.macro && DATA.coach.macro.weeks) || [];
-  const out = {};
-  for(const w of m){ out[String(w.kw).replace(/^0+/,'')] = w; }
-  return out;
-}
-function showItemModal(idx){
-  const it = DATA.items[idx];
-  if(!it) return;
-  const bg = document.getElementById('modal-bg');
-  document.getElementById('m-title').textContent = `${icon(it)} ${it.what}`;
-  const kw = getKW(parseIso(it.start));
-  const kindLbl = it.subkind ? `${it.kind.toUpperCase()} · ${it.subkind.toUpperCase()}` : it.kind.toUpperCase();
-  document.getElementById('m-meta').innerHTML = `
-    <span class="tag goal">${esc(kindLbl)}</span>
-    <span class="tag">${esc(fmtDateDE(it.start))}${it.end!==it.start?' – '+esc(fmtDateDE(it.end)):''} · KW ${kw}</span>
-    ${it.time?`<span class="tag">🕒 ${esc(it.time)}</span>`:''}
-    <span class="tag ${it.delta<0?'overdue':'ok'}">${esc(deltaLabel(it.delta))} (${(it.delta/7).toFixed(1)}w)</span>
-    ${it.np_w?`<span class="tag ok">⚡ NP ${it.np_w} W</span>`:''}
-    ${it.avg_hr?`<span class="tag">❤️ ${it.avg_hr} bpm</span>`:''}
-  `;
-  let extra = '';
-  if(it.visual_blocks && it.visual_blocks.length){
-    extra += `<div><strong>Intervall-Struktur (${it.total_min||0} min):</strong>${renderWkoBars(it, true)}</div>`;
-  }
-  if(it.feedback){
-    extra += `<div><strong>Athleten-Feedback:</strong><br><span style="color:#6ee7b7">${esc(it.feedback)}</span></div>`;
-  } else if(it.feedback_pending){
-    extra += `<div style="color:#fde68a"><strong>⚠ Check-in offen:</strong> Noch keine subjektive Notiz (RPE / Beine) hinterlegt.<br><code>atlas.py coach note --date ${esc(it.start)} --text "..."</code></div>`;
-  }
-  if(it.zwo_xml){
-    extra += `<div style="margin-top:4px"><button class="btn-act" style="border-color:var(--workout);color:#6ee7b7" onclick="downloadZwo(${idx})">⬇ .zwo Workout herunterladen (${esc(it.zwo_filename||'workout.zwo')})</button></div>`;
-  }
-  document.getElementById('m-body').innerHTML = `
-    <div><strong>Beschreibung:</strong><br>${esc(it.what)}</div>
-    ${extra}
-    <div style="color:var(--muted-hi);font-size:.76rem"><strong>Quelle im Brain:</strong> <code>${esc(it.rel)}</code></div>
-  `;
-  const copyBtn = document.getElementById('m-copy');
-  copyBtn.onclick = () => {
-    navigator.clipboard.writeText(`${it.start} [${it.kind}] ${it.what} (${it.rel})`);
-    copyBtn.textContent = '✓ Kopiert!';
-    setTimeout(()=>copyBtn.textContent='📋 Quelle / Markdown kopieren', 1500);
-  };
-  bg.classList.add('open');
-}
-function showDayModal(ds){
-  const d = parseIso(ds);
-  const kw = getKW(d);
-  const dayItems = DATA.items.map((it,idx)=>({it,idx})).filter(x => keepItem(x.it) && x.it.start <= ds && ds <= x.it.end);
-  const bg = document.getElementById('modal-bg');
-  const dowName = DOWS[(d.getDay()+6)%7];
-  document.getElementById('m-title').textContent = `${dowName}, ${fmtDateDE(ds)} (KW ${kw})`;
-  document.getElementById('m-meta').innerHTML = `<span class="tag">${dayItems.length} Einträge</span>`;
-  const defKind = filter==='coach' ? 'workout:cycling' : (filter==='todo' ? 'todo' : 'event');
-  const snippet = `- [ ] ${ds} [${defKind}] `;
-  document.getElementById('m-body').innerHTML = (dayItems.length ? dayItems.map(({it,idx}) => `
-    <div class="row" onclick="showItemModal(${idx})">
-      <div class="row-main">
-        <div class="row-title">${icon(it)} ${it.time?esc(it.time)+' ':''}${esc(it.what)}</div>
-        <div class="row-sub"><span>${esc(it.kind)}${it.subkind?':'+esc(it.subkind):''}</span> · <span>${esc(it.rel)}</span></div>
-      </div>
-    </div>
-  `).join('') : '<div style="color:var(--muted-hi)">Keine Einträge an diesem Tag.</div>') + `
-    <div style="margin-top:6px;font-size:.73rem;color:var(--muted-hi)">Markdown-Vorlage für <code>brain/calendar/README.md</code>:</div>
-    <div class="code-hint" onclick="navigator.clipboard.writeText('${snippet}')">${esc(snippet)}… (Klicken zum Kopieren)</div>
-  `;
-  const copyBtn = document.getElementById('m-copy');
-  copyBtn.onclick = () => {
-    navigator.clipboard.writeText(snippet);
-    copyBtn.textContent = '✓ Vorlage kopiert!';
-    setTimeout(()=>copyBtn.textContent='📋 Quelle / Markdown kopieren', 1500);
-  };
-  bg.classList.add('open');
-}
-function closeModal(){ document.getElementById('modal-bg').classList.remove('open'); }
-
-function renderKPIs(){
-  const todayD = parseIso(DATA.today);
-  const kw = getKW(todayD);
-  const dow = DOWS[(todayD.getDay()+6)%7];
-  document.getElementById('today-sub').textContent = `${dow}, ${fmtDateDE(DATA.today)} · KW ${kw}`;
-
-  const coachRib = document.getElementById('coach-ribbon');
-  const coach = DATA.coach || {metrics:[], macro_goals:[], schedule:''};
-  if(filter==='coach'){
-    coachRib.classList.add('show');
-    document.getElementById('coach-sched').textContent = coach.schedule ? `🕒 Primäres Trainingsfenster: ${coach.schedule}` : '';
-    const mBanner = document.getElementById('macro-banner');
-    const mp = coach.macro || {active_phase:'Off-Season', stale:true, stale_reason:'Initialisierung offen', updated:''};
-    const fbPend = (coach.pending_feedback||[]).length;
-    mBanner.innerHTML = `
-      <div><strong>🧭 Makro-Phase:</strong> <span style="color:var(--accent);font-weight:700">${esc(mp.active_phase||'Base')}</span> ${mp.updated?`<span style="color:var(--muted-hi)">(Stand ${esc(mp.updated)})</span>`:''}</div>
-      <div class="macro-badges">
-        <span class="tag ${mp.stale?'med':'ok'}">${mp.stale?'⚠ Makroplan fällig ('+esc(mp.stale_reason)+')':'✓ Makroplan aktuell'}</span>
-        ${coach.strava_connected
-          ? `<span class="tag ok">✓ Strava verbunden (${coach.activities_count||0} Rides)</span><a href="/strava-sync" class="tag" style="background:rgba(56,189,248,0.14);color:var(--accent);border:1px solid rgba(56,189,248,0.35);text-decoration:none;cursor:pointer;font-weight:700">🔄 Strava Sync</a>`
-          : `<a href="/strava-connect" class="tag" style="background:rgba(252,76,2,0.18);color:#fdba74;border:1px solid rgba(252,76,2,0.45);text-decoration:none;cursor:pointer;font-weight:700">🧡 Mit Strava verbinden (1-Klick)</a>`
-        }
-        ${fbPend?`<span class="tag med">💬 ${fbPend} Ride-Check-in(s) offen</span>`:''}
-      </div>
-    `;
-    const chips = document.getElementById('phys-chips');
-    chips.innerHTML = (coach.metrics && coach.metrics.length) ? coach.metrics.map(m =>
-      `<div class="phys-chip"><span>${esc(m.icon||'⚡')}</span><span class="k">${esc(m.label)}:</span><strong class="v">${esc(m.value)}</strong></div>`
-    ).join('') : '<div class="phys-chip"><span class="k">Tipp:</span><strong class="v">Leistungsdaten in coach/profile.md hinterlegen</strong></div>';
-  } else {
-    coachRib.classList.remove('show');
-  }
-
-  const kpiEl = document.getElementById('kpi-strip');
-  const openItems = DATA.items.filter(i => i.status==='open');
-  if(filter==='coach'){
-    const goals = openItems.filter(i => i.kind==='goal' && i.delta>=0);
-    const woDone = DATA.items.filter(i => i.kind==='workout' && i.delta>=-14 && i.delta<=14 && i.status==='done').length;
-    const woOpen = DATA.items.filter(i => i.kind==='workout' && i.delta>=0 && i.delta<=14 && i.status==='open').length;
-    const blockers = openItems.filter(i => i.delta>=0 && i.delta<=28 && (i.kind==='blocked' || (i.kind==='event' && i.time)));
-    const nextGoal = goals[0];
-    const macroCnt = (coach.macro_goals||[]).length;
-    kpiEl.innerHTML = `
-      <div class="kpi" style="--kpi-color:var(--goal)">
-        <div class="kpi-lbl"><span>🏆 Saisonziele & Rennen</span><span>${goals.length + macroCnt} aktiv</span></div>
-        <div class="kpi-val">${nextGoal ? esc(nextGoal.what) : (macroCnt ? esc(coach.macro_goals[0].title) : 'Off-Season / Basis')}</div>
-        <div class="kpi-sub">${nextGoal ? `Countdown: in ${nextGoal.delta}d (${(nextGoal.delta/7).toFixed(1)} Wochen)` : `${macroCnt} strategische Säulen im Brain`}</div>
-      </div>
-      <div class="kpi" style="--kpi-color:var(--workout)">
-        <div class="kpi-lbl"><span>🚴 Workouts (±14 Tage)</span><span>Compliance</span></div>
-        <div class="kpi-val">${woDone} erledigt · ${woOpen} geplant</div>
-        <div class="kpi-sub">${woDone+woOpen>0 ? 'Aus calendar/README.md' : 'Bereit für Wochenplanung (.zwo / Karoo)'}</div>
-      </div>
-      <div class="kpi" style="--kpi-color:${blockers.length?'var(--blocked)':'var(--workout)'}">
-        <div class="kpi-lbl"><span>🛡️ Trainings-Verfügbarkeit</span><span>28 Tage</span></div>
-        <div class="kpi-val">${28 - blockers.length} / 28 Tage frei</div>
-        <div class="kpi-sub">${blockers.length ? `${blockers.length} Blocker/Termine beachten` : 'Keine Reisen oder Blocker eingetragen'}</div>
-      </div>
-      <div class="kpi" style="--kpi-color:var(--plan)">
-        <div class="kpi-lbl"><span>⏱️ Fokus-Rhythmus</span><span>Chronotyp</span></div>
-        <div class="kpi-val">${esc(coach.schedule || '17:00 – 20:00 Uhr')}</div>
-        <div class="kpi-sub">8–10h/Woche Ausdauer + 1–3x Kraft</div>
-      </div>
-    `;
-  } else if(filter==='todo'){
-    const overdue = openItems.filter(i => isTodoItem(i) && i.delta<0);
-    const next30 = openItems.filter(i => isTodoItem(i) && i.delta>=0 && i.delta<=30);
-    const next365 = openItems.filter(i => isTodoItem(i) && i.delta>=0 && i.delta<=365);
-    const highTodos = DATA.todos.filter(t => t.prio==='high').length;
-    kpiEl.innerHTML = `
-      <div class="kpi" style="--kpi-color:${overdue.length?'var(--blocked)':'var(--workout)'}">
-        <div class="kpi-lbl"><span>⚠️ Überfällig</span><span>Status</span></div>
-        <div class="kpi-val">${overdue.length ? `${overdue.length} Frist(en)` : '0 Überfällig'}</div>
-        <div class="kpi-sub">${overdue.length ? esc(overdue[0].what) : 'Alle vergangenen Stichtage erledigt'}</div>
-      </div>
-      <div class="kpi" style="--kpi-color:var(--deadline)">
-        <div class="kpi-lbl"><span>⏳ Nächste 30 Tage</span><span>Fristen</span></div>
-        <div class="kpi-val">${next30.length} Stichtage</div>
-        <div class="kpi-sub">${next30[0] ? `Nächster: in ${next30[0].delta}d (${fmtDateDE(next30[0].start)})` : 'Keine Fristen in 30d'}</div>
-      </div>
-      <div class="kpi" style="--kpi-color:var(--todo)">
-        <div class="kpi-lbl"><span>☑️ Offene To-Dos</span><span>Backlog</span></div>
-        <div class="kpi-val">${DATA.todos.length} Aufgaben</div>
-        <div class="kpi-sub">${highTodos ? `${highTodos} mit hoher Priorität` : 'Aus calendar/ & Checklisten'}</div>
-      </div>
-      <div class="kpi" style="--kpi-color:var(--event)">
-        <div class="kpi-lbl"><span>📆 Jahres-Radar</span><span>365 Tage</span></div>
-        <div class="kpi-val">${next365.length} Meilensteine</div>
-        <div class="kpi-sub">Verträge, Steuern, Gehalt & Sparpläne</div>
-      </div>
-    `;
-  } else {
-    const next30 = openItems.filter(i => i.delta>=0 && i.delta<=30);
-    const nxt = next30[0] || openItems.find(i => i.delta>=0);
-    const bdays = openItems.filter(i => i.kind==='birthday' && i.delta>=0);
-    kpiEl.innerHTML = `
-      <div class="kpi" style="--kpi-color:var(--accent)">
-        <div class="kpi-lbl"><span>📍 Heute</span><span>KW ${kw}</span></div>
-        <div class="kpi-val">${dow}, ${fmtDateDE(DATA.today)}</div>
-        <div class="kpi-sub">${openItems.filter(i=>i.delta===0).length || 'Keine'} Termine heute</div>
-      </div>
-      <div class="kpi" style="--kpi-color:var(--deadline)">
-        <div class="kpi-lbl"><span>📅 Nächste 30 Tage</span><span>Horizont</span></div>
-        <div class="kpi-val">${next30.length} Einträge</div>
-        <div class="kpi-sub">${nxt ? `Als Nächstes: in ${nxt.delta}d (${fmtDateDE(nxt.start)})` : 'Freier Horizont'}</div>
-      </div>
-      <div class="kpi" style="--kpi-color:var(--todo)">
-        <div class="kpi-lbl"><span>☑️ To-Do Backlog</span><span>Offen</span></div>
-        <div class="kpi-val">${DATA.todos.length} Aufgaben</div>
-        <div class="kpi-sub">${DATA.todos[0] ? esc(DATA.todos[0].what) : 'Keine offenen Backlog-To-Dos'}</div>
-      </div>
-      <div class="kpi" style="--kpi-color:var(--bday)">
-        <div class="kpi-lbl"><span>🎂 Geburtstage & Ziele</span><span>365 Tage</span></div>
-        <div class="kpi-val">${bdays.length} Ehrentage</div>
-        <div class="kpi-sub">${bdays[0] ? `${esc(bdays[0].what)} (in ${bdays[0].delta}d)` : 'Alle Jahrestage synchronisiert'}</div>
-      </div>
-    `;
-  }
-}
-
-function renderMain(){
-  const mainEl = document.getElementById('cal-main');
-  const y = cur.getFullYear(), m = cur.getMonth();
-
-  if(layout==='month'){
-    document.getElementById('mlabel').textContent = `${MONTHS[m]} ${y}`;
-    const first = new Date(y, m, 1);
-    const offset = (first.getDay() + 6) % 7;
-    const start = new Date(y, m, 1 - offset);
-    const sixthWeekStart = new Date(start.getFullYear(), start.getMonth(), start.getDate() + 35);
-    const totalCells = (sixthWeekStart.getMonth() !== m) ? 35 : 42;
-
-    let html = `<div class="dow-row"><div class="dow-cell kw-hdr">KW</div>` +
-      DOWS.map((d,i)=>`<div class="dow-cell${i>=5?' wknd':''}">${d}</div>`).join('') +
-      `</div><div class="month-grid">`;
-
-    const kwMap = kwPhaseMap();
-    for(let i=0;i<totalCells;i++){
-      const d = new Date(start.getFullYear(), start.getMonth(), start.getDate()+i);
-      const ds = iso(d);
-      const dowIdx = i % 7;
-      if(dowIdx === 0){
-        const kw = getKW(d);
-        const mw = filter==='coach' ? kwMap[String(kw)] : null;
-        const phBadge = mw && mw.phase ? `<span class="kw-phase" title="${esc(mw.focus||mw.phase)}">${esc(mw.phase.slice(0,6))}</span>` : '';
-        html += `<div class="kw-cell" onclick="openWeekOf('${ds}')" title="Wochenansicht KW ${kw} öffnen"><span>${kw}</span>${phBadge}</div>`;
-      }
-      const isOther = d.getMonth() !== m;
-      const isToday = ds === DATA.today;
-      const isWknd = dowIdx >= 5;
-      const dayMatches = [];
-      DATA.items.forEach((it, idx) => {
-        if(keepItem(it) && it.start <= ds && ds <= it.end) dayMatches.push({it, idx});
-      });
-      const dLabel = (d.getDate()===1 && !isToday) ? `1. ${MONTHS_SHORT[d.getMonth()]}` : d.getDate();
-      const shown = dayMatches.slice(0, 3);
-      const more = dayMatches.length - shown.length;
-
-      html += `<div class="day${isOther?' other':''}${isToday?' today':''}${isWknd?' wknd':''}" onclick="if(event.target===this||event.target.classList.contains('dhead')||event.target.classList.contains('dnum-txt'))showDayModal('${ds}')">`;
-      html += `<div class="dhead"><span class="dnum-txt">${dLabel}</span>${isToday?'<span class="today-tag">Heute</span>':(dayMatches.length>1?`<span class="dcount">${dayMatches.length}</span>`:'')}</div>`;
-      for(const {it, idx} of shown){
-        const c = compactTitle(it.what);
-        const spanInfo = it.start !== it.end ? ` (${it.start.slice(8)}–${it.end.slice(8)})` : '';
-        const fbBadge = it.kind==='workout' && it.status==='done' ? (it.feedback ? `<span class="fb-badge ok" title="${esc(it.feedback)}">✓</span>` : (it.feedback_pending ? `<span class="fb-badge warn" title="Check-in Feedback fehlt">⚠</span>` : '')) : '';
-        html += `<div class="${pillClass(it)}" onclick="event.stopPropagation();showItemModal(${idx})" title="${esc(it.what)} (${esc(it.rel)})">
-          <div class="pill-top">
-            <span class="pill-ico">${icon(it)}</span>
-            ${it.time?`<span class="pill-time">${esc(it.time)}</span>`:''}
-            <span class="pill-txt">${esc(c.main)}${esc(spanInfo)}</span>
-            ${fbBadge}
-          </div>
-          ${c.meta?`<div class="pill-meta">${esc(c.meta)}</div>`:''}
-          ${it.kind==='workout' ? renderWkoBars(it, false) : ''}
-        </div>`;
-      }
-      if(more > 0){
-        html += `<div class="more-pill" onclick="event.stopPropagation();showDayModal('${ds}')">+${more} weitere</div>`;
-      }
-      html += `</div>`;
-    }
-    html += `</div>`;
-    mainEl.innerHTML = html;
-  } else if(layout==='week'){
-    const dowOffset = (cur.getDay() + 6) % 7;
-    const wStart = new Date(cur.getFullYear(), cur.getMonth(), cur.getDate() - dowOffset);
-    const wEnd = new Date(wStart.getFullYear(), wStart.getMonth(), wStart.getDate() + 6);
-    const kw = getKW(wStart);
-    document.getElementById('mlabel').textContent = `KW ${kw} · ${wStart.getDate()}. ${MONTHS_SHORT[wStart.getMonth()]} – ${wEnd.getDate()}. ${MONTHS_SHORT[wEnd.getMonth()]} ${wEnd.getFullYear()}`;
-
-    let html = `<div class="week-list">`;
-    for(let i=0;i<7;i++){
-      const d = new Date(wStart.getFullYear(), wStart.getMonth(), wStart.getDate()+i);
-      const ds = iso(d);
-      const isToday = ds === DATA.today;
-      const dayMatches = [];
-      DATA.items.forEach((it, idx) => {
-        if(keepItem(it) && it.start <= ds && ds <= it.end) dayMatches.push({it, idx});
-      });
-      html += `<div class="wday-row${isToday?' today':''}" onclick="if(event.target===this)showDayModal('${ds}')">
-        <div class="wday-left" onclick="showDayModal('${ds}')">
-          <span class="wday-dow">${DOWS[i]}${isToday?' · HEUTE':''}</span>
-          <span class="wday-date">${d.getDate()}. ${MONTHS_SHORT[d.getMonth()]}</span>
-        </div>
-        <div class="wday-right">`;
-      if(dayMatches.length){
-        for(const {it, idx} of dayMatches){
-          html += `<div class="row" onclick="showItemModal(${idx})">
-            <div class="row-main">
-              <div class="row-title">${icon(it)} ${it.time?`<strong>${esc(it.time)}</strong> `:''}${esc(it.what)}</div>
-              <div class="row-sub"><span>${esc(it.kind)}${it.subkind?':'+esc(it.subkind):''}</span> · <span>${esc(it.rel)}</span></div>
-            </div>
-            <span class="tag">${esc(deltaLabel(it.delta))}</span>
-          </div>`;
-        }
-      } else {
-        html += `<div class="wday-empty" onclick="showDayModal('${ds}')">${filter==='coach'?'Freies Trainingsfenster (Klicken für Workout-Vorlage)':'Keine Termine eingetragen'}</div>`;
-      }
-      html += `</div></div>`;
-    }
-    html += `</div>`;
-    mainEl.innerHTML = html;
-  } else {
-    document.getElementById('mlabel').textContent = `Agenda · ${cur.getFullYear()}`;
-    const groups = new Map();
-    DATA.items.forEach((it, idx) => {
-      if(!keepItem(it) || (it.delta < -14 && it.status !== 'open')) return;
-      const ym = it.start.slice(0, 7);
-      if(!groups.has(ym)) groups.set(ym, []);
-      groups.get(ym).push({it, idx});
-    });
-    if(!groups.size){
-      mainEl.innerHTML = `<div class="agenda-view"><div class="empty-box">Keine Einträge für diesen Filter gefunden.</div></div>`;
-    } else {
-      let html = `<div class="agenda-view">`;
-      for(const [ym, arr] of groups.entries()){
-        const [yy, mm] = ym.split('-').map(Number);
-        html += `<div class="ag-group"><div class="ag-month-hdr"><span>${MONTHS[mm-1]} ${yy}</span><span>${arr.length} Einträge</span></div>`;
-        for(const {it, idx} of arr){
-          const dObj = parseIso(it.start);
-          const dow = DOWS[(dObj.getDay()+6)%7];
-          html += `<div class="ag-item" onclick="showItemModal(${idx})">
-            <div class="ag-date-col">
-              <span class="ag-date-main">${dow}, ${fmtDateDE(it.start).slice(0,6)}</span>
-              <span class="ag-date-sub">KW ${getKW(dObj)}${it.time?' · '+esc(it.time):''}</span>
-            </div>
-            <div class="row-main">
-              <div class="row-title">${icon(it)} ${esc(it.what)}</div>
-              <div class="row-sub"><span>${esc(it.rel)}</span></div>
-            </div>
-            <span class="tag ${it.delta<0?'overdue':(it.kind==='goal'?'goal':'')}">${esc(deltaLabel(it.delta))}</span>
-          </div>`;
-        }
-        html += `</div>`;
-      }
-      html += `</div>`;
-      mainEl.innerHTML = html;
-    }
-  }
-}
-
-function renderSidebar(){
-  const s1T = document.getElementById('s1-title'), s1C = document.getElementById('s1-cnt'), s1L = document.getElementById('s1-list');
-  const s2T = document.getElementById('s2-title'), s2C = document.getElementById('s2-cnt'), s2L = document.getElementById('s2-list');
-  const s3T = document.getElementById('s3-title'), s3C = document.getElementById('s3-cnt'), s3L = document.getElementById('s3-list');
-  const coach = DATA.coach || {metrics:[], macro_goals:[], schedule:''};
-
-  if(filter==='coach'){
-    // Card 1: Goals & Macro Pillars
-    const datedGoals = DATA.items.map((it,idx)=>({it,idx})).filter(x => x.it.kind==='goal' && x.it.delta>=0 && x.it.status==='open');
-    const macros = coach.macro_goals || [];
-    s1T.textContent = '🏆 Saisonziele & Athletik-Fokus';
-    s1C.textContent = datedGoals.length + macros.length;
-    let gHtml = datedGoals.map(({it,idx}) => `
-      <div class="row" onclick="showItemModal(${idx})">
-        <div class="row-main">
-          <div class="row-title">🏆 ${esc(it.what)}</div>
-          <div class="row-sub">${fmtDateDE(it.start)} · ${esc(it.subkind||'Race')}</div>
-        </div>
-        <span class="tag goal">in ${it.delta}d (${(it.delta/7).toFixed(1)}w)</span>
-      </div>
-    `).join('');
-    gHtml += macros.map(m => `
-      <div class="row" style="cursor:default">
-        <div class="row-main">
-          <div class="row-title">🎯 ${esc(m.title)}</div>
-          <div class="row-sub">${esc(m.detail)}</div>
-        </div>
-        <span class="tag goal">${esc(m.cat||'Fokus')}</span>
-      </div>
-    `).join('');
-    s1L.innerHTML = gHtml || `<div class="empty-box">Keine Goals eingetragen.<div class="code-hint">- [ ] YYYY-MM-DD [goal:A] Rennen</div></div>`;
-
-    // Card 2: Workouts (-14d .. +14d)
-    const wos = DATA.items.map((it,idx)=>({it,idx})).filter(x => x.it.kind==='workout' && x.it.delta>=-14 && x.it.delta<=14);
-    s2T.textContent = '🚴 Trainingsblock (-14d bis +14d)';
-    s2C.textContent = wos.length;
-    s2L.innerHTML = wos.length ? wos.map(({it,idx}) => `
-      <div class="row" onclick="showItemModal(${idx})">
-        <div class="row-main">
-          <div class="row-title">${icon(it)} ${esc(it.what)}</div>
-          <div class="row-sub">
-            <span>${fmtDateDE(it.start)} · ${esc(it.subkind||'workout')}</span>
-            ${it.zwo_xml?`<span class="tag low" onclick="event.stopPropagation();downloadZwo(${idx})" title=".zwo herunterladen">⬇ .zwo</span>`:''}
-            ${it.feedback?`<span class="tag ok" title="${esc(it.feedback)}">✓ Notiz</span>`:(it.feedback_pending?`<span class="tag med">⚠ Check-in</span>`:'')}
-          </div>
-          ${renderWkoBars(it, false)}
-        </div>
-        <span class="tag ${it.status==='done'?'ok':''}">${it.status==='done'?'✓ erledigt':deltaLabel(it.delta)}</span>
-      </div>
-    `).join('') : `<div class="empty-box">
-      <div>Noch keine Einzel-Workouts für diese Woche in <code>calendar/README.md</code> geplant.</div>
-      <div class="code-hint" onclick="navigator.clipboard.writeText('- [ ] ${DATA.today} [workout:cycling] 90m Zone 2 / SweetSpot')">📋 Workout-Zeile kopieren</div>
-    </div>`;
-
-    // Card 3: 3-Epoch Power Curve & Blockers (28d)
-    const blk = DATA.items.map((it,idx)=>({it,idx})).filter(x => x.it.delta>=0 && x.it.delta<=28 && x.it.status==='open' && (x.it.kind==='blocked' || (x.it.kind==='event' && x.it.time)));
-    const pc = (coach.power_curve && coach.power_curve.fresh) || {};
-    const pcf = (coach.power_curve && coach.power_curve.fatigued) || {};
-    const durs = ['5s','1m','5m','20m','60m'].filter(d => pc[d]);
-    s3T.textContent = '⚡ 3-Epochen Power Curve & Blocker';
-    s3C.textContent = blk.length ? `${blk.length} Blocker` : 'MMP';
-    let c3Html = '';
-    if(durs.length){
-      c3Html += `<table class="pcurve-tbl"><thead><tr><th>Dauer</th><th>42d</th><th>90d</th><th>365d</th><th>&gt;1500kJ</th></tr></thead><tbody>` +
-        durs.map(d => {
-          const r = pc[d] || {};
-          const rf = pcf[d] || {};
-          return `<tr><td>${d}</td><td>${esc(r['42d']||'—')}</td><td>${esc(r['90d']||'—')}</td><td>${esc(r['365d']||'—')}</td><td>${esc(rf['42d']||rf['90d']||'—')}</td></tr>`;
-        }).join('') + `</tbody></table>`;
-    }
-    c3Html += blk.length ? blk.map(({it,idx}) => `
-      <div class="row" onclick="showItemModal(${idx})">
-        <div class="row-main">
-          <div class="row-title">${icon(it)} ${it.time?esc(it.time)+' ':''}${esc(it.what)}</div>
-          <div class="row-sub">${fmtDateDE(it.start)}${it.end!==it.start?'..'+fmtDateDE(it.end):''}</div>
-        </div>
-        <span class="tag high">${deltaLabel(it.delta)}</span>
-      </div>
-    `).join('') : `<div class="empty-box" style="border-color:rgba(16,185,129,0.3);color:#a7f3d0">✅ 100 % freie Trainingsverfügbarkeit in den nächsten 28 Tagen.</div>`;
-    s3L.innerHTML = c3Html;
-  } else if(filter==='todo'){
-    // Card 1: Open Backlog To-Dos
-    s1T.textContent = '☑️ Offene To-Dos (Backlog)';
-    s1C.textContent = DATA.todos.length;
-    s1L.innerHTML = DATA.todos.length ? DATA.todos.map(t => `
-      <div class="row">
-        <div class="row-main">
-          <div class="row-title">${esc(t.what)}</div>
-          <div class="row-sub">${esc(t.rel)}</div>
-        </div>
-        <span class="tag ${esc(t.prio)}">${esc(t.prio)}</span>
-      </div>
-    `).join('') : `<div class="empty-box">Keine offenen Backlog-To-Dos.</div>`;
-
-    // Card 2: Upcoming Deadlines (Next 90d)
-    const d90 = DATA.items.map((it,idx)=>({it,idx})).filter(x => isTodoItem(x.it) && x.it.delta>=-7 && x.it.delta<=90 && x.it.status==='open');
-    s2T.textContent = '⏳ Fristen & Stichtage (90 Tage)';
-    s2C.textContent = d90.length;
-    s2L.innerHTML = d90.length ? d90.map(({it,idx}) => `
-      <div class="row" onclick="showItemModal(${idx})">
-        <div class="row-main">
-          <div class="row-title">${icon(it)} ${esc(it.what)}</div>
-          <div class="row-sub">${fmtDateDE(it.start)} · ${esc(it.rel)}</div>
-        </div>
-        <span class="tag ${it.delta<0?'overdue':(it.delta<=14?'med':'')}">${deltaLabel(it.delta)}</span>
-      </div>
-    `).join('') : `<div class="empty-box">Keine Fristen in den nächsten 90 Tagen.</div>`;
-
-    // Card 3: Long-term Deadlines (> 90d)
-    const dLong = DATA.items.map((it,idx)=>({it,idx})).filter(x => isTodoItem(x.it) && x.it.delta>90 && x.it.status==='open');
-    s3T.textContent = '📆 Langfristige Stichtage (> 90d)';
-    s3C.textContent = dLong.length;
-    s3L.innerHTML = dLong.length ? dLong.map(({it,idx}) => `
-      <div class="row" onclick="showItemModal(${idx})">
-        <div class="row-main">
-          <div class="row-title">${icon(it)} ${esc(it.what)}</div>
-          <div class="row-sub">${fmtDateDE(it.start)} · ${esc(it.rel)}</div>
-        </div>
-        <span class="tag">${deltaLabel(it.delta)}</span>
-      </div>
-    `).join('') : `<div class="empty-box">Keine langfristigen Fristen.</div>`;
-  } else {
-    // Default 'all' view:
-    // Card 1: Next 30 Days Agenda (matches settings.md deadline_days=30!)
-    const ag30 = DATA.items.map((it,idx)=>({it,idx})).filter(x => keepItem(x.it) && x.it.delta>=0 && x.it.delta<=30 && x.it.status==='open');
-    s1T.textContent = '📅 Nächste 30 Tage (Agenda)';
-    s1C.textContent = ag30.length;
-    s1L.innerHTML = ag30.length ? ag30.map(({it,idx}) => `
-      <div class="row" onclick="showItemModal(${idx})">
-        <div class="row-main">
-          <div class="row-title">${icon(it)} ${it.time?esc(it.time)+' ':''}${esc(it.what)}</div>
-          <div class="row-sub">${fmtDateDE(it.start)}${it.end!==it.start?'..'+fmtDateDE(it.end):''} · ${esc(it.rel)}</div>
-        </div>
-        <span class="tag ${it.delta<=7?'med':''}">${deltaLabel(it.delta)}</span>
-      </div>
-    `).join('') : `<div class="empty-box">Keine Einträge in den nächsten 30 Tagen.</div>`;
-
-    // Card 2: Open To-Dos (Backlog)
-    s2T.textContent = '☑️ Offene To-Dos & Checklisten';
-    s2C.textContent = DATA.todos.length;
-    s2L.innerHTML = DATA.todos.length ? DATA.todos.map(t => `
-      <div class="row">
-        <div class="row-main">
-          <div class="row-title">${esc(t.what)}</div>
-          <div class="row-sub">${esc(t.rel)}</div>
-        </div>
-        <span class="tag ${esc(t.prio)}">${esc(t.prio)}</span>
-      </div>
-    `).join('') : `<div class="empty-box">Keine offenen To-Dos.</div>`;
-
-    // Card 3: Goals, Birthdays & Milestones
-    const hi = DATA.items.map((it,idx)=>({it,idx})).filter(x => x.it.delta>=0 && x.it.status==='open' && (x.it.kind==='goal' || x.it.kind==='birthday' || x.it.delta>30));
-    s3T.textContent = '🏆 Ziele, Geburtstage & Ausblick';
-    s3C.textContent = hi.length;
-    s3L.innerHTML = hi.length ? hi.map(({it,idx}) => `
-      <div class="row" onclick="showItemModal(${idx})">
-        <div class="row-main">
-          <div class="row-title">${icon(it)} ${esc(it.what)}</div>
-          <div class="row-sub">${fmtDateDE(it.start)} · ${esc(it.rel)}</div>
-        </div>
-        <span class="tag ${it.kind==='goal'?'goal':''}">${deltaLabel(it.delta)}</span>
-      </div>
-    `).join('') : `<div class="empty-box">Keine weiteren Jahrestermine.</div>`;
-  }
-}
-
-function render(){
-  for(const k of ['all','coach','todo']){
-    const el = document.getElementById('f-'+k);
-    if(el) el.classList.toggle('active', k===filter);
-  }
-  for(const l of ['month','week','agenda']){
-    const el = document.getElementById('v-'+l);
-    if(el) el.classList.toggle('active', l===layout);
-  }
-  const coachCnt = DATA.items.filter(isCoachItem).length + ((DATA.coach&&DATA.coach.macro_goals)||[]).length;
-  const todoCnt = DATA.items.filter(isTodoItem).length + DATA.todos.length;
-  document.getElementById('cnt-all').textContent = DATA.items.length;
-  document.getElementById('cnt-coach').textContent = coachCnt;
-  document.getElementById('cnt-todo').textContent = todoCnt;
-
-  renderKPIs();
-  renderMain();
-  renderSidebar();
-}
-
-// Keyboard shortcuts
-document.addEventListener('keydown', e => {
-  if(e.target.tagName==='INPUT' || e.target.tagName==='TEXTAREA'){
-    if(e.key==='Escape') e.target.blur();
-    return;
-  }
-  if(e.key==='Escape') closeModal();
-  else if(e.key==='ArrowLeft') stepNav(-1);
-  else if(e.key==='ArrowRight') stepNav(1);
-  else if(e.key==='t' || e.key==='T') goToday();
-  else if(e.key==='1') setFilter('all');
-  else if(e.key==='2') setFilter('coach');
-  else if(e.key==='3') setFilter('todo');
-  else if(e.key==='m' || e.key==='M') setLayout('month');
-  else if(e.key==='w' || e.key==='W') setLayout('week');
-  else if(e.key==='a' || e.key==='A') setLayout('agenda');
-  else if(e.key==='/'){ e.preventDefault(); document.getElementById('q-in').focus(); }
-});
-
-// Seamless background live-sync (preserves filter, month & scroll state without page reload flash!)
-setInterval(async () => {
-  try {
-    const res = await fetch(window.location.href, {cache: 'no-store'});
-    if(!res.ok) return;
-    const html = await res.text();
-    const m = html.match(/let DATA = (\\{.*?\\});\\n/);
-    if(m){
-      const nextData = JSON.parse(m[1]);
-      if(JSON.stringify(nextData) !== JSON.stringify(DATA)){
-        DATA = nextData;
-        render();
-      }
-    }
-  } catch(_e){}
-}, 15000);
-
-render();
-</script></body></html>
-"""
-
-
-CAL_SERVER_SCRIPT = """import functools, http.server, os, subprocess, sys, urllib.parse
-sys.stdout = sys.stderr = open(os.devnull, "w")
-PORT = int(sys.argv[1])
-CACHE_DIR = os.path.abspath(sys.argv[2])
-BRAIN_DIR = os.path.normpath(os.path.join(CACHE_DIR, "..", ".."))
-ATLAS_PY = os.path.join(BRAIN_DIR, "_atlas", "tools", "atlas.py")
-
-def _get_cid():
-    p = os.path.join(BRAIN_DIR, "_secrets", "strava.env")
-    if os.path.isfile(p):
-        try:
-            for line in open(p, encoding="utf-8"):
-                if line.strip().startswith("STRAVA_CLIENT_ID="):
-                    v = line.split("=", 1)[1].strip()
-                    if v:
-                        return v
-        except OSError:
-            pass
-    return "91804"
-
-class _QuietHandler(http.server.SimpleHTTPRequestHandler):
-    def log_message(self, *args, **kwargs):
-        pass
-    def do_GET(self):
-        parsed = urllib.parse.urlparse(self.path)
-        if parsed.path == "/healthz":
-            body = b"atlas-cal-v2"
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        if parsed.path == "/strava-connect":
-            cid = _get_cid()
-            redir = urllib.parse.quote(f"http://127.0.0.1:{PORT}/strava-callback", safe="")
-            url = (f"https://www.strava.com/oauth/authorize?client_id={cid}&response_type=code"
-                   f"&redirect_uri={redir}&approval_prompt=force&scope=read,activity:read,activity:read_all,profile:read_all")
-            self.send_response(302)
-            self.send_header("Location", url)
-            self.end_headers()
-            return
-        if parsed.path in ("/strava-callback", "/callback"):
-            qs = urllib.parse.parse_qs(parsed.query)
-            code = (qs.get("code") or [None])[0]
-            ok = False
-            if code and os.path.isfile(ATLAS_PY):
-                res = subprocess.run([sys.executable, "-I", ATLAS_PY, "coach", "auth-strava", "--code", code, "--execute"],
-                                     capture_output=True, text=True, timeout=90)
-                ok = res.returncode == 0
-            msg = "&#10003; Atlas Coach erfolgreich mit Strava verbunden &amp; synchronisiert!" if ok else "Strava-Verbindung fehlgeschlagen oder abgebrochen."
-            col = "#34d399" if ok else "#f43f5e"
-            body = (f"<!DOCTYPE html><html><head><meta charset='utf-8'><title>Atlas · Strava Connect</title></head>"
-                    f"<body style='font-family:Inter,sans-serif;background:#070a0f;color:{col};display:flex;align-items:center;"
-                    f"justify-content:center;height:100vh;margin:0'><div style='background:#0d121b;border:1px solid rgba(255,255,255,0.1);"
-                    f"padding:32px 40px;border-radius:14px;text-align:center;max-width:480px'><h2 style='margin:0 0 12px'>{msg}</h2>"
-                    f"<p style='color:#94a3b8;font-size:14px;margin:0 0 18px'>Weiterleitung zum Atlas Coach Dashboard…</p>"
-                    f"<a href='/calendar.html?view=coach' style='color:#38bdf8;font-weight:600;text-decoration:none'>Jetzt zum Coach Dashboard &rarr;</a>"
-                    f"</div><script>sessionStorage.setItem('atlas_cal_filter','coach');setTimeout(()=>location.href='/calendar.html?view=coach',900);</script>"
-                    f"</body></html>").encode("utf-8")
-            self.send_response(200 if ok else 400)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        if parsed.path == "/strava-sync":
-            if os.path.isfile(ATLAS_PY):
-                subprocess.run([sys.executable, "-I", ATLAS_PY, "coach", "sync", "--days", "90", "--execute"],
-                               capture_output=True, text=True, timeout=90)
-            self.send_response(302)
-            self.send_header("Location", "/calendar.html?view=coach")
-            self.end_headers()
-            return
-        return super().do_GET()
-
-handler = functools.partial(_QuietHandler, directory=CACHE_DIR)
-http.server.ThreadingHTTPServer(("127.0.0.1", PORT), handler).serve_forever()
-"""
+CAL_TEMPLATE = cal_engine.load_calendar_template()
+CAL_SERVER_SCRIPT = cal_engine.CAL_SERVER_SCRIPT
 
 
 def _cal_http_ok(port):
-    """Verify the calendar server returns HTTP 200 on /healthz (v2 with /strava-connect and /strava-callback)."""
-    import urllib.request
-    try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=0.25) as resp:
-            return resp.status == 200 and b"atlas-cal-v2" in resp.read()
-    except Exception:
-        return False
+    """Verify the calendar server returns HTTP 200 on `/healthz` (`atlas-cal-v3`)."""
+    return cal_engine.cal_http_ok(port)
 
 
 def _ensure_calendar_server(cache_dir, start_server=False):
-    """Ensure a local HTTP server serves cache_dir so http://127.0.0.1:<port>/calendar.html opens rendered in browsers
-    instead of as raw HTML source code in IDE editors (which intercept file:// links)."""
-    import socket
-    port_file = os.path.join(cache_dir, "cal_port.txt")
-    port = 8765
-    try:
-        with open(port_file, encoding="utf-8") as fh:
-            port = int(fh.read().strip())
-    except (OSError, ValueError):
-        pass
-    if not start_server or PROBE or os.environ.get("ATLAS_NO_CAL_SERVER"):
-        return f"http://127.0.0.1:{port}/calendar.html"
-    if _cal_http_ok(port):
-        return f"http://127.0.0.1:{port}/calendar.html"
-    if os.name == "nt":
-        # Clean up any legacy pythonw.exe -m http.server or older _cal_server.py
-        try:
-            kill_ps = ("Get-CimInstance Win32_Process -Filter \"Name LIKE 'python%' AND (CommandLine LIKE '%http.server%' OR CommandLine LIKE '%_cal_server.py%')\" "
-                       "| Invoke-CimMethod -MethodName Terminate | Out-Null")
-            subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", kill_ps],
-                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           timeout=4, creationflags=0x08000000)
-            time.sleep(0.15)
-        except Exception:
-            pass
-    else:
-        try:
-            subprocess.run(["pkill", "-f", "_cal_server.py"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, timeout=2)
-            time.sleep(0.1)
-        except Exception:
-            pass
-    for cand in range(8765, 8795):
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.bind(("127.0.0.1", cand))
-                port = cand
-                break
-        except OSError:
-            continue
-    try:
-        srv_script = os.path.join(cache_dir, "_cal_server.py")
-        with open(srv_script, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write(CAL_SERVER_SCRIPT)
-        with open(port_file, "w", encoding="utf-8") as fh:
-            fh.write(str(port))
-        py_exe = sys.executable
-        if os.name == "nt":
-            pyw = os.path.join(os.path.dirname(py_exe), "pythonw.exe")
-            if os.path.isfile(pyw):
-                py_exe = pyw
-        server_cmd = [py_exe, "-I", srv_script, str(port), cache_dir]
-        if os.name == "nt":
-            # Antigravity/VS Code run_command on Windows uses a Job Object with KILL_ON_JOB_CLOSE that kills normal
-            # child processes when atlas.py exits. Spawning via WMI Win32_Process.Create launches outside the Job Object.
-            cmdline = subprocess.list2cmdline(server_cmd).replace("'", "''")
-            wdir = cache_dir.replace("'", "''")
-            ps = (f"$si = New-CimInstance -ClientOnly -ClassName Win32_ProcessStartup -Property @{{ShowWindow=[uint16]0}}; "
-                  f"Invoke-CimMethod -ClassName Win32_Process -MethodName Create "
-                  f"-Arguments @{{CommandLine='{cmdline}'; CurrentDirectory='{wdir}'; ProcessStartupInformation=$si}} | Out-Null")
-            subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", ps],
-                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           timeout=5, creationflags=0x08000000)
-        else:
-            subprocess.Popen(server_cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL, close_fds=True, start_new_session=True)
-        for _ in range(20):
-            if _cal_http_ok(port):
-                break
-            time.sleep(0.1)
-    except Exception:
-        pass
-    return f"http://127.0.0.1:{port}/calendar.html"
+    """Ensure a loopback HTTP server serves `cache_dir` (`127.0.0.1:<port>/calendar.html`)."""
+    return cal_engine.ensure_calendar_server(
+        cache_dir,
+        start_server=start_server,
+        probe=PROBE,
+        tools_dir=_TOOLS_DIR,
+        hook_py=os.path.abspath(__file__),
+    )
 
 
 def render_calendar_html(idx=None, start_server=False):
-    """Generate brain/_atlas/cache/calendar.html (0 LLM tokens) and return its rendered http://127.0.0.1 URL."""
+    """Generate `brain/_atlas/cache/calendar.html` (0 LLM tokens) and return its rendered `http://127.0.0.1` URL."""
     if idx is None:
         idx = load_index(budget=INDEX_BUDGET_S)
     raw_items = calendar_items(idx, days=365, past_days=90, include_done=True)
     serial = [{k: (v.isoformat() if isinstance(v, dt.date) else v) for k, v in it.items()} for it in raw_items]
-    todos = [{"status": t["status"], "prio": t["prio"], "what": t["what"], "rel": t["rel"]}
-             for t in open_todos(include_done=False)]
+    todos = [
+        {
+            "status": t["status"],
+            "prio": t["prio"],
+            "what": t["what"],
+            "rel": t["rel"],
+            "line": t.get("line", 0),
+            "can_toggle": bool(t.get("can_toggle", False)),
+        }
+        for t in open_todos(include_done=False)
+    ]
     try:
         coach = _extract_coach_context(idx, cal_items=raw_items)
         c_state = load_coach_state()
     except Exception:
-        coach = {"metrics": [], "ftp_watts": 275, "macro_goals": [], "schedule": ""}
+        coach = {"depth": "standard", "metrics": [], "ftp_watts": 275, "macro_goals": [], "schedule": ""}
         c_state = {"activities": []}
     ftp_w = coach.get("ftp_watts", 275) or 275
     acts_by_date = {}
@@ -2348,19 +1347,34 @@ def render_calendar_html(idx=None, start_server=False):
         if day_acts:
             act = day_acts[0]
             it["strava_id"] = act.get("id")
-            if act.get("np_w"):
-                it["np_w"] = act.get("np_w")
-            if act.get("avg_hr"):
-                it["avg_hr"] = act.get("avg_hr")
+            for k_act in ("np_w", "avg_hr", "tss", "w_bal_min_pct", "matches_burned", "cho_burn_g"):
+                if act.get(k_act) is not None:
+                    it[k_act] = act[k_act]
             if act.get("feedback") and str(act["feedback"]).lower() != "pending":
                 it["feedback"] = str(act["feedback"]).strip()
                 it["feedback_pending"] = False
             elif it.get("status") == "done" and not it.get("feedback"):
                 it["feedback_pending"] = True
-    payload = {"today": dt.date.today().isoformat(), "items": serial, "todos": todos, "coach": coach}
-    html = CAL_TEMPLATE.replace("__DATA_JSON__", json.dumps(payload, ensure_ascii=False))
+
     cache_dir = os.path.dirname(CAL_HTML)
     os.makedirs(cache_dir, exist_ok=True)
+    csrf_tok = cal_engine.get_or_create_csrf_token(cache_dir)
+    try:
+        graph_data = cal_engine.build_brain_graph_payload(BRAIN, idx=idx, db_path=CACHE)
+    except Exception:
+        graph_data = {"nodes": [], "edges": [], "stats": {"nodes": 0, "edges": 0}}
+
+    payload = {
+        "today": dt.date.today().isoformat(),
+        "csrf_token": csrf_tok,
+        "items": serial,
+        "todos": todos,
+        "coach": coach,
+        "graph": graph_data,
+    }
+    atlas_dir = os.path.join(BRAIN, "_atlas")
+    tpl = cal_engine.load_calendar_template(atlas_dir=atlas_dir)
+    html = tpl.replace("__DATA_JSON__", cal_engine.safe_json_for_script(payload))
     try:
         with open(CAL_HTML, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(html)
@@ -2388,18 +1402,44 @@ def maintenance_due(s):
     return due, int(age), changed
 
 
+OFFLINE_ERR_RX = re.compile(
+    r"(?i)(could not resolve host|unable to access|network is unreachable|connection refused|"
+    r"connection timed out|operation timed out|timed out|temporary failure|no route to host|"
+    r"failed to connect|ssh: connect to host|could not read from remote repository|"
+    r"does not appear to be a git repository)"
+)
+CONFLICT_ERR_RX = re.compile(r"(?i)(\bconflict\b|could not apply|merge conflict|unmerged files)")
+
+
 def pull():
-    """Multi-device: fetch the newest brain before the chat starts. On conflict abort cleanly and say so."""
+    """Multi-device: fetch the newest brain before the chat starts.
+
+    Offline / DNS / unreachable remotes fail silently; real rebase/merge conflicts abort cleanly and notify.
+    """
     if not os.path.isdir(os.path.join(BRAIN, ".git")) or not _git("remote").stdout.strip():
         return ""
     if _git("status", "--porcelain").stdout.strip():
         _git("add", "-A")
         _git("commit", "-q", "-m", "atlas: auto-commit before pull")
-    res = _git("pull", "-q", "--rebase", timeout=8)
+    try:
+        res = _git("pull", "-q", "--rebase", timeout=8)
+    except subprocess.TimeoutExpired:
+        return ""
     if res.returncode == 0:
         return ""
+    err_out = f"{res.stderr or ''}\n{res.stdout or ''}"
+    in_rebase = (
+        os.path.exists(os.path.join(BRAIN, ".git", "rebase-merge"))
+        or os.path.exists(os.path.join(BRAIN, ".git", "rebase-apply"))
+    )
+    if in_rebase or CONFLICT_ERR_RX.search(err_out):
+        _git("rebase", "--abort")
+        return ("Sync: pulling the brain from its remote hit a merge conflict (rebase aborted cleanly; local files "
+                "untouched). Tell the user and resolve it with them (git -C brain pull --rebase).")
+    if OFFLINE_ERR_RX.search(err_out):
+        return ""
     _git("rebase", "--abort")
-    return ("Sync: pulling the brain from its remote failed (conflict or offline). Tell the user; if it is a conflict, "
+    return ("Sync: pulling the brain from its remote failed. Tell the user; if it is a conflict, "
             "resolve it with them (git -C brain pull --rebase).")
 
 
@@ -2446,9 +1486,16 @@ def session_text(cwd, session):
     s = settings()
     st = _state()
     lines = ["Atlas · ok"]
+    fresh_err = _recent_hook_error(st)
+    if fresh_err:
+        err_iso, err_sum = fresh_err
+        lines.append(f"Hook warning (recent logged error in _atlas/cache/hook_errors.log): {err_sum}")
+        if not PROBE:
+            st["last_error_notified"] = err_iso
     try:
         msg = "" if PROBE else pull()
-    except Exception:
+    except Exception as exc:
+        _log_hook_error("session.pull", exc)
         msg = ""
     if msg:
         lines.append(msg)
@@ -2476,17 +1523,26 @@ def session_text(cwd, session):
             try:
                 cal_uri = render_calendar_html(idx, start_server=True)
                 parts.append(f"Visual calendar: [📅 Kalender öffnen]({cal_uri}) (include this clickable link in the briefing)")
-            except Exception:
-                pass
+            except Exception as exc:
+                _log_hook_error("session.render_calendar", exc)
         try:
             if "coach" in st.get("modules", []) or os.path.isdir(os.path.join(BRAIN, "coach")):
                 c_state = load_coach_state()
                 pend = c_state.get("pending_feedback", [])
                 if pend:
                     p0 = pend[0]
-                    parts.append(f"Coach check-in: Ride '{p0.get('name', 'Workout')}' on {p0.get('date')} ({p0.get('duration_min', 0)}m, NP {p0.get('np_w') or '—'}W) has no athlete feedback note yet. Ask 1 short question how it felt (RPE/legs) and save via `atlas.py coach note --date {p0.get('date')} --text \"...\"`.")
+                    np_bit = f", NP {p0.get('np_w')}W" if p0.get("np_w") else ""
+                    parts.append(f"Coach check-in: Session '{p0.get('name', 'Workout')}' on {p0.get('date')} ({p0.get('duration_min', 0)}m{np_bit}) has no feedback note yet. Ask 1 short question how it felt and save via `atlas.py coach note --date {p0.get('date')} --text \"...\"`.")
+        except Exception as exc:
+            _log_hook_error("session.coach", exc)
+        try:
+            open_conf = graph_engine.open_conflicts(BRAIN, CONFLICTS_FILE)
         except Exception:
-            pass
+            open_conf = []
+        if open_conf:
+            c_preview = "; ".join(f"[{c.get('id')}] {c.get('summary')}" for c in open_conf[:3])
+            parts.append(f"Conflicts ({len(open_conf)} open in _atlas/conflicts.json): {c_preview}. "
+                         "Resolve with the user (`atlas.py conflicts`).")
         inbox = os.path.join(BRAIN, "inbox")
         waiting = [f for f in os.listdir(inbox) if not f.startswith(".") and f.lower() != "readme.md"] \
             if os.path.isdir(inbox) else []
@@ -2500,7 +1556,7 @@ def session_text(cwd, session):
         mdue, mage, mchanged = maintenance_due(s)
         if mdue:
             parts.append(f"Maintenance due ({mage} d, {mchanged} pages changed): after the user's first request run "
-                         "/atlas-maintain (Claude: in a subagent), report in at most 3 lines.")
+                         "/atlas-maintain (in the atlas-maintainer subagent), report in at most 3 lines.")
         upd = last_mark("update-check")
         if not upd or (_age_days(upd[0]) or 0) > UPDATE_DAYS:
             parts.append("Update check is due: offer /atlas-update.")
@@ -2510,7 +1566,8 @@ def session_text(cwd, session):
                 parts.append(f"Backup: last push of the brain is older than {PUSH_REMIND_DAYS} days.")
         try:
             foreign = foreign_items(_root(), os.path.expanduser("~"))
-        except Exception:
+        except Exception as exc:
+            _log_hook_error("session.foreign_items", exc)
             foreign = []
         if foreign:
             parts.append(f"{len(foreign)} rule/skill/text item(s) outside Atlas (e.g. from Antigravity /learn): "
@@ -2524,8 +1581,8 @@ def session_text(cwd, session):
         if not PROBE:
             try:
                 render_calendar_html(idx, start_server=True)
-            except Exception:
-                pass
+            except Exception as exc:
+                _log_hook_error("session.render_calendar", exc)
         urgent = [d for d in due if d[1] <= 0]
         if urgent:
             lines.append("Due today/overdue (mention only if relevant or due today): " + "; ".join(
@@ -2656,55 +1713,11 @@ def _grep_counts(term, word):
 
 
 def hints(prompt, idx, skip_pages):
-    vocab = _vocab(idx, skip_pages)
-    low, comp = _norm_text(prompt), re.sub(r"[^a-z0-9]", "", _norm_text(prompt))
-    cands = {}
-    for t in vocab:
-        tl = _norm_text(t)
-        if re.search(r"(?<![\w-])" + re.escape(tl) + r"(?![\w-])", low):
-            cands[t] = True
-        elif len(re.sub(r"[^a-z0-9]", "", tl)) >= 6 and re.sub(r"[^a-z0-9]", "", tl) in comp:
-            cands[t] = True
-    for m in TOKEN_ID.finditer(prompt):
-        cands.setdefault(m.group(0), False)
-    # Tags (and their synonyms from tags.md) point straight at the pages carrying them; a page that still uses a
-    # synonym as tag counts too (maintenance normalises it later).
-    vocab_tags = tag_vocab()
-    canon = {s: t for t, syns in vocab_tags.items() for s in syns}
-    tag_pages = {}
-    for tag, syns in vocab_tags.items():
-        for word in [tag] + syns:
-            if len(word) >= 3 and re.search(r"(?<![\w-])" + re.escape(_norm_text(word)) + r"(?![\w-])", low):
-                tag_pages[tag] = [r for r, e in idx.items() if r not in skip_pages
-                                  and tag in {canon.get(t, t) for t in e.get("tags", [])}]
-                break
-    if not cands and not tag_pages:
-        return []
-    n = max(len(idx), 1)
-    scores, hits = {}, {}
-    for tag, pages in tag_pages.items():
-        if pages and len(pages) <= MAX_DF_SHARE * n:
-            idf = math.log(1 + n / len(pages))
-            for rel in pages:
-                scores[rel] = scores.get(rel, 0.0) + 1.5 * idf
-                hits.setdefault(rel, set()).add("#" + tag)
-    for term, word in list(cands.items())[:12]:
-        try:
-            counts = _grep_counts(term, word)
-        except Exception:
-            continue
-        counts = {p: c for p, c in counts.items() if p not in skip_pages}
-        if not counts or len(counts) > MAX_DF_SHARE * n:
-            continue
-        idf = math.log(1 + n / len(counts))
-        for rel, c in counts.items():
-            score = idf * (1 + math.log(c)) * (1.3 if rel.startswith(CANONICAL) else 1.0)
-            if vocab.get(term) == rel:
-                score += 2 * idf
-            scores[rel] = scores.get(rel, 0.0) + score
-            hits.setdefault(rel, set()).add(term)
-    ranked = sorted(scores, key=lambda r: (-scores[r], r))[:MAX_HINTS]
-    return [(rel, idx.get(rel, {}).get("summary", ""), sorted(hits[rel], key=str.lower)[:4]) for rel in ranked]
+    direct, _neighbors = graph_engine.compute_prompt_hints(
+        BRAIN, prompt, idx, tag_vocab(), _vocab(idx, skip_pages), skip_pages,
+        max_hints=MAX_HINTS, max_df_share=MAX_DF_SHARE, db_path=CACHE,
+    )
+    return direct
 
 
 def _session(st, session):
@@ -2727,12 +1740,14 @@ COACH_RX_PLAN14 = re.compile(
     r"trainingsplan\s+(?:f[uü]r|schreiben|erstellen|planen)|workouts?\s+(?:planen|erstellen|schreiben)|wochenplan\s+training)\b"
 )
 COACH_RX_CHECKIN = re.compile(
-    r"(?i)\b(?:rpe\s*\d|beine\s+waren|puls\s+war|strava\s+sync\w*|ride\s+check-?in|feedback\s+zum\s+(?:ride|training|workout)|"
+    r"(?i)\b(?:rpe\s*\d|beine\s+waren|puls\s+war|ruhepuls\s+\d|rhr\s+\d|strava\s+sync\w*|"
+    r"ride\s+check-?in|readiness\s+check|feedback\s+zum\s+(?:ride|training|workout|lauf)|"
     r"training\s+gestern\s+war|einheit\s+gestern)\b"
 )
 COACH_RX_DAILY = re.compile(
     r"(?i)\b(?:mein\s+workout|workout\s+heute|workout\s+morgen|was\s+trainier\w+\s+ich|heutiges?\s+(?:workout|training)|"
-    r"training\s+heute|training\s+morgen|intervall-?training|\.zwo\b|karoo\s+workout|ftp\s+test|sweet\s*spot\s+workout)\b"
+    r"training\s+heute|training\s+morgen|intervall-?training|\.zwo\b|karoo\s+workout|ftp\s+test|sweet\s*spot\s+workout|"
+    r"tagesform\s+training|readiness\s+heute)\b"
 )
 
 
@@ -2786,8 +1801,9 @@ def prompt_text(prompt, cwd, session):
             stale_note = ""
             if c_macro and c_macro.get("stale") and c_mode in ("plan-14d", "macro"):
                 stale_note = f" Macro plan is STALE ({c_macro.get('stale_reason')}) -> update brain/coach/macro-plan.md FIRST before writing 14d workouts."
+            depth_flag = " --depth pro" if coach_engine.PRO_QUERY_RX.search(prompt) else ""
             lines.append(
-                f"Atlas coach -> mode '{c_mode}' ({c_why}). Run `python -I {_show('_atlas/tools/atlas.py', cwd)} coach context --mode {c_mode}` "
+                f"Atlas coach -> mode '{c_mode}' ({c_why}). Run `python -I {_show('_atlas/tools/atlas.py', cwd)} coach context --mode {c_mode}{depth_flag}` "
                 f"and follow {_show('_atlas/procedures/coach.md', cwd)}.{stale_note}"
             )
             sess["coach_mode"] = c_mode
@@ -2798,11 +1814,19 @@ def prompt_text(prompt, cwd, session):
     skip = {p["page"] for p, _ in routes}
     # File paths in the message are routing input, not search terms ("C:/Atlas/code/shop" must not hint "Atlas").
     plain = re.sub(r"[A-Za-z]:[\\/][^\s\"'`]*|~?/[\w.-]+/[^\s\"'`]*", " ", prompt)
-    found = hints(plain, idx, skip) if len(plain.strip()) >= 3 else []
+    if len(plain.strip()) >= 3:
+        found, linked = graph_engine.compute_prompt_hints(
+            BRAIN, plain, idx, tag_vocab(), _vocab(idx, skip), skip,
+            max_hints=MAX_HINTS, max_df_share=MAX_DF_SHARE, db_path=CACHE,
+        )
+    else:
+        found, linked = [], []
     if found:
         lines.append("Atlas pages for this message (leads; open only what you need):")
         for rel, summary, terms in found:
             lines.append(f"- {_show(rel, cwd)}" + (f" — {summary}" if summary else "") + f" [{', '.join(terms)}]")
+        for n_rel, n_sum, _via, _kind in linked:
+            lines.append(f"  ↳ linked: {_show(n_rel, cwd)}" + (f" — {n_sum}" if n_sum else ""))
     _save_state(st)
     return "\n".join(lines)
 
@@ -2837,6 +1861,20 @@ def autocommit_and_push():
     _save_state(st)
 
 
+def _autolink_daily_entry(line_text, journal_dir):
+    """Turn recognized existing `brain/` paths in a daily-log line into relative Markdown links."""
+    masked = re.sub(r"!?\[[^\]]*\]\([^)]*\)", lambda m: " " * len(m.group(0)), line_text)
+    out = line_text
+    for m in reversed(list(graph_engine.BRAIN_PATH_RX.finditer(masked))):
+        raw_p = m.group(2)
+        rel = raw_p[6:] if raw_p.startswith("brain/") else raw_p
+        full = os.path.join(BRAIN, rel)
+        if os.path.isfile(full):
+            href = os.path.relpath(full, journal_dir).replace("\\", "/")
+            out = out[:m.start()] + f"[{raw_p}]({href})" + out[m.end():]
+    return out
+
+
 def daily_log(text, context):
     """Append the `Atlas:` line(s) to journal/<year>/<date>.md (0 tokens: the script writes it)."""
     # Antigravity transcripts are JSON: cut the line where the JSON string ends ("}, ", ...).
@@ -2847,7 +1885,8 @@ def daily_log(text, context):
         return
     today = dt.date.today().isoformat()
     path = os.path.join(BRAIN, "journal", today[:4], f"{today}.md")
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    jdir = os.path.dirname(path)
+    os.makedirs(jdir, exist_ok=True)
     try:
         with open(path, encoding="utf-8") as fh:
             current = fh.read()
@@ -2855,7 +1894,12 @@ def daily_log(text, context):
         current = (f"---\nsummary: Daily log {today} (written by the stop hook from `Atlas:` lines)\n"
                    f"tags: [log]\n---\n# {today} · Log\n\n")
     stamp = dt.datetime.now().strftime("%H:%M")
-    new = [f"- {stamp} · {context} · {f[:300]}" for f in found if f[:300] not in current]
+    new = []
+    for f in found:
+        raw_cut = f[:300]
+        linked = _autolink_daily_entry(raw_cut, jdir)
+        if raw_cut not in current and linked not in current:
+            new.append(f"- {stamp} · {context} · {linked}")
     if new:
         body = current.rstrip("\n")
         with open(path, "w", encoding="utf-8", newline="\n") as fh:
@@ -2927,6 +1971,37 @@ def _decide(session, marker_seen, did_work):
     return reason
 
 
+def _calendar_needs_render():
+    """Return True only when `CAL_HTML` is missing or relevant calendar/coach/due sources are newer than `CAL_HTML`."""
+    try:
+        if not os.path.isfile(CAL_HTML):
+            return True
+        cal_mtime = os.path.getmtime(CAL_HTML)
+    except OSError:
+        return True
+    for single in (os.path.join(BRAIN, "settings.md"), os.path.join(BRAIN, "_secrets", "strava.env")):
+        try:
+            if os.path.isfile(single) and os.path.getmtime(single) > cal_mtime:
+                return True
+        except OSError:
+            pass
+    for sub in ("calendar", "coach", "areas", "projects", "people", "self"):
+        base = os.path.join(BRAIN, sub)
+        if not os.path.isdir(base):
+            continue
+        for dp, dns, fns in os.walk(base):
+            dns[:] = [d for d in dns if not d.startswith(".")]
+            for fn in fns:
+                if not fn.lower().endswith((".md", ".json")):
+                    continue
+                try:
+                    if os.path.getmtime(os.path.join(dp, fn)) > cal_mtime:
+                        return True
+                except OSError:
+                    continue
+    return False
+
+
 def stop(agent, data):
     if PROBE:
         return
@@ -2949,16 +2024,17 @@ def stop(agent, data):
     if s.get("daily_log", "on") != "off":
         try:
             daily_log(last, context)
-        except Exception:
-            pass
+        except Exception as exc:
+            _log_hook_error("stop.daily_log", exc)
     try:
-        render_calendar_html()
-    except Exception:
-        pass
+        if _calendar_needs_render():
+            render_calendar_html()
+    except Exception as exc:
+        _log_hook_error("stop.render_calendar", exc)
     try:
         autocommit_and_push()
-    except Exception:
-        pass
+    except Exception as exc:
+        _log_hook_error("stop.autocommit", exc)
     marker = bool(MARKER.search(last))
     if agent == "claude":
         if data.get("stop_hook_active"):
@@ -3016,6 +2092,7 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except Exception:
-        pass
+    except Exception as exc:
+        _log_hook_error("main", exc)
+    sys.exit(0)
     sys.exit(0)

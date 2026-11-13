@@ -9,18 +9,17 @@ counterpart.)
 ## 1. Open with the Gap Radar (3–5 bullet overview)
 
 Before asking your first question, scan `self/README.md`, `calendar/README.md`, `areas/`, `projects/`, `people/`,
-`atlas.py check`, and `atlas.py calendar`. Check the core life pillars for missing or incomplete facts:
+`atlas.py check`, `atlas.py conflicts list`, and `atlas.py calendar`. Check both **missing pillars** and **bi-temporal / conflict hygiene**:
+- **Stale, expiring & conflicting facts (highest priority):** Check `atlas.py check` for pages whose `verified:` date is older than 365 days or whose `valid_until:` window is expired/within 30 days, and check `atlas.py conflicts list` for open contradictions across pages.
 - **Finances & cashflow:** Income, fixed costs, savings/investments, budget structure, tax basics.
 - **Contracts & insurances:** Health, liability (Haftpflicht), disability (BU), car/home insurance, electricity,
-  internet, mobile, subscriptions — specifically monthly/yearly costs, notice periods, and renewal dates (`due:`).
+  internet, mobile, subscriptions — specifically monthly/yearly costs, notice periods, renewal dates (`due:`), and validity windows (`valid_until:`).
 - **Housing, mobility & assets:** Rent/mortgage details, vehicle data, key equipment/inventory.
 - **Projects & goals:** Active projects lacking a clear next milestone, target date (`due:`), or status.
 - **Key people & dates:** Important contacts without relationship role, birthday (`due:`), or key facts.
 - **Health & daily setup:** Routines, check-ups, key metrics, or constraints.
 
-Start by showing the user a crisp **3–5 bullet Gap Radar**: what is already solid, where the biggest factual blind spots
-are, and **why** filling each gap makes Atlas more useful (e.g., *"If we add your insurance and internet contracts with
-their notice periods, I can warn you in the briefing before they auto-renew and spot where you overpay"*).
+Start by showing the user a crisp **3–5 bullet Gap Radar**: what is already solid, any stale/expiring/conflicting facts to re-verify, where the biggest factual blind spots are, and **why** filling each gap makes Atlas more useful (e.g., *"If we add your insurance and internet contracts with their notice periods, I can warn you in the briefing before they auto-renew and spot where you overpay"*).
 
 ## 2. How to run the fact-check round
 
@@ -29,8 +28,8 @@ their notice periods, I can warn you in the briefing before they auto-renew and 
    drop a PDF, screenshot, or contract into the chat** so you extract the numbers and dates yourself.
 2. **One question at a time, crisp and pragmatic:** Keep questions short and factual (who, what, how much, when, notice
    period). Always offer an easy way out ("skip", "next area", "enough").
-3. **File each answer immediately** in its canonical place with `summary:`, `tags:`, and `due: YYYY-MM-DD what` for any
-   deadline, renewal date, or birthday — never wait until the end of the chat.
+3. **File each answer immediately with bi-temporal provenance:** Write confirmed facts into their canonical page with
+   `summary:`, `tags:`, `verified: YYYY-MM-DD` (today's verification date), `valid_until: YYYY-MM-DD` when a contract/tariff/ID has a fixed expiry, `sources:` when backed by a filed PDF/mail, and `due: YYYY-MM-DD what` for any deadline, renewal date, or birthday — never wait until the end of the chat. Resolve any clarified contradiction via `atlas.py conflicts resolve <ID> --resolution "..."`.
 4. **Stop after about 8–10 questions** (or earlier when answers get short) and summarise in two lines what new facts and
    deadlines Atlas now tracks. If the user wants to go beyond hard facts into a deeper, personal conversation, offer to
    switch into `/atlas-deep`.

@@ -32,13 +32,13 @@ You can invoke the mail engine either via `atlas.py mail ...` or directly via `a
    ```bash
    python -I "<ROOT>/brain/_atlas/tools/atlas.py" mail folders -a <account>
    ```
-3. **List messages in a folder (with `UNSEEN`, `★`, `↩` `FLAGS` & `LABELS` badges):**
+3. **List messages in a folder (fast header-only `BODY.PEEK[HEADER.FIELDS (...)]` by default; pass `--with-body` for snippets):**
    ```bash
-   python -I "<ROOT>/brain/_atlas/tools/atlas.py" mail list -a <account> -f INBOX -n 50 [--unread] [--flagged] [--since YYYY-MM-DD]
+   python -I "<ROOT>/brain/_atlas/tools/atlas.py" mail list -a <account> -f INBOX -n 50 [--unread] [--flagged] [--since YYYY-MM-DD] [--with-body]
    ```
-4. **Search messages (Subject, From, To, Body, attachment filenames, and labels):**
+4. **Search messages (server-side `UID SEARCH` first with automatic client-side fallback for labels/filenames/UTF-8):**
    ```bash
-   python -I "<ROOT>/brain/_atlas/tools/atlas.py" mail search "<query>" -a <account> -f INBOX
+   python -I "<ROOT>/brain/_atlas/tools/atlas.py" mail search "<query>" -a <account> -f INBOX [--since YYYY-MM-DD]
    ```
 5. **Read a single message in full (including `FLAGS`, `LABELS` & optional attachment extraction):**
    ```bash
@@ -47,6 +47,15 @@ You can invoke the mail engine either via `atlas.py mail ...` or directly via `a
 6. **Full deduplicated mailbox audit (All Mail or INBOX + Sent + Archive):**
    ```bash
    python -I "<ROOT>/brain/_atlas/tools/atlas.py" mail audit -a <account> -n 200 [--since YYYY-MM-DD]
+   ```
+7. **Deterministic 0-token Inbox Bridge (`mail ingest` -> `brain/inbox/`):**
+   Scans new messages in `readonly=True` mode using an incremental `UIDVALIDITY` + `last_uid` + `Message-ID` cursor in `brain/_atlas/state.json`, extracts `.ics` calendar invites (including inline `text/calendar`) and `.pdf` documents into `brain/inbox/`, and writes a provenance-linked `.md` stub (`verified:`, `sources:`) ready for `/atlas-sort` or `atlas.py calendar --sync-ics`:
+   ```bash
+   # Preview new actionable messages without writing files:
+   python -I "<ROOT>/brain/_atlas/tools/atlas.py" mail ingest -a <account> [-f INBOX] [--since YYYY-MM-DD] [--include-all]
+
+   # Save .ics / .pdf attachments + provenance .md stubs into brain/inbox/ and advance cursor:
+   python -I "<ROOT>/brain/_atlas/tools/atlas.py" mail ingest --all-accounts --execute
    ```
 
 ## 3. Safety-Gated Write Commands (`MOVE`, `TRASH`, `FLAGS`, `LABELS`, `MKDIR`)

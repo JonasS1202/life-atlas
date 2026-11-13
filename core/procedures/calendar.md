@@ -18,16 +18,19 @@ Run:
 
 ```bash
 python -I <ROOT>/brain/_atlas/tools/atlas.py calendar --open
+# Or open directly in Brain Graph / Coach / To-Do tab:
+python -I <ROOT>/brain/_atlas/tools/atlas.py calendar --view graph --open
 ```
 
 (Use `python3` if `python` is not found.)
 
 What this does automatically (0 LLM tokens):
 1. Merges `brain/calendar/README.md` (`## Timeline` and `## Open To-Dos`) with all decentralized `due:` items across
-   the brain.
-2. Regenerates the visual dashboard (`brain/_atlas/cache/calendar.html`).
-3. Starts the lightweight local static server on `http://127.0.0.1:<port>/calendar.html` (if not already running) and
-   opens the rendered dashboard directly in the user's browser.
+   the brain, plus the SQLite knowledge graph (`index.sqlite`) and adaptive Coach state.
+2. Regenerates the visual dashboard (`brain/_atlas/cache/calendar.html`) with 4 views (`Alle`, `🚴 Coach View`,
+   `☑️ To-Dos & Fristen`, and `🕸️ Brain Graph`).
+3. Starts the loopback server (`atlas-cal-v3`) on `http://127.0.0.1:<port>/calendar.html` (with CSRF-protected
+   1-click To-Do/Workout checkbox toggling via `POST /toggle-todo`) and opens the rendered dashboard in the browser.
 
 In your reply:
 - Give the user the clickable `http://127.0.0.1:<port>/calendar.html` link printed by the command (`[📅 Atlas Kalender öffnen](http://127.0.0.1:.../calendar.html)`).

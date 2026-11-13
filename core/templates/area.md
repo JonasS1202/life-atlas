@@ -1,6 +1,7 @@
 ---
 summary: <one line: what this part of life covers and what matters now>
 tags: []
+related: []
 ---
 # <Area name>
 

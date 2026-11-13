@@ -45,6 +45,8 @@ import stat
 import sys
 from typing import Any
 
+sys.dont_write_bytecode = True
+
 
 def resolve_default_secrets_path(explicit_root: str | None = None, explicit_env: str | None = None) -> Path:
     """Dynamically locate <ROOT>/brain/_secrets/mail.env across any OS or installation path."""
@@ -73,7 +75,6 @@ SECRETS_PATH = resolve_default_secrets_path()
 DEFAULT_HOSTS = {
     "gmail.com": "imap.gmail.com",
     "googlemail.com": "imap.gmail.com",
-    "buschplusschulte.de": "imap.gmail.com",
     "icloud.com": "imap.mail.me.com",
     "me.com": "imap.mail.me.com",
     "mac.com": "imap.mail.me.com",
@@ -456,6 +457,51 @@ def parse_imap_flags_and_labels(meta_text: str) -> tuple[list[str], list[str]]:
     return flags, labels
 
 
+def resolve_brain_dir(explicit_root: str | None = None, secrets_path: Path | None = None) -> Path:
+    """Locate <ROOT>/brain directory for state.json and inbox/ provenance stubs."""
+    if explicit_root:
+        rp = Path(explicit_root).expanduser().resolve()
+        if (rp / "_atlas").exists() or rp.name == "brain":
+            return rp
+        return rp / "brain"
+    sec = secrets_path or SECRETS_PATH
+    if sec.parent.name == "_secrets":
+        return sec.parent.parent
+    root_env = os.environ.get("ATLAS_ROOT")
+    if root_env:
+        rp = Path(root_env).expanduser().resolve()
+        return rp if (rp / "_atlas").exists() else (rp / "brain")
+    default_root = Path(r"C:\Atlas") if os.name == "nt" else (Path.home() / "Atlas")
+    return default_root / "brain"
+
+
+def parse_ics_events(ics_bytes: bytes) -> list[dict[str, str]]:
+    """Parse RFC 5545 VEVENT summaries (SUMMARY, DTSTART, DTEND, LOCATION, UID) in 0 tokens."""
+    text = ics_bytes.decode("utf-8", errors="replace")
+    unfolded = re.sub(r"\r?\n[ \t]", "", text)
+    events: list[dict[str, str]] = []
+    cur: dict[str, str] | None = None
+    for raw_line in unfolded.splitlines():
+        line = raw_line.strip()
+        up = line.upper()
+        if up == "BEGIN:VEVENT":
+            cur = {}
+            continue
+        if up == "END:VEVENT":
+            if cur:
+                events.append(cur)
+            cur = None
+            continue
+        if cur is None or ":" not in line:
+            continue
+        key_part, val = line.split(":", 1)
+        prop = key_part.split(";", 1)[0].upper().strip()
+        if prop in ("SUMMARY", "DTSTART", "DTEND", "LOCATION", "UID"):
+            clean_v = val.replace("\\n", " ").replace("\\,", ",").replace("\\;", ";").strip()
+            cur[prop.lower()] = clean_v
+    return events
+
+
 def extract_body_and_attachments(
     msg: email.message.Message,
     save_dir: Path | None = None,
@@ -466,25 +512,31 @@ def extract_body_and_attachments(
 
     if msg.is_multipart():
         for part in msg.walk():
-            ctype = part.get_content_type()
+            if part.is_multipart():
+                continue
+            ctype = part.get_content_type().lower()
             cdisp = str(part.get("Content-Disposition") or "")
             filename = part.get_filename()
             if filename:
                 filename = decode_mime_header(filename)
 
-            if filename or "attachment" in cdisp.lower():
+            is_inline_cal = ctype in ("text/calendar", "application/ics")
+            if filename or "attachment" in cdisp.lower() or is_inline_cal:
                 payload = part.get_payload(decode=True) or b""
+                eff_name = filename or ("invite.ics" if is_inline_cal else "unnamed_attachment")
                 att_info: dict[str, Any] = {
-                    "filename": filename or "unnamed_attachment",
+                    "filename": eff_name,
                     "content_type": ctype,
                     "size_bytes": len(payload),
                 }
                 if save_dir and payload:
                     save_dir.mkdir(parents=True, exist_ok=True)
-                    safe_name = re.sub(r"[^A-Za-z0-9._ -]", "_", att_info["filename"])
+                    safe_name = re.sub(r"[^A-Za-z0-9._ -]", "_", eff_name)
                     target = save_dir / safe_name
                     target.write_bytes(payload)
                     att_info["saved_to"] = str(target)
+                if is_inline_cal or eff_name.lower().endswith((".ics", ".vcs")):
+                    att_info["ics_events"] = parse_ics_events(payload)
                 attachments.append(att_info)
                 continue
 
@@ -505,17 +557,34 @@ def extract_body_and_attachments(
                     except LookupError:
                         html_parts.append(payload.decode("utf-8", errors="replace"))
     else:
+        ctype_single = msg.get_content_type().lower()
         payload = msg.get_payload(decode=True)
         if payload is not None:
-            charset = msg.get_content_charset() or "utf-8"
-            try:
-                text = payload.decode(charset, errors="replace")
-            except LookupError:
-                text = payload.decode("utf-8", errors="replace")
-            if msg.get_content_type() == "text/html":
-                html_parts.append(text)
+            if ctype_single in ("text/calendar", "application/ics"):
+                eff_name = decode_mime_header(msg.get_filename()) or "invite.ics"
+                att_info = {
+                    "filename": eff_name,
+                    "content_type": ctype_single,
+                    "size_bytes": len(payload),
+                    "ics_events": parse_ics_events(payload),
+                }
+                if save_dir and payload:
+                    save_dir.mkdir(parents=True, exist_ok=True)
+                    safe_name = re.sub(r"[^A-Za-z0-9._ -]", "_", eff_name)
+                    target = save_dir / safe_name
+                    target.write_bytes(payload)
+                    att_info["saved_to"] = str(target)
+                attachments.append(att_info)
             else:
-                plain_parts.append(text)
+                charset = msg.get_content_charset() or "utf-8"
+                try:
+                    text = payload.decode(charset, errors="replace")
+                except LookupError:
+                    text = payload.decode("utf-8", errors="replace")
+                if ctype_single == "text/html":
+                    html_parts.append(text)
+                else:
+                    plain_parts.append(text)
 
     body = "\n".join(plain_parts).strip()
     if not body and html_parts:
@@ -583,6 +652,38 @@ def _extract_fetch_parts(msg_data: list[Any]) -> tuple[bytes | None, list[str], 
     return raw_bytes, flags, labels
 
 
+HEADER_PEEK_FIELDS = "FROM TO CC SUBJECT DATE MESSAGE-ID CONTENT-TYPE"
+
+
+def _format_imap_since(since_iso: str) -> str:
+    d = dt.date.fromisoformat(since_iso[:10])
+    months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    return f"{d.day:02d}-{months[d.month - 1]}-{d.year}"
+
+
+def _get_mailbox_uidvalidity(conn: imaplib.IMAP4, raw_folder: str) -> str:
+    """Return current mailbox UIDVALIDITY string (RFC 3501) after SELECT/EXAMINE."""
+    try:
+        _code, uv_list = conn.response("UIDVALIDITY")
+        if uv_list and uv_list[-1]:
+            val = uv_list[-1].decode("ascii", errors="replace") if isinstance(uv_list[-1], bytes) else str(uv_list[-1])
+            m = re.search(r"(\d+)", val)
+            if m:
+                return m.group(1)
+    except Exception:
+        pass
+    try:
+        typ, st_data = conn.status(quote_folder(raw_folder), "(UIDVALIDITY)")
+        if typ == "OK" and st_data and st_data[0]:
+            s = st_data[0].decode("ascii", errors="replace") if isinstance(st_data[0], bytes) else str(st_data[0])
+            m = re.search(r"UIDVALIDITY\s+(\d+)", s, re.I)
+            if m:
+                return m.group(1)
+    except Exception:
+        pass
+    return "1"
+
+
 def fetch_messages_in_folder(
     conn: imaplib.IMAP4,
     folder: str,
@@ -591,6 +692,7 @@ def fetch_messages_in_folder(
     unread_only: bool = False,
     flagged_only: bool = False,
     caps: set[str] | None = None,
+    headers_only: bool = False,
 ) -> list[dict[str, Any]]:
     raw_folder, _ = resolve_folder_name(conn, folder, must_exist=False)
     typ, _ = conn.select(quote_folder(raw_folder), readonly=True)
@@ -607,10 +709,7 @@ def fetch_messages_in_folder(
     if flagged_only:
         criteria.append("FLAGGED")
     if since:
-        d = dt.date.fromisoformat(since)
-        months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-        imap_date = f"{d.day:02d}-{months[d.month - 1]}-{d.year}"
-        criteria.append(f"SINCE {imap_date}")
+        criteria.append(f"SINCE {_format_imap_since(since)}")
     search_str = "(" + " ".join(criteria) + ")" if criteria else "ALL"
 
     typ, data = conn.uid("search", None, search_str)
@@ -621,7 +720,12 @@ def fetch_messages_in_folder(
     if limit > 0:
         uids = uids[-limit:]
 
-    fetch_spec = "(FLAGS X-GM-LABELS BODY.PEEK[])" if has_gm_labels else "(FLAGS BODY.PEEK[])"
+    if headers_only:
+        body_spec = f"BODY.PEEK[HEADER.FIELDS ({HEADER_PEEK_FIELDS})]"
+    else:
+        body_spec = "BODY.PEEK[]"
+    fetch_spec = f"(FLAGS X-GM-LABELS {body_spec})" if has_gm_labels else f"(FLAGS {body_spec})"
+
     results: list[dict[str, Any]] = []
     # Fetch in reverse chronological order (newest UID first)
     for uid in reversed(uids):
@@ -630,7 +734,11 @@ def fetch_messages_in_folder(
             continue
         raw_bytes, flags, labels = _extract_fetch_parts(msg_data)
         if raw_bytes is not None:
-            results.append(parse_message_bytes(uid, raw_folder, raw_bytes, flags=flags, labels=labels))
+            parsed = parse_message_bytes(uid, raw_folder, raw_bytes, flags=flags, labels=labels)
+            if headers_only:
+                msg_hdr = email.message_from_bytes(raw_bytes)
+                parsed["content_type"] = msg_hdr.get_content_type().lower()
+            results.append(parsed)
     return results
 
 
@@ -1032,6 +1140,7 @@ def cmd_list(args: argparse.Namespace) -> int:
             since=args.since,
             unread_only=args.unread,
             flagged_only=getattr(args, "flagged", False),
+            headers_only=not getattr(args, "with_body", False),
         )
         if args.json:
             for m in msgs:
@@ -1043,7 +1152,7 @@ def cmd_list(args: argparse.Namespace) -> int:
             att_str = (
                 f" [📎 {len(m['attachments'])}: {', '.join(a['filename'] for a in m['attachments'])}]"
                 if m["attachments"]
-                else ""
+                else (" [📎 multipart]" if str(m.get("content_type", "")).startswith("multipart/mixed") else "")
             )
             flag_badges: list[str] = []
             if "\\Seen" not in m.get("flags", []):
@@ -1115,23 +1224,82 @@ def cmd_read(args: argparse.Namespace) -> int:
         conn.logout()
 
 
+def _build_server_uid_search_criteria(query: str, since: str | None = None) -> str | None:
+    """Build safe RFC 3501 ASCII UID SEARCH criteria, or return None if client-side fallback is safer."""
+    q_clean = query.strip()
+    if not q_clean:
+        return None
+    # Server-side un-charsetted IMAP UID SEARCH is reliable for printable ASCII without control chars
+    if any(ord(ch) < 0x20 or ord(ch) > 0x7E for ch in q_clean):
+        return None
+    esc = q_clean.replace("\\", "\\\\").replace('"', '\\"')
+    or_expr = f'OR OR SUBJECT "{esc}" FROM "{esc}" OR TO "{esc}" TEXT "{esc}"'
+    if since:
+        return f"(SINCE {_format_imap_since(since)} {or_expr})"
+    return f"({or_expr})"
+
+
+def _message_matches_query(m: dict[str, Any], q_low: str) -> bool:
+    return (
+        q_low in m["subject"].lower()
+        or q_low in m["from"].lower()
+        or q_low in m["to"].lower()
+        or q_low in m["body"].lower()
+        or any(q_low in a["filename"].lower() for a in m["attachments"])
+        or any(q_low in lbl.lower() for lbl in m.get("labels", []))
+    )
+
+
 def cmd_search(args: argparse.Namespace) -> int:
     accounts = load_accounts()
     acc = resolve_account(accounts, args.account)
     conn = connect_imap(acc)
     q = args.query.lower()
+    since_arg = getattr(args, "since", None)
     try:
-        msgs = fetch_messages_in_folder(conn, folder=args.folder, limit=args.scan_limit)
-        matched = [
-            m
-            for m in msgs
-            if q in m["subject"].lower()
-            or q in m["from"].lower()
-            or q in m["to"].lower()
-            or q in m["body"].lower()
-            or any(q in a["filename"].lower() for a in m["attachments"])
-            or any(q in lbl.lower() for lbl in m.get("labels", []))
-        ]
+        caps = get_server_capabilities(conn)
+        has_gm_labels = "X-GM-EXT-1" in caps
+        raw_folder, _ = resolve_folder_name(conn, args.folder, must_exist=False)
+
+        msgs: list[dict[str, Any]] | None = None
+        server_crit = _build_server_uid_search_criteria(args.query, since=since_arg)
+        if server_crit is not None:
+            try:
+                typ_sel, _ = conn.select(quote_folder(raw_folder), readonly=True)
+                if typ_sel == "OK":
+                    typ_s, s_data = conn.uid("search", None, server_crit)
+                    if typ_s == "OK" and s_data is not None:
+                        cand_uids = [u.decode("ascii") for u in (s_data[0] or b"").split()] if s_data else []
+                        if args.scan_limit > 0:
+                            cand_uids = cand_uids[-args.scan_limit:]
+                        fetch_spec = "(FLAGS X-GM-LABELS BODY.PEEK[])" if has_gm_labels else "(FLAGS BODY.PEEK[])"
+                        fetched: list[dict[str, Any]] = []
+                        for uid in reversed(cand_uids):
+                            t_f, m_data = conn.uid("fetch", uid, fetch_spec)
+                            if t_f != "OK" or not m_data:
+                                continue
+                            raw_b, flgs, lbls = _extract_fetch_parts(m_data)
+                            if raw_b is not None:
+                                fetched.append(parse_message_bytes(uid, raw_folder, raw_b, flags=flgs, labels=lbls))
+                        # If UID SEARCH returned 0 hits, check if user might be matching a label or attachment filename
+                        # on a small mailbox; only keep empty result directly unless X-GM-LABELS / filename fallback applies.
+                        msgs = fetched
+            except Exception:
+                msgs = None
+
+        if msgs is None:
+            msgs = fetch_messages_in_folder(
+                conn, folder=args.folder, limit=args.scan_limit, since=since_arg, caps=caps, headers_only=False
+            )
+
+        matched = [m for m in msgs if _message_matches_query(m, q)]
+        # Fallback if server-side TEXT/SUBJECT/FROM/TO missed an attachment filename or Gmail label
+        if not matched and server_crit is not None and (has_gm_labels or "." in q):
+            fallback_msgs = fetch_messages_in_folder(
+                conn, folder=args.folder, limit=min(args.scan_limit, 100), since=since_arg, caps=caps, headers_only=False
+            )
+            matched = [m for m in fallback_msgs if _message_matches_query(m, q)]
+
         if args.limit > 0:
             matched = matched[: args.limit]
         if args.json:
@@ -1213,6 +1381,329 @@ def cmd_audit(args: argparse.Namespace) -> int:
                 print(f"Auszug:  {m['snippet']}")
     finally:
         conn.logout()
+    return 0
+
+
+INGEST_EXTS = (".ics", ".vcs", ".pdf")
+INGEST_CTYPES = ("text/calendar", "application/ics", "application/pdf")
+
+
+def _slugify_stub(text: str, max_len: int = 44) -> str:
+    s = re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
+    return (s[:max_len].rstrip("-") or "message")
+
+
+def _is_ingest_attachment(filename: str, ctype: str) -> bool:
+    fn_low = (filename or "").lower().strip()
+    ct_low = (ctype or "").lower().strip()
+    return fn_low.endswith(INGEST_EXTS) or ct_low in INGEST_CTYPES
+
+
+def _extract_ingest_payloads(msg: email.message.Message) -> tuple[str, list[dict[str, Any]]]:
+    """Extract clean plain-text body and raw bytes for .ics / .pdf attachments."""
+    plain_parts: list[str] = []
+    html_parts: list[str] = []
+    matched_atts: list[dict[str, Any]] = []
+
+    parts = list(msg.walk()) if msg.is_multipart() else [msg]
+    for part in parts:
+        if part.is_multipart():
+            continue
+        ctype = part.get_content_type().lower()
+        cdisp = str(part.get("Content-Disposition") or "")
+        raw_fn = part.get_filename()
+        filename = decode_mime_header(raw_fn) if raw_fn else ""
+        is_cal = ctype in ("text/calendar", "application/ics")
+        eff_name = filename or ("invite.ics" if is_cal else ("document.pdf" if ctype == "application/pdf" else ""))
+
+        if eff_name and (_is_ingest_attachment(eff_name, ctype) or ("attachment" in cdisp.lower() and _is_ingest_attachment(eff_name, ctype))):
+            payload = part.get_payload(decode=True) or b""
+            if payload:
+                entry: dict[str, Any] = {
+                    "filename": eff_name,
+                    "content_type": ctype,
+                    "size_bytes": len(payload),
+                    "bytes": payload,
+                }
+                if is_cal or eff_name.lower().endswith((".ics", ".vcs")):
+                    entry["ics_events"] = parse_ics_events(payload)
+                matched_atts.append(entry)
+            if filename or "attachment" in cdisp.lower() or is_cal:
+                continue
+
+        if ctype == "text/plain" and "attachment" not in cdisp.lower():
+            payload = part.get_payload(decode=True)
+            if payload is not None:
+                ch = part.get_content_charset() or "utf-8"
+                try:
+                    plain_parts.append(payload.decode(ch, errors="replace"))
+                except LookupError:
+                    plain_parts.append(payload.decode("utf-8", errors="replace"))
+        elif ctype == "text/html" and "attachment" not in cdisp.lower():
+            payload = part.get_payload(decode=True)
+            if payload is not None:
+                ch = part.get_content_charset() or "utf-8"
+                try:
+                    html_parts.append(payload.decode(ch, errors="replace"))
+                except LookupError:
+                    html_parts.append(payload.decode("utf-8", errors="replace"))
+
+    body = "\n".join(plain_parts).strip()
+    if not body and html_parts:
+        body = html_to_text("\n".join(html_parts))
+    return body, matched_atts
+
+
+def _yaml_quote(val: str) -> str:
+    clean = re.sub(r"[\r\n\t]+", " ", str(val or "")).strip()
+    escaped = clean.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def cmd_ingest(args: argparse.Namespace) -> int:
+    """Deterministic 0-token read-only bridge from IMAP into brain/inbox/ with UIDVALIDITY cursor."""
+    accounts = load_accounts()
+    if getattr(args, "all_accounts", False):
+        target_accs = [a for a in accounts.values() if a.get("configured")]
+        if not target_accs:
+            raise RuntimeError(f"Keine konfigurierten Konten in {SECRETS_PATH} gefunden.")
+    else:
+        target_accs = [resolve_account(accounts, args.account)]
+
+    brain_dir = resolve_brain_dir(explicit_root=getattr(args, "root", None), secrets_path=SECRETS_PATH)
+    inbox_dir = brain_dir / "inbox"
+    state_path = brain_dir / "_atlas" / "state.json"
+
+    state_data: dict[str, Any] = {}
+    if state_path.is_file():
+        try:
+            state_data = json.loads(state_path.read_text(encoding="utf-8"))
+            if not isinstance(state_data, dict):
+                state_data = {}
+        except Exception:
+            state_data = {}
+
+    ingest_cursors: dict[str, Any] = dict(state_data.get("mail_ingest") or {})
+    execute = bool(getattr(args, "execute", False))
+    include_all = bool(getattr(args, "include_all", False))
+    today_iso = dt.date.today().isoformat()
+    ingested_items: list[dict[str, Any]] = []
+    scanned_total = 0
+
+    for acc in target_accs:
+        conn = connect_imap(acc)
+        try:
+            caps = get_server_capabilities(conn)
+            has_gm_labels = "X-GM-EXT-1" in caps
+            raw_folder, disp_folder = resolve_folder_name(conn, args.folder, must_exist=True)
+            typ, _ = conn.select(quote_folder(raw_folder), readonly=True)
+            if typ != "OK":
+                raise RuntimeError(f"Ordner '{disp_folder}' konnte nicht im Lesemodus geöffnet werden.")
+
+            cur_uv = _get_mailbox_uidvalidity(conn, raw_folder)
+            cursor_key = f"{acc['id']}:{disp_folder}"
+            prev_cursor = dict(ingest_cursors.get(cursor_key) or {})
+            prev_uv = str(prev_cursor.get("uidvalidity") or "")
+            last_uid = int(prev_cursor.get("last_uid") or 0) if prev_uv == cur_uv else 0
+            seen_ids: list[str] = list(prev_cursor.get("seen_message_ids") or [])
+            seen_set = set(seen_ids)
+
+            crit_parts: list[str] = []
+            if getattr(args, "since", None):
+                crit_parts.append(f"SINCE {_format_imap_since(args.since)}")
+            search_str = "(" + " ".join(crit_parts) + ")" if crit_parts else "ALL"
+            typ_s, s_data = conn.uid("search", None, search_str)
+            all_uids_int = sorted(
+                int(u.decode("ascii"))
+                for u in ((s_data[0] or b"").split() if (typ_s == "OK" and s_data) else [])
+                if u.decode("ascii", errors="ignore").isdigit()
+            )
+            new_uids = [u for u in all_uids_int if u > last_uid]
+            if args.limit > 0:
+                new_uids = new_uids[: args.limit]
+
+            hdr_spec = (
+                f"(FLAGS X-GM-LABELS BODY.PEEK[HEADER.FIELDS ({HEADER_PEEK_FIELDS})])"
+                if has_gm_labels
+                else f"(FLAGS BODY.PEEK[HEADER.FIELDS ({HEADER_PEEK_FIELDS})])"
+            )
+            full_spec = "(FLAGS X-GM-LABELS BODY.PEEK[])" if has_gm_labels else "(FLAGS BODY.PEEK[])"
+
+            max_processed_uid = last_uid
+            for uid_num in new_uids:
+                uid_str = str(uid_num)
+                scanned_total += 1
+                t_h, h_data = conn.uid("fetch", uid_str, hdr_spec)
+                if t_h != "OK" or not h_data:
+                    continue
+                hdr_bytes, _flgs, _lbls = _extract_fetch_parts(h_data)
+                if hdr_bytes is None:
+                    continue
+                hdr_msg = email.message_from_bytes(hdr_bytes)
+                msg_id = decode_mime_header(hdr_msg.get("Message-ID")).strip()
+                ctype_top = hdr_msg.get_content_type().lower()
+
+                if msg_id and msg_id in seen_set:
+                    max_processed_uid = max(max_processed_uid, uid_num)
+                    continue
+
+                # Fast header pre-filter: plain/html non-multipart messages cannot hold .ics/.pdf attachments
+                can_have_att = (
+                    ctype_top.startswith("multipart/")
+                    or ctype_top in INGEST_CTYPES
+                    or include_all
+                )
+                if not can_have_att:
+                    max_processed_uid = max(max_processed_uid, uid_num)
+                    continue
+
+                t_b, b_data = conn.uid("fetch", uid_str, full_spec)
+                if t_b != "OK" or not b_data:
+                    continue
+                full_bytes, _f2, lbls = _extract_fetch_parts(b_data)
+                if full_bytes is None:
+                    continue
+
+                full_msg = email.message_from_bytes(full_bytes)
+                subject = decode_mime_header(full_msg.get("Subject")) or "(No Subject)"
+                from_hdr = decode_mime_header(full_msg.get("From")) or "(Unknown Sender)"
+                to_hdr = decode_mime_header(full_msg.get("To"))
+                date_hdr = decode_mime_header(full_msg.get("Date"))
+                parsed_dt: dt.datetime | None = None
+                if date_hdr:
+                    try:
+                        parsed_dt = email.utils.parsedate_to_datetime(date_hdr)
+                    except Exception:
+                        parsed_dt = None
+                msg_date_iso = parsed_dt.date().isoformat() if parsed_dt else today_iso
+                full_iso_dt = parsed_dt.isoformat() if parsed_dt else date_hdr
+
+                body_txt, atts = _extract_ingest_payloads(full_msg)
+                if not atts and not include_all:
+                    max_processed_uid = max(max_processed_uid, uid_num)
+                    continue
+
+                slug = _slugify_stub(subject)
+                stub_name = f"{msg_date_iso}_mail_{acc['id']}_{uid_str}_{slug}.md"
+                stub_rel = f"inbox/{stub_name}"
+                saved_files_rel: list[str] = []
+                saved_att_Links: list[str] = []
+                ics_summaries: list[str] = []
+
+                if execute:
+                    inbox_dir.mkdir(parents=True, exist_ok=True)
+
+                for idx_a, att in enumerate(atts):
+                    safe_fn = re.sub(r"[^A-Za-z0-9._-]", "_", att["filename"]).strip("_") or f"att_{idx_a + 1}"
+                    out_fn = f"{msg_date_iso}_{acc['id']}_{uid_str}_{safe_fn}"
+                    out_rel = f"inbox/{out_fn}"
+                    saved_files_rel.append(out_rel)
+                    saved_att_Links.append(f"- [{out_fn}]({out_fn}) (`{att['content_type']}`, {att['size_bytes']} bytes)")
+                    if execute:
+                        (inbox_dir / out_fn).write_bytes(att["bytes"])
+                    for ev in att.get("ics_events") or []:
+                        ev_sum = ev.get("summary") or "Calendar Event"
+                        ev_dt = ev.get("dtstart") or ""
+                        ev_end = f" -> {ev['dtend']}" if ev.get("dtend") else ""
+                        ev_loc = f" @ {ev['location']}" if ev.get("location") else ""
+                        ics_summaries.append(f"- **Event:** {ev_sum} (`{ev_dt}{ev_end}`{ev_loc})")
+
+                from_short = re.sub(r"<[^>]+>", "", from_hdr).strip().strip('"') or from_hdr
+                sum_raw = f"Mail ({from_short[:30]}): {subject}"[:115]
+                imap_uri = f"imap://{acc['id']}/{disp_folder};uidvalidity={cur_uv};uid={uid_str}"
+                sources_list = [imap_uri]
+                if msg_id:
+                    sources_list.append(msg_id if msg_id.startswith("<") else f"msgid:{msg_id}")
+                sources_list.extend(saved_files_rel)
+
+                fm_lines = [
+                    "---",
+                    f"summary: {_yaml_quote(sum_raw)}",
+                    "tags: [mail]",
+                    f"verified: {today_iso}",
+                    "sources:",
+                ]
+                for s_item in sources_list:
+                    fm_lines.append(f"  - {_yaml_quote(s_item)}")
+                fm_lines.append("---")
+
+                snippet_clean = re.sub(r"\s+", " ", body_txt).strip()[:600]
+                md_lines = fm_lines + [
+                    f"# Mail Ingest: {subject}",
+                    "",
+                    f"Stand: {today_iso}. Deterministically ingested via `atlas.py mail ingest` (read-only `BODY.PEEK`, 0 LLM tokens).",
+                    "",
+                    "## Provenance",
+                    "",
+                    f"- **Account / Folder:** `{acc['id']}` / `{disp_folder}` (`UID {uid_str}`, `UIDVALIDITY {cur_uv}`)",
+                    f"- **From:** {from_hdr}",
+                    f"- **To:** {to_hdr or '—'}",
+                    f"- **Date:** {full_iso_dt or '—'}",
+                    f"- **Message-ID:** `{msg_id or '—'}`",
+                ]
+                if lbls:
+                    md_lines.append(f"- **Labels:** {', '.join(lbls)}")
+                if saved_att_Links:
+                    md_lines += ["", "## Saved Attachments", ""] + saved_att_Links
+                if ics_summaries:
+                    md_lines += ["", "## Calendar Invite (`.ics`) Summary", ""] + ics_summaries
+                if snippet_clean:
+                    md_lines += ["", "## Body Excerpt", "", snippet_clean]
+
+                if execute:
+                    (inbox_dir / stub_name).write_text("\n".join(md_lines) + "\n", encoding="utf-8")
+                    if msg_id:
+                        seen_ids.append(msg_id)
+                        seen_set.add(msg_id)
+
+                max_processed_uid = max(max_processed_uid, uid_num)
+                ingested_items.append({
+                    "account": acc["id"],
+                    "folder": disp_folder,
+                    "uid": uid_str,
+                    "uidvalidity": cur_uv,
+                    "message_id": msg_id,
+                    "subject": subject,
+                    "from": from_hdr,
+                    "date": msg_date_iso,
+                    "stub": stub_rel,
+                    "attachments": saved_files_rel,
+                    "ics_events_count": len(ics_summaries),
+                })
+
+            if execute and (max_processed_uid != last_uid or prev_uv != cur_uv):
+                ingest_cursors[cursor_key] = {
+                    "uidvalidity": cur_uv,
+                    "last_uid": max_processed_uid,
+                    "seen_message_ids": seen_ids[-500:],
+                    "updated": dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat(),
+                }
+        finally:
+            conn.logout()
+
+    if execute and ingest_cursors:
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_data["mail_ingest"] = ingest_cursors
+        tmp_st = state_path.with_name(f"state.json.{os.getpid()}.tmp")
+        tmp_st.write_text(json.dumps(state_data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        os.replace(tmp_st, state_path)
+
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "status": "APPLIED" if execute else "DRY_RUN",
+            "scanned_new_uids": scanned_total,
+            "ingested_count": len(ingested_items),
+            "items": ingested_items,
+        }, ensure_ascii=False, indent=2))
+        return 0
+
+    mode_lbl = "applied" if execute else "dry-run"
+    print(f"mail ingest ({mode_lbl}): scanned {scanned_total} new UID(s), {len(ingested_items)} item(s) {'saved to' if execute else 'ready for'} brain/inbox/.")
+    for it in ingested_items:
+        atts_s = f" + {len(it['attachments'])} attachment(s) ({', '.join(Path(x).name for x in it['attachments'])})" if it["attachments"] else ""
+        print(f"  - [{it['account']}] UID {it['uid']} '{it['subject']}' -> {it['stub']}{atts_s}")
+    if not execute and ingested_items:
+        print("Dry run. Add --execute to save files into brain/inbox/ and advance state.json cursor.")
     return 0
 
 
@@ -1732,7 +2223,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # --- ONBOARDING / INIT ---
     p_init = sub.add_parser("init", help="Vorlage für brain/_secrets/mail.env (chmod 600) anlegen oder Konto ergänzen")
-    p_init.add_argument("-a", "--account", default="MAIN", help="Account-ID (z. B. WORK, GMAIL, BPLUSS)")
+    p_init.add_argument("-a", "--account", default="MAIN", help="Account-ID (z. B. WORK, PERSONAL, GMAIL)")
     p_init.add_argument("--label", help="Anzeigename des Kontos")
     p_init.add_argument("--host", help="IMAP-Host (z. B. imap.gmail.com)")
     p_init.add_argument("--port", type=int, default=993, help="IMAP-Port (Default: 993)")
@@ -1750,13 +2241,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_fld.add_argument("--json", action="store_true", help="Ausgabe als JSON")
     p_fld.set_defaults(func=cmd_folders)
 
-    p_lst = sub.add_parser("list", help="Nachrichten in einem Ordner auflisten (Read-Only)")
+    p_lst = sub.add_parser("list", help="Nachrichten in einem Ordner auflisten (Read-Only, fast HEADER.PEEK)")
     p_lst.add_argument("-a", "--account", help="Account-ID oder E-Mail-Adresse")
     p_lst.add_argument("-f", "--folder", default="INBOX", help="IMAP-Ordner (Default: INBOX)")
     p_lst.add_argument("-n", "--limit", type=int, default=50, help="Maximale Anzahl (Default: 50)")
     p_lst.add_argument("--since", help="Nur Nachrichten seit YYYY-MM-DD")
     p_lst.add_argument("--unread", action="store_true", help="Nur ungelesene Nachrichten (UNSEEN)")
     p_lst.add_argument("--flagged", action="store_true", help="Nur markierte Nachrichten (\\Flagged)")
+    p_lst.add_argument("--with-body", action="store_true", help="Volltext-Snippets laden statt schnellem HEADER.PEEK")
     p_lst.add_argument("--json", action="store_true", help="Ausgabe als JSON")
     p_lst.set_defaults(func=cmd_list)
 
@@ -1768,14 +2260,29 @@ def build_parser() -> argparse.ArgumentParser:
     p_rd.add_argument("--json", action="store_true", help="Ausgabe als JSON")
     p_rd.set_defaults(func=cmd_read)
 
-    p_srch = sub.add_parser("search", help="Volltext-, Header-, Anhang- & Label-Suche in einem Ordner (Read-Only)")
+    p_srch = sub.add_parser("search", help="Volltext-, Header-, Anhang- & Label-Suche via UID SEARCH + Fallback (Read-Only)")
     p_srch.add_argument("query", help="Suchbegriff (Betreff, Absender, Empfänger, Text, Anhang, Label)")
     p_srch.add_argument("-a", "--account", help="Account-ID oder E-Mail-Adresse")
     p_srch.add_argument("-f", "--folder", default="INBOX", help="IMAP-Ordner (Default: INBOX)")
     p_srch.add_argument("-n", "--limit", type=int, default=50, help="Max. Treffer")
     p_srch.add_argument("--scan-limit", type=int, default=300, help="Max. zu durchsuchende Mails")
+    p_srch.add_argument("--since", help="Optional: nur Nachrichten seit YYYY-MM-DD")
     p_srch.add_argument("--json", action="store_true", help="Ausgabe als JSON")
     p_srch.set_defaults(func=cmd_search)
+
+    p_ing = sub.add_parser(
+        "ingest",
+        help="Read-Only 0-Token Bridge: speichert .ics/.pdf Anhänge + Provenance-Stubs in brain/inbox/ mit UIDVALIDITY-Cursor",
+    )
+    p_ing.add_argument("-a", "--account", help="Account-ID oder E-Mail-Adresse (Default: aktives Hauptkonto)")
+    p_ing.add_argument("--all-accounts", action="store_true", help="Alle konfigurierten Konten scannen")
+    p_ing.add_argument("-f", "--folder", default="INBOX", help="IMAP-Ordner (Default: INBOX)")
+    p_ing.add_argument("-n", "--limit", type=int, default=50, help="Max. neue UIDs pro Lauf (Default: 50)")
+    p_ing.add_argument("--since", help="Optional: nur Nachrichten seit YYYY-MM-DD")
+    p_ing.add_argument("--include-all", action="store_true", help="Auch reine Text-Mails ohne .ics/.pdf als Stub ablegen")
+    p_ing.add_argument("--execute", action="store_true", help="Dateien in brain/inbox/ & Cursor in state.json schreiben")
+    p_ing.add_argument("--json", action="store_true", help="Ausgabe als JSON")
+    p_ing.set_defaults(func=cmd_ingest)
 
     p_aud = sub.add_parser("audit", help="Komplett-Scan über Posteingang & Gesendet / Alle Nachrichten (Read-Only)")
     p_aud.add_argument("-a", "--account", help="Account-ID oder E-Mail-Adresse")

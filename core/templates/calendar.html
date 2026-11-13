@@ -1,0 +1,1912 @@
+<!DOCTYPE html>
+<html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Atlas · Calendar, Coach &amp; Brain Hub</title>
+<style>
+:root{
+  --bg:#070a0f;--surface:#0d121b;--surface-2:#121926;--surface-3:#182234;--border:rgba(255,255,255,0.075);
+  --border-hi:rgba(255,255,255,0.15);--text:#f1f5f9;--text-dim:#cbd5e1;--muted:#64748b;--muted-hi:#94a3b8;
+  --accent:#38bdf8;--accent-glow:rgba(56,189,248,0.16);
+  --workout:#10b981;--workout-bg:rgba(16,185,129,0.14);--workout-tx:#a7f3d0;
+  --plan:#0ea5e9;--plan-bg:rgba(14,165,233,0.14);--plan-tx:#bae6fd;
+  --goal:#f59e0b;--goal-bg:rgba(245,158,11,0.15);--goal-tx:#fde68a;
+  --blocked:#f43f5e;--blocked-bg:rgba(244,63,94,0.15);--blocked-tx:#fecdd3;
+  --event:#8b5cf6;--event-bg:rgba(139,92,246,0.15);--event-tx:#ddd6fe;
+  --deadline:#f97316;--deadline-bg:rgba(249,115,22,0.14);--deadline-tx:#fed7aa;
+  --todo:#38bdf8;--todo-bg:rgba(56,189,248,0.14);--todo-tx:#e0f2fe;
+  --bday:#ec4899;--bday-bg:rgba(236,72,153,0.15);--bday-tx:#fbcfe8;
+  --radius:12px;--radius-sm:8px
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;background:var(--bg);color:var(--text);font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;font-size:14px;line-height:1.45;-webkit-font-smoothing:antialiased;font-variant-numeric:tabular-nums}
+body{background-image:radial-gradient(ellipse 80% 35% at 50% -10%,rgba(56,189,248,0.09),transparent);min-height:100vh}
+.shell{max-width:1760px;margin:0 auto;padding:16px 20px 32px;display:flex;flex-direction:column;gap:14px}
+@media(max-width:768px){.shell{padding:12px}}
+
+/* Topbar */
+.topbar{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:12px;padding:12px 16px;background:rgba(13,18,27,0.85);backdrop-filter:blur(12px);border:1px solid var(--border);border-radius:var(--radius);box-shadow:0 8px 30px rgba(0,0,0,0.35)}
+.brand{display:flex;align-items:center;gap:11px;min-width:0}
+.brand-icon{width:32px;height:32px;border-radius:9px;background:linear-gradient(135deg,#0284c7,#38bdf8);display:flex;align-items:center;justify-content:center;font-size:1rem;box-shadow:0 0 18px rgba(56,189,248,0.35);flex-shrink:0}
+.brand-title{font-size:1.05rem;font-weight:700;letter-spacing:-0.02em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.brand-sub{font-size:.72rem;color:var(--muted-hi);display:flex;align-items:center;gap:6px}
+.live-pill{display:inline-flex;align-items:center;gap:5px;font-size:.68rem;font-weight:600;color:#34d399;background:rgba(16,185,129,0.12);border:1px solid rgba(16,185,129,0.28);padding:2px 8px;border-radius:99px}
+.live-dot{width:6px;height:6px;border-radius:50%;background:#10b981;box-shadow:0 0 8px #10b981;animation:pulse 2.2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+
+.toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
+.seg{display:inline-flex;flex-wrap:wrap;background:var(--surface-2);padding:3px;border-radius:9px;border:1px solid var(--border);gap:2px}
+.seg button{background:transparent;color:var(--muted-hi);border:none;padding:5px 11px;border-radius:6px;cursor:pointer;font-size:.78rem;font-weight:600;display:inline-flex;align-items:center;gap:6px;transition:all .15s ease;white-space:nowrap}
+.seg button:hover{color:var(--text);background:rgba(255,255,255,0.04)}
+.seg button.active{background:var(--surface-3);color:#fff;box-shadow:0 1px 4px rgba(0,0,0,0.4),inset 0 0 0 1px rgba(56,189,248,0.35)}
+.cnt{font-size:.66rem;padding:1px 5px;border-radius:99px;background:rgba(255,255,255,0.07);color:var(--text-dim);font-weight:600}
+.seg button.active .cnt{background:rgba(56,189,248,0.22);color:var(--accent)}
+
+.search-wrap{position:relative;display:flex;align-items:center}
+.search-in{background:var(--surface-2);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:5px 10px 5px 26px;font-size:.78rem;width:155px;transition:all .15s ease;outline:none}
+.search-in:focus{border-color:var(--accent);width:210px;background:var(--surface-3)}
+.search-ico{position:absolute;left:8px;font-size:.72rem;color:var(--muted);pointer-events:none}
+
+.nav-grp{display:inline-flex;align-items:center;background:var(--surface-2);border:1px solid var(--border);border-radius:9px;padding:2px}
+.nav-btn{background:transparent;color:var(--text-dim);border:none;padding:5px 9px;border-radius:6px;cursor:pointer;font-size:.78rem;font-weight:600;transition:all .15s}
+.nav-btn:hover{background:var(--surface-3);color:#fff}
+.nav-label{min-width:138px;text-align:center;font-weight:700;font-size:.82rem;color:var(--text);padding:0 8px;cursor:pointer}
+
+/* Telemetry & KPI Strip */
+.kpi-strip{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}
+@media(max-width:960px){.kpi-strip{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:520px){.kpi-strip{grid-template-columns:1fr}}
+.kpi{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:10px 13px;display:flex;flex-direction:column;gap:3px;min-width:0;position:relative;overflow:hidden}
+.kpi.clickable{cursor:pointer;transition:border-color .15s,background .15s}
+.kpi.clickable:hover{border-color:var(--border-hi);background:var(--surface-2)}
+.kpi::before{content:"";position:absolute;top:0;left:0;right:0;height:2px;background:var(--kpi-color,var(--accent));opacity:.75}
+.kpi-lbl{font-size:.68rem;text-transform:uppercase;letter-spacing:.05em;color:var(--muted-hi);font-weight:600;display:flex;justify-content:space-between;align-items:center}
+.kpi-val{font-size:1.05rem;font-weight:700;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.kpi-sub{font-size:.72rem;color:var(--muted-hi);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+/* Athlete Telemetry Ribbon (Adaptive Simple / Standard / Pro Coach View) */
+.coach-ribbon{background:linear-gradient(180deg,rgba(16,185,129,0.08),rgba(13,18,27,0.9));border:1px solid rgba(16,185,129,0.25);border-radius:var(--radius);padding:11px 14px;display:none;flex-direction:column;gap:9px}
+.coach-ribbon.simple-mode{background:linear-gradient(180deg,rgba(56,189,248,0.08),rgba(13,18,27,0.9));border-color:rgba(56,189,248,0.24)}
+.coach-ribbon.show{display:flex}
+.coach-hdr{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px}
+.coach-title{font-size:.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:#34d399;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.coach-ribbon.simple-mode .coach-title{color:#7dd3fc}
+.rdy-badge{font-size:.66rem;font-weight:800;padding:2px 8px;border-radius:99px;letter-spacing:.04em;display:inline-flex;align-items:center;gap:5px}
+.rdy-GREEN{background:rgba(16,185,129,0.18);color:#6ee7b7;border:1px solid rgba(16,185,129,0.4)}
+.rdy-AMBER{background:rgba(245,158,11,0.18);color:#fde68a;border:1px solid rgba(245,158,11,0.4)}
+.rdy-RED{background:rgba(244,63,94,0.2);color:#fda4af;border:1px solid rgba(244,63,94,0.45)}
+.phys-chips{display:flex;flex-wrap:wrap;gap:7px}
+.phys-chip{background:rgba(15,23,42,0.85);border:1px solid rgba(255,255,255,0.09);border-radius:7px;padding:4px 9px;font-size:.74rem;display:inline-flex;align-items:center;gap:6px}
+.phys-chip.pro-hi{border-color:rgba(56,189,248,0.32);background:rgba(14,165,233,0.1)}
+.phys-chip span.k{color:var(--muted-hi);font-weight:500}
+.phys-chip strong.v{color:var(--text);font-weight:700}
+.macro-banner{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px;padding:7px 10px;border-radius:8px;background:rgba(15,23,42,0.75);border:1px solid rgba(56,189,248,0.2);font-size:.74rem}
+.macro-badges{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.pmc-strip{display:grid;grid-template-columns:repeat(5,minmax(0,1fr)) minmax(160px,1.4fr);gap:8px;align-items:center;padding:8px 10px;border-radius:9px;background:rgba(7,10,15,0.62);border:1px solid rgba(255,255,255,0.08)}
+@media(max-width:960px){.pmc-strip{grid-template-columns:repeat(3,minmax(0,1fr))}}
+.pmc-cell{display:flex;flex-direction:column;gap:1px;min-width:0}
+.pmc-lbl{font-size:.63rem;text-transform:uppercase;letter-spacing:.05em;color:var(--muted-hi);font-weight:600}
+.pmc-val{font-size:.9rem;font-weight:800;color:var(--text)}
+.pmc-spark{width:100%;height:36px;display:block}
+.guardrail-bar{font-size:.72rem;padding:6px 10px;border-radius:7px;background:rgba(245,158,11,0.12);border:1px solid rgba(245,158,11,0.3);color:#fde68a;display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.kw-phase{font-size:.54rem;font-weight:700;text-transform:uppercase;padding:1px 4px;border-radius:3px;background:rgba(56,189,248,0.16);color:var(--accent);margin-top:3px;letter-spacing:.03em;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.wko-bars{display:flex;align-items:flex-end;gap:1.5px;height:12px;margin-top:3px;padding:1px 2px;background:rgba(0,0,0,0.25);border-radius:3px;overflow:hidden}
+.wko-bar{min-width:2px;border-radius:1px 1px 0 0;opacity:.92}
+.fb-badge{font-size:.58rem;font-weight:700;padding:0 4px;border-radius:3px;margin-left:auto;flex-shrink:0}
+.fb-badge.ok{background:rgba(16,185,129,0.2);color:#6ee7b7}
+.fb-badge.warn{background:rgba(245,158,11,0.22);color:#fde68a}
+.pcurve-tbl{width:100%;border-collapse:collapse;font-size:.7rem;margin-top:4px}
+.pcurve-tbl th,.pcurve-tbl td{padding:4px 5px;text-align:right;border-bottom:1px solid var(--border)}
+.pcurve-tbl th:first-child,.pcurve-tbl td:first-child{text-align:left;font-weight:700;color:var(--muted-hi)}
+.pcurve-tbl th{font-size:.62rem;text-transform:uppercase;color:var(--muted)}
+.mini-tabs{display:inline-flex;gap:3px;background:var(--surface-2);padding:2px;border-radius:6px;border:1px solid var(--border)}
+.mini-tabs button{background:transparent;border:none;color:var(--muted-hi);font-size:.66rem;font-weight:700;padding:2px 7px;border-radius:4px;cursor:pointer}
+.mini-tabs button.active{background:var(--surface-3);color:var(--accent)}
+
+/* Interactive Checkbox Button */
+.cb-btn{width:17px;height:17px;border-radius:4px;border:1.5px solid rgba(148,163,184,0.55);background:rgba(15,23,42,0.75);color:transparent;display:inline-flex;align-items:center;justify-content:center;font-size:.68rem;font-weight:900;cursor:pointer;flex-shrink:0;transition:all .14s ease;padding:0;line-height:1}
+.cb-btn:hover{border-color:var(--accent);background:rgba(56,189,248,0.16)}
+.cb-btn.done{background:rgba(16,185,129,0.25);border-color:#10b981;color:#6ee7b7}
+.row.is-done .row-title{text-decoration:line-through;opacity:.62}
+
+/* Main Workspace Layout */
+.workspace{display:grid;grid-template-columns:minmax(0,1fr) 370px;gap:14px;align-items:start}
+@media(max-width:1120px){.workspace{grid-template-columns:minmax(0,1fr)}}
+
+/* Calendar & Brain Graph Main Box */
+.cal-box{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;box-shadow:0 10px 30px rgba(0,0,0,0.3);min-width:0;position:relative}
+
+/* Brain Graph Canvas & Overlay Controls */
+.graph-wrap{position:relative;width:100%;height:640px;background:radial-gradient(circle at 50% 45%,rgba(30,41,59,0.42),rgba(7,10,15,0.96));overflow:hidden;user-select:none}
+@media(max-width:768px){.graph-wrap{height:480px}}
+.graph-canvas{width:100%;height:100%;display:block;cursor:grab}
+.graph-canvas.dragging{cursor:grabbing}
+.graph-overlay-top{position:absolute;top:12px;left:12px;right:12px;display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:8px;pointer-events:none;z-index:4}
+.graph-pills,.graph-zoom{display:inline-flex;flex-wrap:wrap;gap:4px;background:rgba(13,18,27,0.88);backdrop-filter:blur(8px);padding:4px;border-radius:9px;border:1px solid var(--border-hi);pointer-events:auto}
+.g-pill{background:transparent;border:none;color:var(--muted-hi);font-size:.71rem;font-weight:600;padding:4px 9px;border-radius:6px;cursor:pointer;transition:all .14s}
+.g-pill:hover{color:var(--text);background:rgba(255,255,255,0.05)}
+.g-pill.active{background:var(--surface-3);color:#fff;box-shadow:inset 0 0 0 1px rgba(56,189,248,0.4)}
+.graph-legend{position:absolute;bottom:12px;left:12px;display:flex;flex-wrap:wrap;gap:9px;padding:6px 10px;border-radius:8px;background:rgba(13,18,27,0.86);backdrop-filter:blur(8px);border:1px solid var(--border);font-size:.67rem;color:var(--muted-hi);pointer-events:none;z-index:4}
+.leg-item{display:inline-flex;align-items:center;gap:5px}
+.leg-dot{width:8px;height:8px;border-radius:50%;display:inline-block}
+.leg-ring{width:9px;height:9px;border-radius:50%;border:1.8px dashed #f59e0b;display:inline-block}
+.leg-ring.err{border:1.8px solid #f43f5e}
+.graph-tip{position:absolute;pointer-events:none;background:rgba(13,18,27,0.95);border:1px solid var(--border-hi);border-radius:8px;padding:7px 10px;font-size:.72rem;color:var(--text);box-shadow:0 10px 25px rgba(0,0,0,0.55);max-width:290px;display:none;z-index:6}
+
+/* Month View Grid — STRICT minmax(0,1fr) prevents column blowouts! */
+.dow-row{display:grid;grid-template-columns:32px repeat(7,minmax(0,1fr));background:var(--surface-2);border-bottom:1px solid var(--border)}
+.dow-cell{padding:8px 4px;text-align:center;font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted-hi)}
+.dow-cell.wknd{color:var(--muted)}
+.dow-cell.kw-hdr{font-size:.62rem;color:var(--muted);border-right:1px solid var(--border)}
+
+.month-grid{display:grid;grid-template-columns:32px repeat(7,minmax(0,1fr));grid-auto-rows:minmax(112px,auto)}
+@media(max-width:680px){
+  .dow-row,.month-grid{grid-template-columns:24px repeat(7,minmax(0,1fr))}
+  .month-grid{grid-auto-rows:minmax(92px,auto)}
+}
+.kw-cell{border-right:1px solid var(--border);border-bottom:1px solid var(--border);background:rgba(15,21,32,0.6);display:flex;flex-direction:column;align-items:center;justify-content:flex-start;padding:7px 2px 4px;font-size:.66rem;font-weight:600;color:var(--muted);cursor:pointer;user-select:none;transition:color .15s,background .15s}
+.kw-cell:hover{color:var(--accent);background:rgba(56,189,248,0.07)}
+
+.day{min-width:0;overflow:hidden;border-right:1px solid var(--border);border-bottom:1px solid var(--border);padding:6px;display:flex;flex-direction:column;gap:4px;position:relative;background:var(--surface);transition:background .12s ease;cursor:pointer}
+.day:nth-child(8n){border-right:none}
+.day.wknd{background:rgba(255,255,255,0.01)}
+.day.other{background:rgba(7,10,15,0.65)}
+.day.other .dnum-txt,.day.other .pill{opacity:.42}
+.day:hover{background:var(--surface-2)}
+.day.today{background:linear-gradient(180deg,rgba(56,189,248,0.09),rgba(13,18,27,0.95))}
+.day.today::before{content:"";position:absolute;top:0;left:0;right:0;height:2px;background:var(--accent);box-shadow:0 0 10px var(--accent)}
+
+.dhead{display:flex;justify-content:space-between;align-items:center;margin-bottom:2px;min-width:0}
+.dnum-txt{font-size:.76rem;font-weight:600;color:var(--muted-hi);display:inline-flex;align-items:center;gap:4px;line-height:1}
+.day.today .dnum-txt{background:var(--accent);color:#041019;font-weight:800;padding:3px 7px;border-radius:99px;box-shadow:0 0 12px rgba(56,189,248,0.45)}
+.today-tag{font-size:.58rem;font-weight:800;text-transform:uppercase;letter-spacing:.05em;color:var(--accent)}
+.dcount{font-size:.62rem;color:var(--muted);font-weight:600}
+
+/* Event Pills inside Day Cells */
+.pill{min-width:0;max-width:100%;overflow:hidden;padding:3.5px 6px;border-radius:5px;border-left:3px solid var(--accent);background:var(--surface-3);color:var(--text);font-size:.71rem;line-height:1.25;display:flex;flex-direction:column;gap:1px;cursor:pointer;transition:transform .1s ease,filter .12s ease}
+.pill:hover{filter:brightness(1.15);transform:translateY(-1px)}
+.pill-top{display:flex;align-items:center;gap:4px;min-width:0}
+.pill-ico{font-size:.68rem;flex-shrink:0;line-height:1}
+.pill-time{font-size:.63rem;font-weight:700;opacity:.85;flex-shrink:0}
+.pill-txt{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-word;white-space:normal;font-weight:500;min-width:0;flex:1}
+.pill-meta{font-size:.61rem;opacity:.8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.more-pill{font-size:.66rem;font-weight:600;color:var(--accent);padding:2px 5px;border-radius:4px;background:rgba(56,189,248,0.08);text-align:center}
+
+.pill.workout-done{border-left-color:var(--workout);background:var(--workout-bg);color:var(--workout-tx)}
+.pill.workout-open{border-left-color:var(--plan);background:var(--plan-bg);color:var(--plan-tx)}
+.pill.workout-skipped{border-left-color:#64748b;background:rgba(100,116,139,0.12);color:#94a3b8;text-decoration:line-through}
+.pill.goal{border-left-color:var(--goal);background:var(--goal-bg);color:var(--goal-tx);font-weight:600}
+.pill.blocked{border-left-color:var(--blocked);background:var(--blocked-bg);color:var(--blocked-tx)}
+.pill.event{border-left-color:var(--event);background:var(--event-bg);color:var(--event-tx)}
+.pill.deadline{border-left-color:var(--deadline);background:var(--deadline-bg);color:var(--deadline-tx)}
+.pill.todo{border-left-color:var(--todo);background:var(--todo-bg);color:var(--todo-tx)}
+.pill.todo-done{border-left-color:#10b981;background:rgba(16,185,129,0.09);color:#94a3b8;text-decoration:line-through}
+.pill.birthday{border-left-color:var(--bday);background:var(--bday-bg);color:var(--bday-tx)}
+
+/* Week View */
+.week-list{display:flex;flex-direction:column}
+.wday-row{display:grid;grid-template-columns:130px minmax(0,1fr);border-bottom:1px solid var(--border);min-height:76px;transition:background .12s}
+.wday-row:last-child{border-bottom:none}
+.wday-row:hover{background:rgba(255,255,255,0.015)}
+.wday-row.today{background:linear-gradient(90deg,rgba(56,189,248,0.09),transparent)}
+@media(max-width:600px){.wday-row{grid-template-columns:92px minmax(0,1fr)}}
+.wday-left{padding:12px;border-right:1px solid var(--border);display:flex;flex-direction:column;gap:2px}
+.wday-dow{font-size:.72rem;font-weight:700;text-transform:uppercase;color:var(--muted-hi)}
+.wday-date{font-size:1.05rem;font-weight:800;color:var(--text)}
+.wday-row.today .wday-date{color:var(--accent)}
+.wday-right{padding:10px 12px;display:flex;flex-direction:column;gap:7px;justify-content:center;min-width:0}
+.wday-empty{font-size:.76rem;color:var(--muted);font-style:italic}
+
+/* Agenda View */
+.agenda-view{padding:14px;display:flex;flex-direction:column;gap:16px}
+.ag-group{display:flex;flex-direction:column;gap:7px}
+.ag-month-hdr{font-size:.76rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--accent);padding-bottom:4px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between}
+.ag-item{display:grid;grid-template-columns:105px minmax(0,1fr) auto;gap:12px;align-items:center;padding:10px 12px;background:var(--surface-2);border:1px solid var(--border);border-radius:9px;cursor:pointer;transition:border-color .15s,background .15s}
+.ag-item:hover{border-color:var(--border-hi);background:var(--surface-3)}
+@media(max-width:600px){.ag-item{grid-template-columns:82px minmax(0,1fr)}}
+.ag-date-col{display:flex;flex-direction:column}
+.ag-date-main{font-size:.8rem;font-weight:700;color:var(--text)}
+.ag-date-sub{font-size:.68rem;color:var(--muted-hi)}
+
+/* Sidebar */
+.side{display:flex;flex-direction:column;gap:12px;min-width:0}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:14px;display:flex;flex-direction:column;gap:10px;box-shadow:0 6px 20px rgba(0,0,0,0.25);min-width:0}
+.card-hdr{display:flex;justify-content:space-between;align-items:center;gap:8px}
+.card-title{font-size:.76rem;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--muted-hi);display:flex;align-items:center;gap:6px}
+.card-badge{font-size:.68rem;font-weight:600;padding:1px 7px;border-radius:99px;background:var(--surface-3);color:var(--text-dim)}
+.list{display:flex;flex-direction:column;gap:7px;max-height:340px;overflow-y:auto;padding-right:2px}
+.list::-webkit-scrollbar{width:5px}
+.list::-webkit-scrollbar-thumb{background:var(--surface-3);border-radius:99px}
+
+.row{font-size:.79rem;padding:9px 11px;border-radius:8px;background:var(--surface-2);border:1px solid var(--border);display:flex;justify-content:space-between;gap:10px;align-items:flex-start;cursor:pointer;transition:border-color .15s,background .15s;min-width:0}
+.row:hover{border-color:var(--border-hi);background:var(--surface-3)}
+.row-main{min-width:0;flex:1;display:flex;flex-direction:column;gap:3px}
+.row-title{font-weight:600;color:var(--text);word-break:break-word;line-height:1.3}
+.row-sub{font-size:.7rem;color:var(--muted-hi);display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.ctx-snip{font-size:.69rem;color:var(--text-dim);background:rgba(7,10,15,0.55);padding:4px 7px;border-radius:5px;border-left:2px solid var(--accent);margin-top:2px;word-break:break-word}
+.tag{font-size:.67rem;font-weight:600;padding:2px 7px;border-radius:5px;background:var(--surface-3);color:var(--text-dim);white-space:nowrap;flex-shrink:0}
+.tag.high,.tag.overdue{background:rgba(244,63,94,0.18);color:#fda4af;border:1px solid rgba(244,63,94,0.3)}
+.tag.med{background:rgba(249,115,22,0.16);color:#fdba74;border:1px solid rgba(249,115,22,0.3)}
+.tag.low{background:rgba(56,189,248,0.14);color:#bae6fd}
+.tag.goal{background:rgba(245,158,11,0.18);color:#fde68a;border:1px solid rgba(245,158,11,0.3)}
+.tag.ok{background:rgba(16,185,129,0.16);color:#6ee7b7;border:1px solid rgba(16,185,129,0.3)}
+.empty-box{font-size:.78rem;color:var(--muted-hi);padding:12px;border-radius:8px;background:rgba(255,255,255,0.02);border:1px dashed var(--border);display:flex;flex-direction:column;gap:6px}
+.code-hint{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.7rem;background:var(--bg);padding:5px 8px;border-radius:5px;color:var(--accent);border:1px solid var(--border);cursor:pointer;word-break:break-all}
+
+/* Toast Notification */
+.toast{position:fixed;bottom:18px;right:18px;background:rgba(13,18,27,0.96);border:1px solid var(--border-hi);color:var(--text);padding:10px 14px;border-radius:10px;font-size:.78rem;box-shadow:0 14px 36px rgba(0,0,0,0.55);display:none;align-items:center;gap:8px;z-index:120;max-width:420px}
+.toast.show{display:flex}
+.toast.err{border-color:rgba(244,63,94,0.5);color:#fecdd3}
+.toast.ok{border-color:rgba(16,185,129,0.45);color:#a7f3d0}
+
+/* Modal */
+.modal-backdrop{position:fixed;inset:0;background:rgba(3,6,12,0.75);backdrop-filter:blur(6px);display:none;align-items:center;justify-content:center;padding:16px;z-index:100}
+.modal-backdrop.open{display:flex}
+.modal{background:var(--surface);border:1px solid var(--border-hi);border-radius:14px;max-width:560px;width:100%;padding:20px;box-shadow:0 24px 60px rgba(0,0,0,0.65);display:flex;flex-direction:column;gap:14px}
+.modal-top{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
+.modal-title{font-size:1.05rem;font-weight:700;color:var(--text);line-height:1.35}
+.modal-close{background:var(--surface-2);border:1px solid var(--border);color:var(--muted-hi);width:28px;height:28px;border-radius:7px;cursor:pointer;font-size:.9rem}
+.modal-close:hover{color:#fff;background:var(--surface-3)}
+.modal-meta{display:flex;flex-wrap:wrap;gap:8px}
+.modal-body{font-size:.84rem;color:var(--text-dim);background:var(--surface-2);padding:12px;border-radius:9px;border:1px solid var(--border);display:flex;flex-direction:column;gap:8px}
+.modal-actions{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:8px}
+.btn-act{background:var(--surface-3);color:var(--text);border:1px solid var(--border-hi);padding:6px 12px;border-radius:7px;font-size:.76rem;font-weight:600;cursor:pointer}
+.btn-act:hover{border-color:var(--accent);color:var(--accent)}
+</style></head><body>
+<div class="shell">
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-icon" id="brand-ico">📅</div>
+      <div>
+        <div class="brand-title">Atlas · Calendar, Coach &amp; Brain Hub</div>
+        <div class="brand-sub">
+          <span class="live-pill"><span class="live-dot"></span>Atlas-First · Live</span>
+          <span id="today-sub"></span>
+        </div>
+      </div>
+    </div>
+    <div class="toolbar">
+      <div class="seg" role="tablist">
+        <button id="f-all" class="active" onclick="setFilter('all')">Alle <span class="cnt" id="cnt-all">0</span></button>
+        <button id="f-coach" onclick="setFilter('coach')">🚴 Coach View <span class="cnt" id="cnt-coach">0</span></button>
+        <button id="f-todo" onclick="setFilter('todo')">☑️ To-Dos &amp; Fristen <span class="cnt" id="cnt-todo">0</span></button>
+        <button id="f-graph" onclick="setFilter('graph')">🕸️ Brain Graph <span class="cnt" id="cnt-graph">0</span></button>
+      </div>
+      <div class="search-wrap">
+        <span class="search-ico">🔍</span>
+        <input id="q-in" class="search-in" type="search" placeholder="Filtern… (/)" oninput="setQuery(this.value)">
+      </div>
+      <div class="seg" id="layout-seg">
+        <button id="v-month" class="active" onclick="setLayout('month')">Monat</button>
+        <button id="v-week" onclick="setLayout('week')">Woche</button>
+        <button id="v-agenda" onclick="setLayout('agenda')">Agenda</button>
+      </div>
+      <div class="nav-grp" id="cal-nav">
+        <button class="nav-btn" onclick="stepNav(-1)" title="Zurück (◀)">◀</button>
+        <span class="nav-label" id="mlabel" onclick="goToday()" title="Springe zu Heute (T)"></span>
+        <button class="nav-btn" onclick="stepNav(1)" title="Vor (▶)">▶</button>
+        <button class="nav-btn" onclick="goToday()" style="border-left:1px solid var(--border);color:var(--accent)">Heute</button>
+      </div>
+    </div>
+  </header>
+
+  <section id="coach-ribbon" class="coach-ribbon"></section>
+
+  <section class="kpi-strip" id="kpi-strip"></section>
+
+  <div class="workspace">
+    <main class="cal-box" id="cal-main"></main>
+    <aside class="side">
+      <div class="card"><div class="card-hdr"><div class="card-title" id="s1-title"></div><span class="card-badge" id="s1-cnt"></span></div><div class="list" id="s1-list"></div></div>
+      <div class="card"><div class="card-hdr"><div class="card-title" id="s2-title"></div><span class="card-badge" id="s2-cnt"></span></div><div class="list" id="s2-list"></div></div>
+      <div class="card"><div class="card-hdr"><div class="card-title" id="s3-title"></div><span class="card-badge" id="s3-cnt"></span></div><div class="list" id="s3-list"></div></div>
+    </aside>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<div class="modal-backdrop" id="modal-bg" onclick="if(event.target===this)closeModal()">
+  <div class="modal">
+    <div class="modal-top">
+      <div class="modal-title" id="m-title"></div>
+      <button class="modal-close" onclick="closeModal()">✕</button>
+    </div>
+    <div class="modal-meta" id="m-meta"></div>
+    <div class="modal-body" id="m-body"></div>
+    <div class="modal-actions">
+      <button class="btn-act" id="m-toggle" style="display:none"></button>
+      <button class="btn-act" id="m-copy">📋 Quelle / Markdown kopieren</button>
+      <button class="btn-act" onclick="closeModal()">Schließen</button>
+    </div>
+  </div>
+</div>
+
+<script>
+let DATA = __DATA_JSON__;
+const MONTHS = ['Januar','Februar','März','April','Mai','Juni','Juli','August','September','Oktober','November','Dezember'];
+const MONTHS_SHORT = ['Jan','Feb','Mär','Apr','Mai','Jun','Jul','Aug','Sep','Okt','Nov','Dez'];
+const DOWS = ['Mo','Di','Mi','Do','Fr','Sa','So'];
+const DOMAIN_COLORS = {
+  people:'#ec4899', areas:'#38bdf8', projects:'#8b5cf6', howto:'#f59e0b',
+  self:'#10b981', coach:'#14b8a6', calendar:'#f97316', journal:'#94a3b8',
+  inbox:'#eab308', skills:'#a855f7', root:'#6366f1', other:'#64748b'
+};
+
+let cur = new Date(DATA.today + "T00:00:00");
+const _urlView = new URLSearchParams(window.location.search).get("view");
+if(_urlView && ["all","coach","todo","graph"].includes(_urlView)) sessionStorage.setItem("atlas_cal_filter", _urlView);
+let filter = sessionStorage.getItem("atlas_cal_filter") || "all";
+if(!["all","coach","todo","graph"].includes(filter)) filter = "all";
+let layout = sessionStorage.getItem("atlas_cal_layout") || "month";
+let query = "";
+let pcurveTab = "epochs"; // 'epochs' | 'durability'
+
+// Brain Graph state
+let graphDomainFilter = "all"; // 'all'|'people'|'areas'|'projects'|'howto'|'isolated'|'stale'
+let graphShowHubs = false;
+let graphSelectedRel = null;
+let graphHoverRel = null;
+let graphSim = { nodes: [], edges: [], byRel: {}, camX: 0, camY: 0, scale: 1, ticks: 0, raf: 0, key: "", dragNode: null, panning: false, lastX: 0, lastY: 0, moved: false };
+let _toastTimer = null;
+
+function showToast(msg, kind='ok'){
+  const el = document.getElementById('toast');
+  if(!el) return;
+  el.textContent = msg;
+  el.className = 'toast show ' + kind;
+  if(_toastTimer) clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(()=>{ el.classList.remove('show'); }, 3200);
+}
+
+function iso(d){ return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); }
+function parseIso(s){ const [y,m,d]=s.split('-').map(Number); return new Date(y,m-1,d); }
+function getKW(d){
+  const t = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+  const dayNum = t.getUTCDay() || 7;
+  t.setUTCDate(t.getUTCDate() + 4 - dayNum);
+  const yearStart = new Date(Date.UTC(t.getUTCFullYear(),0,1));
+  return Math.ceil((((t - yearStart) / 86400000) + 1)/7);
+}
+function fmtDateDE(s){
+  const [y,m,d] = String(s||'').split('-');
+  return d ? `${d}.${m}.${y}` : String(s||'');
+}
+function esc(s){
+  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function compactTitle(what){
+  let s = String(what||'');
+  const mAmt = s.match(/(\d[\d.,]*\s*€(?:\s*\/\s*(?:Monat|M|Jahr|J|Quartal))?)/);
+  let main = s.replace(/\s*\((?:Eingang|doppeltes|übergesetzliche|30 Tage|seit \d+|je \d+).*?\)/gi, '').trim();
+  if(main.length > 68 && main.includes('(')) main = main.split('(')[0].trim();
+  return {main: main || s, meta: mAmt ? mAmt[1] : ''};
+}
+function coachMode(){
+  const c = DATA.coach || {};
+  const d = String(c.depth || 'standard').toLowerCase();
+  if(d === 'simple') return 'simple';
+  const tel = c.telemetry || {};
+  if(d === 'pro' || (tel.cp_model && tel.cp_model.valid) || (tel.pmc && (tel.pmc.ctl > 0 || tel.pmc.weekly_load_7d > 0))) return 'pro';
+  return 'standard';
+}
+function isCoachItem(it){
+  return ['workout','blocked','goal'].includes(it.kind) || (it.kind==='event' && Boolean(it.time));
+}
+function isTodoItem(it){
+  return ['todo','deadline'].includes(it.kind);
+}
+function keepItem(it){
+  if(filter==='coach' && !isCoachItem(it)) return false;
+  if(filter==='todo' && !isTodoItem(it)) return false;
+  if(query){
+    const q = query.toLowerCase();
+    const hay = `${it.what} ${it.kind} ${it.subkind||''} ${it.rel||''} ${it.start}`.toLowerCase();
+    if(!hay.includes(q)) return false;
+  }
+  return true;
+}
+function pillClass(it){
+  if(it.kind==='workout') return 'pill workout-' + it.status;
+  if(it.kind==='todo' && it.status==='done') return 'pill todo-done';
+  return 'pill ' + it.kind;
+}
+function icon(it){
+  if(it.kind==='workout') return (it.status==='done'?'✓':it.status==='skipped'?'–':(it.subkind==='strength'?'🏋️':it.subkind==='running'?'🏃':'🚴'));
+  if(it.kind==='goal') return '🏆';
+  if(it.kind==='blocked') return '🚫';
+  if(it.kind==='birthday') return (it.subkind==='anniversary'?'❤️':'🎂');
+  if(it.kind==='deadline') return '⏳';
+  if(it.kind==='todo') return (it.status==='done'?'✅':'☑️');
+  return '📅';
+}
+function deltaLabel(delta){
+  if(delta===0) return 'heute';
+  if(delta===1) return 'morgen';
+  if(delta===-1) return 'gestern';
+  return delta < 0 ? `vor ${-delta}d` : `in ${delta}d`;
+}
+function setFilter(f){
+  filter = f;
+  sessionStorage.setItem("atlas_cal_filter", f);
+  const url = new URL(window.location.href);
+  if(f === 'all') url.searchParams.delete('view');
+  else url.searchParams.set('view', f);
+  try { window.history.replaceState({}, '', url.toString()); } catch(_e){}
+  render();
+}
+function setLayout(l){
+  layout = l;
+  sessionStorage.setItem("atlas_cal_layout", l);
+  render();
+}
+function setQuery(q){
+  query = (q||'').trim();
+  if(filter === 'graph'){
+    graphSim.key = '';
+    renderKPIs();
+    renderGraphMain();
+    renderSidebar();
+  } else {
+    render();
+  }
+}
+function setPcurveTab(t){
+  pcurveTab = t;
+  renderSidebar();
+}
+function stepNav(dir){
+  if(filter==='graph') return;
+  if(layout==='week'){
+    cur = new Date(cur.getFullYear(), cur.getMonth(), cur.getDate() + dir*7);
+  } else {
+    cur = new Date(cur.getFullYear(), cur.getMonth() + dir, 1);
+  }
+  render();
+}
+function goToday(){
+  cur = new Date(DATA.today + "T00:00:00");
+  render();
+}
+function openWeekOf(dateStr){
+  cur = parseIso(dateStr);
+  setLayout('week');
+}
+function zoneColor(z){
+  if(z<=1) return '#64748b';
+  if(z===2) return '#38bdf8';
+  if(z===3) return '#10b981';
+  if(z===4) return '#f59e0b';
+  if(z===5) return '#f43f5e';
+  return '#a855f7';
+}
+function renderWkoBars(it, tall=false){
+  if(coachMode()==='simple') return '';
+  const blks = it.visual_blocks || [];
+  if(!blks.length) return '';
+  const tot = blks.reduce((s,b)=>s+(b.sec||60), 0) || 1;
+  const h = tall ? 28 : 11;
+  return `<div class="wko-bars" style="height:${h}px" title="Intervall-Struktur (${it.total_min||0} min)">` +
+    blks.map(b => {
+      const wPct = Math.max(2, (b.sec/tot)*100);
+      const hPct = Math.min(100, Math.max(22, Math.round((b.pct||0.65)*78)));
+      return `<div class="wko-bar" style="width:${wPct.toFixed(1)}%;height:${hPct}%;background:${zoneColor(b.zone||2)}" title="${esc(b.label||'Block')}"></div>`;
+    }).join('') + `</div>`;
+}
+function downloadZwo(idx){
+  const it = DATA.items[idx];
+  if(!it || !it.zwo_xml) return;
+  const blob = new Blob([it.zwo_xml], {type: 'application/xml'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = it.zwo_filename || `${it.start}_workout.zwo`;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(()=>{ document.body.removeChild(a); URL.revokeObjectURL(url); }, 150);
+}
+function kwPhaseMap(){
+  const m = (DATA.coach && DATA.coach.macro && DATA.coach.macro.weeks) || [];
+  const out = {};
+  for(const w of m){ out[String(w.kw).replace(/^0+/,'')] = w; }
+  return out;
+}
+
+/* ---------------- CSRF-Protected /toggle-todo ---------------- */
+async function postToggleTodo(reqPayload){
+  const res = await fetch('/toggle-todo', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Atlas-CSRF': DATA.csrf_token || ''
+    },
+    body: JSON.stringify(Object.assign({}, reqPayload, {csrf_token: DATA.csrf_token || ''}))
+  });
+  let body = {};
+  try { body = await res.json(); } catch(_e){}
+  if(!res.ok || !body.ok){
+    throw new Error(body.error || `HTTP ${res.status}`);
+  }
+  return body;
+}
+
+async function toggleDatedItem(idx, ev){
+  if(ev) ev.stopPropagation();
+  const it = DATA.items[idx];
+  if(!it || !it.can_toggle) return;
+  const prevStatus = it.status;
+  const wantDone = prevStatus !== 'done';
+  it.status = wantDone ? 'done' : 'open';
+  render();
+  try {
+    const out = await postToggleTodo({rel: it.rel, line: it.line, what: it.what, done: wantDone});
+    it.status = out.done ? 'done' : 'open';
+    showToast(`${out.done ? '✓ Erledigt' : '↺ Wieder offen'}: ${it.what.slice(0, 48)} (${out.rel})`, 'ok');
+    render();
+  } catch(err){
+    it.status = prevStatus;
+    render();
+    showToast(`Offline / Schreibschutz (${err.message}) — bitte über den lokalen Atlas-Server öffnen.`, 'err');
+  }
+}
+
+async function toggleUndatedTodo(tIdx, ev){
+  if(ev) ev.stopPropagation();
+  const td = DATA.todos[tIdx];
+  if(!td || !td.can_toggle) return;
+  const prevStatus = td.status;
+  const wantDone = prevStatus !== 'done';
+  td.status = wantDone ? 'done' : 'open';
+  render();
+  try {
+    const out = await postToggleTodo({rel: td.rel, line: td.line, what: td.what, done: wantDone});
+    if(out.done){
+      DATA.todos.splice(tIdx, 1);
+    } else {
+      td.status = 'open';
+    }
+    showToast(`${out.done ? '✓ To-Do abgehakt' : '↺ Wieder offen'}: ${td.what.slice(0, 48)} (${out.rel})`, 'ok');
+    render();
+  } catch(err){
+    td.status = prevStatus;
+    render();
+    showToast(`Offline / Schreibschutz (${err.message}) — bitte über den lokalen Atlas-Server öffnen.`, 'err');
+  }
+}
+
+function showItemModal(idx){
+  const it = DATA.items[idx];
+  if(!it) return;
+  const bg = document.getElementById('modal-bg');
+  document.getElementById('m-title').textContent = `${icon(it)} ${it.what}`;
+  const kw = getKW(parseIso(it.start));
+  const kindLbl = it.subkind ? `${it.kind.toUpperCase()} · ${it.subkind.toUpperCase()}` : it.kind.toUpperCase();
+  const mode = coachMode();
+  document.getElementById('m-meta').innerHTML = `
+    <span class="tag goal">${esc(kindLbl)}</span>
+    <span class="tag">${esc(fmtDateDE(it.start))}${it.end!==it.start?' – '+esc(fmtDateDE(it.end)):''} · KW ${kw}</span>
+    ${it.time?`<span class="tag">🕒 ${esc(it.time)}</span>`:''}
+    <span class="tag ${it.delta<0 && it.status!=='done'?'overdue':'ok'}">${esc(deltaLabel(it.delta))} (${(it.delta/7).toFixed(1)}w)</span>
+    ${mode!=='simple' && it.np_w?`<span class="tag ok">⚡ NP ${it.np_w} W</span>`:''}
+    ${mode!=='simple' && it.avg_hr?`<span class="tag">❤️ ${it.avg_hr} bpm</span>`:''}
+    ${mode!=='simple' && it.tss?`<span class="tag low">📈 TSS ${Math.round(it.tss)}</span>`:''}
+    ${mode!=='simple' && it.w_bal_min_pct!=null?`<span class="tag ${it.w_bal_min_pct<25?'med':'ok'}">🔋 W'bal min ${Math.round(it.w_bal_min_pct)}%</span>`:''}
+    ${mode!=='simple' && it.matches_burned?`<span class="tag med">🔥 ${it.matches_burned} Match(es)</span>`:''}
+    ${mode!=='simple' && it.cho_burn_g?`<span class="tag">🍌 ${Math.round(it.cho_burn_g)}g CHO</span>`:''}
+  `;
+  let extra = '';
+  if(mode!=='simple' && it.visual_blocks && it.visual_blocks.length){
+    extra += `<div><strong>Intervall-Struktur (${it.total_min||0} min):</strong>${renderWkoBars(it, true)}</div>`;
+  }
+  if(it.feedback){
+    extra += `<div><strong>Athleten-Feedback:</strong><br><span style="color:#6ee7b7">${esc(it.feedback)}</span></div>`;
+  } else if(mode!=='simple' && it.feedback_pending){
+    extra += `<div style="color:#fde68a"><strong>⚠ Check-in offen:</strong> Noch keine subjektive Notiz (RPE / Beine) hinterlegt.<br><code>atlas.py coach note --date ${esc(it.start)} --text "..."</code></div>`;
+  }
+  if(mode!=='simple' && it.zwo_xml){
+    extra += `<div style="margin-top:4px"><button class="btn-act" style="border-color:var(--workout);color:#6ee7b7" onclick="downloadZwo(${idx})">⬇ .zwo Workout herunterladen (${esc(it.zwo_filename||'workout.zwo')})</button></div>`;
+  }
+  document.getElementById('m-body').innerHTML = `
+    <div><strong>Beschreibung:</strong><br>${esc(it.what)}</div>
+    ${extra}
+    <div style="color:var(--muted-hi);font-size:.76rem"><strong>Quelle im Brain:</strong> <code>${esc(it.rel)}${it.line?':'+it.line:''}</code></div>
+  `;
+  const tglBtn = document.getElementById('m-toggle');
+  if(it.can_toggle){
+    tglBtn.style.display = 'inline-block';
+    tglBtn.textContent = it.status==='done' ? '↺ Wieder als offen markieren' : '✓ Als erledigt abhaken';
+    tglBtn.style.borderColor = it.status==='done' ? 'var(--border-hi)' : 'var(--workout)';
+    tglBtn.style.color = it.status==='done' ? 'var(--text)' : '#6ee7b7';
+    tglBtn.onclick = async () => { closeModal(); await toggleDatedItem(idx); };
+  } else {
+    tglBtn.style.display = 'none';
+  }
+  const copyBtn = document.getElementById('m-copy');
+  copyBtn.onclick = () => {
+    navigator.clipboard.writeText(`${it.start} [${it.kind}] ${it.what} (${it.rel})`);
+    copyBtn.textContent = '✓ Kopiert!';
+    setTimeout(()=>copyBtn.textContent='📋 Quelle / Markdown kopieren', 1500);
+  };
+  bg.classList.add('open');
+}
+
+function showDayModal(ds){
+  const d = parseIso(ds);
+  const kw = getKW(d);
+  const dayItems = DATA.items.map((it,idx)=>({it,idx})).filter(x => keepItem(x.it) && x.it.start <= ds && ds <= x.it.end);
+  const bg = document.getElementById('modal-bg');
+  const dowName = DOWS[(d.getDay()+6)%7];
+  document.getElementById('m-title').textContent = `${dowName}, ${fmtDateDE(ds)} (KW ${kw})`;
+  document.getElementById('m-meta').innerHTML = `<span class="tag">${dayItems.length} Einträge</span>`;
+  document.getElementById('m-toggle').style.display = 'none';
+  const defKind = filter==='coach' ? 'workout:cycling' : (filter==='todo' ? 'todo' : 'event');
+  const snippet = `- [ ] ${ds} [${defKind}] `;
+  document.getElementById('m-body').innerHTML = (dayItems.length ? dayItems.map(({it,idx}) => `
+    <div class="row ${it.status==='done'?'is-done':''}" onclick="showItemModal(${idx})">
+      ${it.can_toggle ? `<button class="cb-btn ${it.status==='done'?'done':''}" onclick="toggleDatedItem(${idx}, event)" title="Abhaken">${it.status==='done'?'✓':''}</button>` : ''}
+      <div class="row-main">
+        <div class="row-title">${icon(it)} ${it.time?esc(it.time)+' ':''}${esc(it.what)}</div>
+        <div class="row-sub"><span>${esc(it.kind)}${it.subkind?':'+esc(it.subkind):''}</span> · <span>${esc(it.rel)}</span></div>
+      </div>
+    </div>
+  `).join('') : '<div style="color:var(--muted-hi)">Keine Einträge an diesem Tag.</div>') + `
+    <div style="margin-top:6px;font-size:.73rem;color:var(--muted-hi)">Markdown-Vorlage für <code>brain/calendar/README.md</code>:</div>
+    <div class="code-hint" onclick="navigator.clipboard.writeText('${snippet}')">${esc(snippet)}… (Klicken zum Kopieren)</div>
+  `;
+  const copyBtn = document.getElementById('m-copy');
+  copyBtn.onclick = () => {
+    navigator.clipboard.writeText(snippet);
+    copyBtn.textContent = '✓ Vorlage kopiert!';
+    setTimeout(()=>copyBtn.textContent='📋 Quelle / Markdown kopieren', 1500);
+  };
+  bg.classList.add('open');
+}
+function closeModal(){ document.getElementById('modal-bg').classList.remove('open'); }
+
+/* ---------------- SVG 42d PMC Sparkline ---------------- */
+function renderPmcSparkline(series){
+  if(!series || series.length < 2) return '';
+  const w = 180, h = 36, pad = 3;
+  const vals = [];
+  for(const pt of series){ vals.push(pt.ctl||0, pt.atl||0); }
+  const minV = Math.min(0, ...vals);
+  const maxV = Math.max(20, ...vals);
+  const span = (maxV - minV) || 1;
+  const xAt = i => (pad + (i / (series.length - 1)) * (w - pad*2)).toFixed(1);
+  const yAt = v => (h - pad - ((v - minV) / span) * (h - pad*2)).toFixed(1);
+  const ctlPts = series.map((p,i)=>`${xAt(i)},${yAt(p.ctl||0)}`).join(' ');
+  const atlPts = series.map((p,i)=>`${xAt(i)},${yAt(p.atl||0)}`).join(' ');
+  return `<svg class="pmc-spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" aria-label="42d CTL ATL Trend">
+    <polyline fill="none" stroke="rgba(244,63,94,0.65)" stroke-width="1.4" points="${atlPts}"/>
+    <polyline fill="none" stroke="#38bdf8" stroke-width="2" points="${ctlPts}"/>
+  </svg>`;
+}
+
+/* ---------------- Adaptive Coach Ribbon & KPI Strip ---------------- */
+function renderCoachRibbon(coach){
+  const coachRib = document.getElementById('coach-ribbon');
+  if(filter !== 'coach'){
+    coachRib.classList.remove('show', 'simple-mode');
+    return;
+  }
+  const mode = coachMode();
+  const tel = coach.telemetry || {};
+  coachRib.classList.add('show');
+  coachRib.classList.toggle('simple-mode', mode === 'simple');
+
+  if(mode === 'simple'){
+    const sched = coach.schedule ? `🕒 Bewegungsfenster: ${esc(coach.schedule)}` : '🕒 Flexibles Wochenfenster';
+    const nextGoal = (DATA.items || []).find(i => i.kind==='goal' && i.delta>=0 && i.status==='open');
+    coachRib.innerHTML = `
+      <div class="coach-hdr">
+        <div class="coach-title">🌱 Gewohnheits- &amp; Wochen-Ansicht <span class="tag low">Simple Mode</span></div>
+        <div style="font-size:.73rem;color:var(--muted-hi)">${sched}</div>
+      </div>
+      <div class="macro-banner" style="border-color:rgba(56,189,248,0.22)">
+        <div><strong>✨ Fokus:</strong> Ruhige Konstanz vor Komplexität — jede erledigte Einheit zählt.</div>
+        ${nextGoal ? `<span class="tag goal">🎯 ${esc(nextGoal.what)} (in ${nextGoal.delta}d)</span>` : `<span class="tag ok">✓ Freier Gewohnheits-Rhythmus</span>`}
+      </div>
+    `;
+    return;
+  }
+
+  // Standard & Pro Mode
+  const rdy = tel.readiness || {};
+  const rdyStatus = rdy.status || 'GREEN';
+  const rdyReasons = (rdy.reasons || []).slice(0, 2).join(' · ');
+  const mp = coach.macro || {active_phase:'Base', stale:false, stale_reason:'', updated:''};
+  const fbPend = (coach.pending_feedback||[]).length;
+  const pmc = tel.pmc || {};
+  const cpM = tel.cp_model || {};
+  const csM = tel.cs_model || {};
+  const typ = tel.typology || {};
+  const met = tel.metabolic || {};
+
+  let proChips = '';
+  if(cpM.valid && cpM.cp_w){
+    proChips += `<div class="phys-chip pro-hi"><span>⚡</span><span class="k">CP / W':</span><strong class="v">${cpM.cp_w} W · ${cpM.w_prime_kj||'—'} kJ</strong></div>`;
+  }
+  if(typ.typology && typ.typology !== 'Unknown'){
+    proChips += `<div class="phys-chip pro-hi"><span>🧬</span><span class="k">Typologie:</span><strong class="v">${esc(typ.typology)}${typ.p5s_cp?' (P5s/CP '+typ.p5s_cp+')':''}</strong></div>`;
+  }
+  if(csM.valid && csM.cs_pace_fmt){
+    proChips += `<div class="phys-chip pro-hi"><span>🏃</span><span class="k">CS / D':</span><strong class="v">${esc(csM.cs_pace_fmt)}${csM.d_prime_m?' · '+csM.d_prime_m+'m':''}</strong></div>`;
+  }
+  if(met.vo2max_storer || met.vo2max_uth){
+    const vVal = met.vo2max_storer || met.vo2max_uth;
+    proChips += `<div class="phys-chip"><span>🫁</span><span class="k">VO₂max (est.):</span><strong class="v">${vVal} ml/kg</strong></div>`;
+  }
+  if(met.fatmax_watts){
+    proChips += `<div class="phys-chip"><span>🔥</span><span class="k">FatMax / LT1:</span><strong class="v">${met.fatmax_watts} W</strong></div>`;
+  }
+  if(met.glycolytic_band){
+    proChips += `<div class="phys-chip"><span>🧪</span><span class="k">Glykolytisch:</span><strong class="v">${esc(met.glycolytic_band)}</strong></div>`;
+  }
+  const baseChips = (coach.metrics || []).map(m =>
+    `<div class="phys-chip"><span>${esc(m.icon||'⚡')}</span><span class="k">${esc(m.label)}:</span><strong class="v">${esc(m.value)}</strong></div>`
+  ).join('');
+
+  const showPmc = (mode === 'pro') || (pmc.ctl > 0 || pmc.atl > 0 || pmc.weekly_load_7d > 0);
+  const tsbVal = Number(pmc.tsb || 0);
+  const tsbCol = tsbVal < -20 ? '#fda4af' : (tsbVal > 5 ? '#6ee7b7' : '#bae6fd');
+  const acwrVal = Number(pmc.acwr || 0);
+  const pmcHtml = showPmc ? `
+    <div class="pmc-strip">
+      <div class="pmc-cell"><span class="pmc-lbl">Fitness (CTL)</span><span class="pmc-val" style="color:#38bdf8">${(pmc.ctl||0).toFixed(1)}</span></div>
+      <div class="pmc-cell"><span class="pmc-lbl">Fatigue (ATL)</span><span class="pmc-val" style="color:#fda4af">${(pmc.atl||0).toFixed(1)}</span></div>
+      <div class="pmc-cell"><span class="pmc-lbl">Form (TSB)</span><span class="pmc-val" style="color:${tsbCol}">${tsbVal>=0?'+':''}${tsbVal.toFixed(1)}</span></div>
+      <div class="pmc-cell"><span class="pmc-lbl">ACWR / Ramp</span><span class="pmc-val" style="color:${acwrVal>1.35?'#fde68a':'var(--text)'}">${acwrVal.toFixed(2)} · ${(pmc.ramp_7d||0)>=0?'+':''}${(pmc.ramp_7d||0).toFixed(1)}</span></div>
+      <div class="pmc-cell"><span class="pmc-lbl">7d Load</span><span class="pmc-val">${Math.round(pmc.weekly_load_7d||0)} TSS</span></div>
+      <div class="pmc-cell" title="42d Trend: CTL (Blau) vs. ATL (Rot)">${renderPmcSparkline(pmc.series_42d||[])}</div>
+    </div>
+  ` : '';
+
+  const guards = []
+    .concat(rdy.guardrails || [])
+    .concat(pmc.warnings || [])
+    .concat(rdy.taper && rdy.taper.recommendation ? [rdy.taper.recommendation] : []);
+  const guardHtml = guards.length ? `<div class="guardrail-bar">🛡️ <strong>Coach Guardrail:</strong> ${esc(guards[0])}</div>` : '';
+
+  coachRib.innerHTML = `
+    <div class="coach-hdr">
+      <div class="coach-title">
+        <span>⚡ Athleten-Telemetrie &amp; Physiologie (${mode === 'pro' ? 'Pro Mode' : 'Standard'})</span>
+        <span class="rdy-badge rdy-${esc(rdyStatus)}" title="${esc(rdyReasons || 'Readiness Status')}">● Readiness ${esc(rdyStatus)}${rdyReasons ? ' · '+esc(rdyReasons) : ''}</span>
+      </div>
+      <div style="font-size:.72rem;color:var(--muted-hi)">${coach.schedule ? `🕒 Primäres Trainingsfenster: ${esc(coach.schedule)}` : ''}</div>
+    </div>
+    <div class="macro-banner">
+      <div><strong>🧭 Makro-Phase:</strong> <span style="color:var(--accent);font-weight:700">${esc(mp.active_phase||'Base')}</span> ${mp.updated?`<span style="color:var(--muted-hi)">(Stand ${esc(mp.updated)})</span>`:''}</div>
+      <div class="macro-badges">
+        <span class="tag ${mp.stale?'med':'ok'}">${mp.stale?'⚠ Makroplan fällig ('+esc(mp.stale_reason)+')':'✓ Makroplan aktuell'}</span>
+        ${coach.strava_connected
+          ? `<span class="tag ok">✓ Strava verbunden (${coach.activities_count||0} Aktivitäten)</span><a href="/strava-sync" class="tag" style="background:rgba(56,189,248,0.14);color:var(--accent);border:1px solid rgba(56,189,248,0.35);text-decoration:none;cursor:pointer;font-weight:700">🔄 Strava Sync</a>`
+          : `<a href="/strava-connect" class="tag" style="background:rgba(252,76,2,0.18);color:#fdba74;border:1px solid rgba(252,76,2,0.45);text-decoration:none;cursor:pointer;font-weight:700">🧡 Mit Strava verbinden (1-Klick)</a>`
+        }
+        ${fbPend?`<span class="tag med">💬 ${fbPend} Check-in(s) offen</span>`:''}
+      </div>
+    </div>
+    ${pmcHtml}
+    ${guardHtml}
+    <div class="phys-chips">${proChips}${baseChips || (!proChips ? '<div class="phys-chip"><span class="k">Tipp:</span><strong class="v">Leistungsdaten in coach/profile.md hinterlegen</strong></div>' : '')}</div>
+  `;
+}
+
+function renderKPIs(){
+  const todayD = parseIso(DATA.today);
+  const kw = getKW(todayD);
+  const dow = DOWS[(todayD.getDay()+6)%7];
+  document.getElementById('today-sub').textContent = `${dow}, ${fmtDateDE(DATA.today)} · KW ${kw}`;
+  document.getElementById('brand-ico').textContent = filter==='graph' ? '🕸️' : (filter==='coach' ? '🚴' : '📅');
+
+  const coach = DATA.coach || {metrics:[], macro_goals:[], schedule:''};
+  renderCoachRibbon(coach);
+
+  const kpiEl = document.getElementById('kpi-strip');
+  const openItems = DATA.items.filter(i => i.status==='open');
+
+  if(filter==='graph'){
+    const g = DATA.graph || {nodes:[], edges:[], stats:{}};
+    const st = g.stats || {};
+    kpiEl.innerHTML = `
+      <div class="kpi clickable" style="--kpi-color:var(--accent)" onclick="setGraphDomain('all')">
+        <div class="kpi-lbl"><span>🕸️ Wissens-Netzwerk</span><span>SQLite Graph</span></div>
+        <div class="kpi-val">${st.nodes||0} Seiten · ${st.horizontal_edges||0} Links</div>
+        <div class="kpi-sub">${st.edges||0} Kanten gesamt (inkl. Ordner-Hubs)</div>
+      </div>
+      <div class="kpi clickable" style="--kpi-color:${(st.isolated||0)?'var(--goal)':'var(--workout)'}" onclick="setGraphDomain('isolated')">
+        <div class="kpi-lbl"><span>🏝️ Isolierte Seiten</span><span>Filter</span></div>
+        <div class="kpi-val">${st.isolated||0} Orphans</div>
+        <div class="kpi-sub">${(st.isolated||0) ? 'Klicken zum Filtern isolierter Notizen' : 'Alle Fachseiten horizontal vernetzt'}</div>
+      </div>
+      <div class="kpi clickable" style="--kpi-color:${(st.stale_verified||0)+(st.broken_links||0)?'var(--blocked)':'var(--workout)'}" onclick="setGraphDomain('stale')">
+        <div class="kpi-lbl"><span>🕰️ Faktencheck &amp; Integrität</span><span>Radar</span></div>
+        <div class="kpi-val">${st.stale_verified||0} Stale · ${st.broken_links||0} Broken</div>
+        <div class="kpi-sub">Warnring bei verified &gt;365d oder defekten Links</div>
+      </div>
+      <div class="kpi" style="--kpi-color:var(--event)">
+        <div class="kpi-lbl"><span>💡 Unlinked Mentions</span><span>Backfill</span></div>
+        <div class="kpi-val">${st.unlinked_mentions||0} Erwähnungen</div>
+        <div class="kpi-sub">Knoten anklicken für Backlinks &amp; Kontext</div>
+      </div>
+    `;
+    return;
+  }
+
+  if(filter==='coach'){
+    const mode = coachMode();
+    const woDone14 = DATA.items.filter(i => i.kind==='workout' && i.delta>=-14 && i.delta<=14 && i.status==='done');
+    const woOpen14 = DATA.items.filter(i => i.kind==='workout' && i.delta>=0 && i.delta<=14 && i.status==='open');
+    const blockers = openItems.filter(i => i.delta>=0 && i.delta<=28 && (i.kind==='blocked' || (i.kind==='event' && i.time)));
+    if(mode === 'simple'){
+      const weekDone = DATA.items.filter(i => i.kind==='workout' && i.delta>=-6 && i.delta<=0 && i.status==='done').length;
+      const weekPlan = DATA.items.filter(i => i.kind==='workout' && i.delta>=0 && i.delta<=7 && i.status==='open').length;
+      const activeMin = woDone14.reduce((s,i)=>s+(i.total_min||45), 0);
+      kpiEl.innerHTML = `
+        <div class="kpi" style="--kpi-color:var(--workout)">
+          <div class="kpi-lbl"><span>🌱 Wochen-Gewohnheit</span><span>7 Tage</span></div>
+          <div class="kpi-val">${weekDone} erledigt · ${weekPlan} geplant</div>
+          <div class="kpi-sub">Einfach abhaken direkt im Kalender</div>
+        </div>
+        <div class="kpi" style="--kpi-color:var(--plan)">
+          <div class="kpi-lbl"><span>⏱️ Aktive Bewegungszeit</span><span>14 Tage</span></div>
+          <div class="kpi-val">${activeMin} Minuten</div>
+          <div class="kpi-sub">${woDone14.length} abgeschlossene Einheiten</div>
+        </div>
+        <div class="kpi" style="--kpi-color:var(--goal)">
+          <div class="kpi-lbl"><span>🔥 Rhythmus</span><span>Fenster</span></div>
+          <div class="kpi-val">${esc(coach.schedule || 'Flexibel im Alltag')}</div>
+          <div class="kpi-sub">Konsistenz schlägt Perfektion</div>
+        </div>
+        <div class="kpi" style="--kpi-color:${blockers.length?'var(--blocked)':'var(--workout)'}">
+          <div class="kpi-lbl"><span>🛡️ Freie Tage</span><span>28 Tage</span></div>
+          <div class="kpi-val">${28 - blockers.length} / 28 Tage frei</div>
+          <div class="kpi-sub">${blockers.length ? `${blockers.length} Termine/Reisen beachten` : 'Freier Kalenderhorizont'}</div>
+        </div>
+      `;
+      return;
+    }
+    const goals = openItems.filter(i => i.kind==='goal' && i.delta>=0);
+    const nextGoal = goals[0];
+    const macroCnt = (coach.macro_goals||[]).length;
+    kpiEl.innerHTML = `
+      <div class="kpi" style="--kpi-color:var(--goal)">
+        <div class="kpi-lbl"><span>🏆 Saisonziele &amp; Rennen</span><span>${goals.length + macroCnt} aktiv</span></div>
+        <div class="kpi-val">${nextGoal ? esc(nextGoal.what) : (macroCnt ? esc(coach.macro_goals[0].title) : 'Off-Season / Basis')}</div>
+        <div class="kpi-sub">${nextGoal ? `Countdown: in ${nextGoal.delta}d (${(nextGoal.delta/7).toFixed(1)} Wochen)` : `${macroCnt} strategische Säulen im Brain`}</div>
+      </div>
+      <div class="kpi" style="--kpi-color:var(--workout)">
+        <div class="kpi-lbl"><span>🚴 Workouts (±14 Tage)</span><span>Compliance</span></div>
+        <div class="kpi-val">${woDone14.length} erledigt · ${woOpen14.length} geplant</div>
+        <div class="kpi-sub">${woDone14.length+woOpen14.length>0 ? 'Aus calendar/README.md' : 'Bereit für Wochenplanung (.zwo / Karoo)'}</div>
+      </div>
+      <div class="kpi" style="--kpi-color:${blockers.length?'var(--blocked)':'var(--workout)'}">
+        <div class="kpi-lbl"><span>🛡️ Trainings-Verfügbarkeit</span><span>28 Tage</span></div>
+        <div class="kpi-val">${28 - blockers.length} / 28 Tage frei</div>
+        <div class="kpi-sub">${blockers.length ? `${blockers.length} Blocker/Termine beachten` : 'Keine Reisen oder Blocker eingetragen'}</div>
+      </div>
+      <div class="kpi" style="--kpi-color:var(--plan)">
+        <div class="kpi-lbl"><span>⏱️ Fokus-Rhythmus</span><span>Chronotyp</span></div>
+        <div class="kpi-val">${esc(coach.schedule || '17:00 – 20:00 Uhr')}</div>
+        <div class="kpi-sub">Adaptiver Simple-to-Pro Coach</div>
+      </div>
+    `;
+  } else if(filter==='todo'){
+    const overdue = openItems.filter(i => isTodoItem(i) && i.delta<0);
+    const next30 = openItems.filter(i => isTodoItem(i) && i.delta>=0 && i.delta<=30);
+    const next365 = openItems.filter(i => isTodoItem(i) && i.delta>=0 && i.delta<=365);
+    const highTodos = DATA.todos.filter(t => t.prio==='high').length;
+    kpiEl.innerHTML = `
+      <div class="kpi" style="--kpi-color:${overdue.length?'var(--blocked)':'var(--workout)'}">
+        <div class="kpi-lbl"><span>⚠️ Überfällig</span><span>Status</span></div>
+        <div class="kpi-val">${overdue.length ? `${overdue.length} Frist(en)` : '0 Überfällig'}</div>
+        <div class="kpi-sub">${overdue.length ? esc(overdue[0].what) : 'Alle vergangenen Stichtage erledigt'}</div>
+      </div>
+      <div class="kpi" style="--kpi-color:var(--deadline)">
+        <div class="kpi-lbl"><span>⏳ Nächste 30 Tage</span><span>Fristen</span></div>
+        <div class="kpi-val">${next30.length} Stichtage</div>
+        <div class="kpi-sub">${next30[0] ? `Nächster: in ${next30[0].delta}d (${fmtDateDE(next30[0].start)})` : 'Keine Fristen in 30d'}</div>
+      </div>
+      <div class="kpi" style="--kpi-color:var(--todo)">
+        <div class="kpi-lbl"><span>☑️ Offene To-Dos</span><span>1-Klick Toggle</span></div>
+        <div class="kpi-val">${DATA.todos.length} Aufgaben</div>
+        <div class="kpi-sub">${highTodos ? `${highTodos} mit hoher Priorität` : 'Direkt hier per Checkbox abhakbar'}</div>
+      </div>
+      <div class="kpi" style="--kpi-color:var(--event)">
+        <div class="kpi-lbl"><span>📆 Jahres-Radar</span><span>365 Tage</span></div>
+        <div class="kpi-val">${next365.length} Meilensteine</div>
+        <div class="kpi-sub">Verträge, Steuern, Gehalt &amp; Sparpläne</div>
+      </div>
+    `;
+  } else {
+    const next30 = openItems.filter(i => i.delta>=0 && i.delta<=30);
+    const nxt = next30[0] || openItems.find(i => i.delta>=0);
+    const bdays = openItems.filter(i => i.kind==='birthday' && i.delta>=0);
+    kpiEl.innerHTML = `
+      <div class="kpi" style="--kpi-color:var(--accent)">
+        <div class="kpi-lbl"><span>📍 Heute</span><span>KW ${kw}</span></div>
+        <div class="kpi-val">${dow}, ${fmtDateDE(DATA.today)}</div>
+        <div class="kpi-sub">${openItems.filter(i=>i.delta===0).length || 'Keine'} Termine heute</div>
+      </div>
+      <div class="kpi" style="--kpi-color:var(--deadline)">
+        <div class="kpi-lbl"><span>📅 Nächste 30 Tage</span><span>Horizont</span></div>
+        <div class="kpi-val">${next30.length} Einträge</div>
+        <div class="kpi-sub">${nxt ? `Als Nächstes: in ${nxt.delta}d (${fmtDateDE(nxt.start)})` : 'Freier Horizont'}</div>
+      </div>
+      <div class="kpi" style="--kpi-color:var(--todo)">
+        <div class="kpi-lbl"><span>☑️ To-Do Backlog</span><span>Offen</span></div>
+        <div class="kpi-val">${DATA.todos.length} Aufgaben</div>
+        <div class="kpi-sub">${DATA.todos[0] ? esc(DATA.todos[0].what) : 'Keine offenen Backlog-To-Dos'}</div>
+      </div>
+      <div class="kpi" style="--kpi-color:var(--bday)">
+        <div class="kpi-lbl"><span>🎂 Geburtstage &amp; Ziele</span><span>365 Tage</span></div>
+        <div class="kpi-val">${bdays.length} Ehrentage</div>
+        <div class="kpi-sub">${bdays[0] ? `${esc(bdays[0].what)} (in ${bdays[0].delta}d)` : 'Alle Jahrestage synchronisiert'}</div>
+      </div>
+    `;
+  }
+}
+
+/* ---------------- Interactive Brain Graph Engine (Canvas 2D) ---------------- */
+function setGraphDomain(dom){
+  graphDomainFilter = dom;
+  graphSim.key = '';
+  renderGraphMain();
+  renderSidebar();
+}
+function toggleGraphHubs(){
+  graphShowHubs = !graphShowHubs;
+  graphSim.key = '';
+  renderGraphMain();
+  renderSidebar();
+}
+function zoomGraph(factor){
+  graphSim.scale = Math.min(4.0, Math.max(0.28, graphSim.scale * factor));
+  drawGraphFrame();
+}
+function resetGraphCamera(){
+  graphSim.camX = 0;
+  graphSim.camY = 0;
+  graphSim.scale = 1;
+  graphSim.ticks = 0;
+  startGraphLoop();
+}
+function selectGraphNode(rel, center=false){
+  graphSelectedRel = rel;
+  if(center && rel && graphSim.byRel[rel]){
+    graphSim.camX = -graphSim.byRel[rel].x * graphSim.scale;
+    graphSim.camY = -graphSim.byRel[rel].y * graphSim.scale;
+  }
+  drawGraphFrame();
+  renderSidebar();
+}
+
+function filteredGraphData(){
+  const g = DATA.graph || {nodes:[], edges:[]};
+  const q = query.toLowerCase();
+  const nodes = g.nodes.filter(n => {
+    if(!graphShowHubs && n.is_hub && n.rel !== graphSelectedRel){
+      if(graphDomainFilter !== 'all' || g.nodes.length > 8) return false;
+    }
+    if(graphDomainFilter === 'isolated' && !n.isolated) return false;
+    if(graphDomainFilter === 'stale' && !(n.stale_verified || n.expired_valid_until || (n.broken_links && n.broken_links.length))) return false;
+    if(['people','areas','projects','howto'].includes(graphDomainFilter) && n.domain !== graphDomainFilter) return false;
+    if(q){
+      const hay = `${n.title} ${n.rel} ${n.summary||''} ${(n.tags||[]).join(' ')}`.toLowerCase();
+      if(!hay.includes(q)) return false;
+    }
+    return true;
+  });
+  const keep = new Set(nodes.map(n => n.rel));
+  const edges = g.edges.filter(e => {
+    if(!keep.has(e.src) || !keep.has(e.dst)) return false;
+    if(!graphShowHubs && e.kind === 'tree') return false;
+    return true;
+  });
+  return {nodes, edges};
+}
+
+function rebuildGraphSimulation(){
+  const {nodes, edges} = filteredGraphData();
+  const sig = `${graphDomainFilter}|${graphShowHubs}|${query}|${nodes.length}|${edges.length}`;
+  if(graphSim.key === sig && graphSim.nodes.length === nodes.length) return;
+  const oldPos = graphSim.byRel || {};
+  const domOrder = ['self','people','areas','projects','howto','coach','calendar','journal','root','other'];
+  const simNodes = nodes.map((n, idx) => {
+    const prev = oldPos[n.rel];
+    const dIdx = Math.max(0, domOrder.indexOf(n.domain));
+    const baseAngle = (dIdx / domOrder.length) * Math.PI * 2 + (idx * 0.61803398875) % 0.9;
+    const ring = 70 + Math.sqrt(idx + 1) * 34;
+    const deg = n.degree || 0;
+    const radius = Math.min(18, Math.max(6.5, 6.5 + Math.log2(deg + 1) * 2.8));
+    return {
+      data: n,
+      rel: n.rel,
+      r: radius,
+      x: prev ? prev.x : Math.cos(baseAngle) * ring,
+      y: prev ? prev.y : Math.sin(baseAngle) * ring,
+      vx: 0, vy: 0
+    };
+  });
+  const byRel = {};
+  for(const sn of simNodes) byRel[sn.rel] = sn;
+  const simEdges = edges.map(e => ({
+    src: byRel[e.src],
+    dst: byRel[e.dst],
+    kind: e.kind,
+    anchor: e.anchor
+  })).filter(e => e.src && e.dst);
+
+  graphSim.nodes = simNodes;
+  graphSim.edges = simEdges;
+  graphSim.byRel = byRel;
+  graphSim.key = sig;
+  graphSim.ticks = 0;
+}
+
+function stepGraphPhysics(){
+  const nodes = graphSim.nodes;
+  const edges = graphSim.edges;
+  const N = nodes.length;
+  if(N <= 1) return;
+
+  const repulse = N > 120 ? 1500 : 2200;
+  for(let i=0;i<N;i++){
+    const a = nodes[i];
+    for(let j=i+1;j<N;j++){
+      const b = nodes[j];
+      let dx = b.x - a.x, dy = b.y - a.y;
+      let d2 = dx*dx + dy*dy;
+      if(d2 < 4) { dx = (i%2?1:-1)*2; dy = (j%2?1:-1)*2; d2 = 8; }
+      if(d2 > 180000) continue;
+      const d = Math.sqrt(d2);
+      const sameDom = a.data.domain === b.data.domain ? 0.78 : 1.0;
+      const f = (repulse * sameDom) / d2;
+      const fx = (dx / d) * f, fy = (dy / d) * f;
+      if(a !== graphSim.dragNode){ a.vx -= fx; a.vy -= fy; }
+      if(b !== graphSim.dragNode){ b.vx += fx; b.vy += fy; }
+    }
+  }
+
+  for(const e of edges){
+    const a = e.src, b = e.dst;
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const d = Math.sqrt(dx*dx + dy*dy) || 1;
+    const targetLen = e.kind === 'related' ? 88 : (e.kind === 'body' ? 105 : 130);
+    const k = e.kind === 'related' ? 0.045 : (e.kind === 'body' ? 0.032 : 0.018);
+    const f = (d - targetLen) * k;
+    const fx = (dx / d) * f, fy = (dy / d) * f;
+    if(a !== graphSim.dragNode){ a.vx += fx; a.vy += fy; }
+    if(b !== graphSim.dragNode){ b.vx -= fx; b.vy -= fy; }
+  }
+
+  for(const n of nodes){
+    if(n === graphSim.dragNode) continue;
+    n.vx -= n.x * 0.0085;
+    n.vy -= n.y * 0.0085;
+    n.vx *= 0.78;
+    n.vy *= 0.78;
+    const stepLim = 14;
+    n.x += Math.max(-stepLim, Math.min(stepLim, n.vx));
+    n.y += Math.max(-stepLim, Math.min(stepLim, n.vy));
+  }
+}
+
+function drawGraphFrame(){
+  const canvas = document.getElementById('graph-canvas');
+  if(!canvas) return;
+  const rect = canvas.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.max(300, Math.floor(rect.width));
+  const h = Math.max(300, Math.floor(rect.height));
+  if(canvas.width !== Math.floor(w * dpr) || canvas.height !== Math.floor(h * dpr)){
+    canvas.width = Math.floor(w * dpr);
+    canvas.height = Math.floor(h * dpr);
+  }
+  const ctx = canvas.getContext('2d');
+  ctx.save();
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, w, h);
+
+  const cx = w / 2 + graphSim.camX;
+  const cy = h / 2 + graphSim.camY;
+  ctx.translate(cx, cy);
+  ctx.scale(graphSim.scale, graphSim.scale);
+
+  const focusRel = graphHoverRel || graphSelectedRel;
+  const focusNeighbors = new Set();
+  if(focusRel){
+    focusNeighbors.add(focusRel);
+    for(const e of graphSim.edges){
+      if(e.src.rel === focusRel) focusNeighbors.add(e.dst.rel);
+      if(e.dst.rel === focusRel) focusNeighbors.add(e.src.rel);
+    }
+  }
+
+  // Draw edges
+  for(const e of graphSim.edges){
+    const active = focusRel && (e.src.rel === focusRel || e.dst.rel === focusRel);
+    const dim = focusRel && !active;
+    ctx.beginPath();
+    if(e.kind === 'journal') ctx.setLineDash([4, 4]);
+    else if(e.kind === 'tree') ctx.setLineDash([2, 4]);
+    else ctx.setLineDash([]);
+    ctx.lineWidth = active ? 2.0 : (e.kind === 'related' ? 1.45 : 1.0);
+    ctx.strokeStyle = active
+      ? 'rgba(56,189,248,0.88)'
+      : (dim ? 'rgba(148,163,184,0.08)' : (e.kind === 'related' ? 'rgba(56,189,248,0.38)' : 'rgba(148,163,184,0.24)'));
+    ctx.moveTo(e.src.x, e.src.y);
+    ctx.lineTo(e.dst.x, e.dst.y);
+    ctx.stroke();
+  }
+  ctx.setLineDash([]);
+
+  // Draw nodes
+  for(const n of graphSim.nodes){
+    const d = n.data;
+    const isSel = n.rel === graphSelectedRel;
+    const isHov = n.rel === graphHoverRel;
+    const dim = focusRel && !focusNeighbors.has(n.rel);
+    const col = DOMAIN_COLORS[d.domain] || DOMAIN_COLORS.other;
+
+    // Warning rings (broken links -> rose, stale verified / expired valid_until -> dashed amber, isolated -> dotted sky)
+    if(d.broken_links && d.broken_links.length){
+      ctx.beginPath();
+      ctx.arc(n.x, n.y, n.r + 4.5, 0, Math.PI*2);
+      ctx.strokeStyle = dim ? 'rgba(244,63,94,0.3)' : '#f43f5e';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    } else if(d.stale_verified || d.expired_valid_until){
+      ctx.beginPath();
+      ctx.setLineDash([3.5, 2.5]);
+      ctx.arc(n.x, n.y, n.r + 4.2, 0, Math.PI*2);
+      ctx.strokeStyle = dim ? 'rgba(245,158,11,0.3)' : '#f59e0b';
+      ctx.lineWidth = 1.8;
+      ctx.stroke();
+      ctx.setLineDash([]);
+    } else if(d.isolated){
+      ctx.beginPath();
+      ctx.setLineDash([2, 3]);
+      ctx.arc(n.x, n.y, n.r + 3.8, 0, Math.PI*2);
+      ctx.strokeStyle = dim ? 'rgba(56,189,248,0.2)' : 'rgba(56,189,248,0.65)';
+      ctx.lineWidth = 1.3;
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    if(isSel || isHov){
+      ctx.beginPath();
+      ctx.arc(n.x, n.y, n.r + 7, 0, Math.PI*2);
+      ctx.fillStyle = 'rgba(56,189,248,0.22)';
+      ctx.fill();
+    }
+
+    ctx.beginPath();
+    ctx.arc(n.x, n.y, n.r, 0, Math.PI*2);
+    ctx.fillStyle = col;
+    ctx.globalAlpha = dim ? 0.22 : 0.94;
+    ctx.fill();
+    ctx.lineWidth = isSel ? 2.4 : 1.2;
+    ctx.strokeStyle = isSel ? '#ffffff' : 'rgba(15,23,42,0.9)';
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+
+    if(graphSim.scale >= 0.62 || isSel || isHov || n.r >= 10.5){
+      ctx.font = `${isSel||isHov?'700':'500'} ${Math.max(9.5, 11 / Math.pow(graphSim.scale, 0.25)).toFixed(1)}px Inter, sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.fillStyle = dim ? 'rgba(203,213,225,0.22)' : (isSel ? '#ffffff' : '#dbeafe');
+      const lbl = d.title.length > 26 ? d.title.slice(0, 24) + '…' : d.title;
+      ctx.fillText(lbl, n.x, n.y + n.r + 12);
+    }
+  }
+  ctx.restore();
+}
+
+function startGraphLoop(){
+  if(graphSim.raf) cancelAnimationFrame(graphSim.raf);
+  const tick = () => {
+    if(filter !== 'graph') return;
+    if(graphSim.ticks < 145 || graphSim.dragNode){
+      stepGraphPhysics();
+      graphSim.ticks++;
+      drawGraphFrame();
+      graphSim.raf = requestAnimationFrame(tick);
+    } else {
+      drawGraphFrame();
+      graphSim.raf = 0;
+    }
+  };
+  graphSim.raf = requestAnimationFrame(tick);
+}
+
+function hitTestGraphNode(clientX, clientY){
+  const canvas = document.getElementById('graph-canvas');
+  if(!canvas) return null;
+  const rect = canvas.getBoundingClientRect();
+  const sx = clientX - rect.left;
+  const sy = clientY - rect.top;
+  const wx = (sx - (rect.width / 2 + graphSim.camX)) / graphSim.scale;
+  const wy = (sy - (rect.height / 2 + graphSim.camY)) / graphSim.scale;
+  for(let i = graphSim.nodes.length - 1; i >= 0; i--){
+    const n = graphSim.nodes[i];
+    const dx = wx - n.x, dy = wy - n.y;
+    const pad = 4 / graphSim.scale;
+    if(dx*dx + dy*dy <= (n.r + pad)*(n.r + pad)) return n;
+  }
+  return null;
+}
+
+function bindGraphEvents(){
+  const canvas = document.getElementById('graph-canvas');
+  const tip = document.getElementById('graph-tip');
+  if(!canvas) return;
+
+  canvas.onmousedown = e => {
+    const hit = hitTestGraphNode(e.clientX, e.clientY);
+    graphSim.lastX = e.clientX;
+    graphSim.lastY = e.clientY;
+    graphSim.moved = false;
+    if(hit){
+      graphSim.dragNode = hit;
+      startGraphLoop();
+    } else {
+      graphSim.panning = true;
+    }
+    canvas.classList.add('dragging');
+  };
+
+  window.onmousemove = e => {
+    if(filter !== 'graph') return;
+    const dx = e.clientX - graphSim.lastX;
+    const dy = e.clientY - graphSim.lastY;
+    if(Math.abs(dx) + Math.abs(dy) > 2) graphSim.moved = true;
+    graphSim.lastX = e.clientX;
+    graphSim.lastY = e.clientY;
+
+    if(graphSim.dragNode){
+      graphSim.dragNode.x += dx / graphSim.scale;
+      graphSim.dragNode.y += dy / graphSim.scale;
+      graphSim.ticks = Math.min(graphSim.ticks, 110);
+      drawGraphFrame();
+      return;
+    }
+    if(graphSim.panning){
+      graphSim.camX += dx;
+      graphSim.camY += dy;
+      drawGraphFrame();
+      return;
+    }
+    const cEl = document.getElementById('graph-canvas');
+    if(!cEl) return;
+    const rect = cEl.getBoundingClientRect();
+    if(e.clientX < rect.left || e.clientX > rect.right || e.clientY < rect.top || e.clientY > rect.bottom){
+      if(graphHoverRel){ graphHoverRel = null; if(tip) tip.style.display='none'; drawGraphFrame(); }
+      return;
+    }
+    const hit = hitTestGraphNode(e.clientX, e.clientY);
+    const nextHov = hit ? hit.rel : null;
+    if(nextHov !== graphHoverRel){
+      graphHoverRel = nextHov;
+      drawGraphFrame();
+    }
+    if(hit && tip){
+      const d = hit.data;
+      const warn = (d.broken_links&&d.broken_links.length) ? `<div style="color:#fda4af">⚠ ${d.broken_links.length} defekte(r) Link</div>`
+        : (d.stale_verified ? `<div style="color:#fde68a">🕰️ verified vor ${d.verified_age_days}d</div>` : '');
+      tip.innerHTML = `<strong>${esc(d.title)}</strong><div style="color:var(--muted-hi);font-size:.67rem">${esc(d.rel)} · ${d.in_degree}↙ ${d.out_degree}↗</div>${warn}`;
+      tip.style.display = 'block';
+      tip.style.left = Math.min(rect.width - 240, Math.max(10, e.clientX - rect.left + 14)) + 'px';
+      tip.style.top = Math.min(rect.height - 80, Math.max(10, e.clientY - rect.top + 14)) + 'px';
+    } else if(tip){
+      tip.style.display = 'none';
+    }
+  };
+
+  window.onmouseup = e => {
+    if(filter !== 'graph') return;
+    const cEl = document.getElementById('graph-canvas');
+    if(cEl) cEl.classList.remove('dragging');
+    if(!graphSim.moved){
+      const rect = cEl ? cEl.getBoundingClientRect() : null;
+      if(rect && e.clientX >= rect.left && e.clientX <= rect.right && e.clientY >= rect.top && e.clientY <= rect.bottom){
+        const hit = hitTestGraphNode(e.clientX, e.clientY);
+        selectGraphNode(hit ? hit.rel : null, false);
+      }
+    }
+    graphSim.dragNode = null;
+    graphSim.panning = false;
+  };
+
+  canvas.onwheel = e => {
+    e.preventDefault();
+    const rect = canvas.getBoundingClientRect();
+    const mx = e.clientX - rect.left - rect.width / 2;
+    const my = e.clientY - rect.top - rect.height / 2;
+    const factor = e.deltaY < 0 ? 1.13 : 0.88;
+    const nextScale = Math.min(4.0, Math.max(0.28, graphSim.scale * factor));
+    const ratio = nextScale / graphSim.scale;
+    graphSim.camX = mx - (mx - graphSim.camX) * ratio;
+    graphSim.camY = my - (my - graphSim.camY) * ratio;
+    graphSim.scale = nextScale;
+    drawGraphFrame();
+  };
+}
+
+function renderGraphMain(){
+  const mainEl = document.getElementById('cal-main');
+  rebuildGraphSimulation();
+  const pills = [
+    ['all','Alle'],['people','People'],['areas','Areas'],['projects','Projects'],
+    ['howto','Howto'],['isolated','🏝️ Orphans'],['stale','🕰️ Stale / Broken']
+  ];
+  mainEl.innerHTML = `
+    <div class="graph-wrap">
+      <div class="graph-overlay-top">
+        <div class="graph-pills">
+          ${pills.map(([k,lbl])=>`<button class="g-pill ${graphDomainFilter===k?'active':''}" onclick="setGraphDomain('${k}')">${lbl}</button>`).join('')}
+          <button class="g-pill ${graphShowHubs?'active':''}" onclick="toggleGraphHubs()" title="Ordner-READMEs &amp; Baumkanten einblenden">📁 Hubs</button>
+        </div>
+        <div class="graph-zoom">
+          <button class="g-pill" onclick="zoomGraph(1.2)" title="Vergrößern">+</button>
+          <button class="g-pill" onclick="zoomGraph(0.83)" title="Verkleinern">−</button>
+          <button class="g-pill" onclick="resetGraphCamera()" title="Ansicht zentrieren">⟲ Reset</button>
+        </div>
+      </div>
+      <canvas id="graph-canvas" class="graph-canvas"></canvas>
+      <div id="graph-tip" class="graph-tip"></div>
+      <div class="graph-legend">
+        <span class="leg-item"><span class="leg-dot" style="background:#ec4899"></span>People</span>
+        <span class="leg-item"><span class="leg-dot" style="background:#38bdf8"></span>Areas</span>
+        <span class="leg-item"><span class="leg-dot" style="background:#8b5cf6"></span>Projects</span>
+        <span class="leg-item"><span class="leg-dot" style="background:#f59e0b"></span>Howto</span>
+        <span class="leg-item"><span class="leg-dot" style="background:#10b981"></span>Self/Coach</span>
+        <span class="leg-item"><span class="leg-ring"></span>Stale &gt;365d</span>
+        <span class="leg-item"><span class="leg-ring err"></span>Broken Link</span>
+      </div>
+    </div>
+  `;
+  bindGraphEvents();
+  startGraphLoop();
+}
+
+function renderMain(){
+  if(filter === 'graph'){
+    renderGraphMain();
+    return;
+  }
+  const mainEl = document.getElementById('cal-main');
+  const y = cur.getFullYear(), m = cur.getMonth();
+  const mode = coachMode();
+
+  if(layout==='month'){
+    document.getElementById('mlabel').textContent = `${MONTHS[m]} ${y}`;
+    const first = new Date(y, m, 1);
+    const offset = (first.getDay() + 6) % 7;
+    const start = new Date(y, m, 1 - offset);
+    const sixthWeekStart = new Date(start.getFullYear(), start.getMonth(), start.getDate() + 35);
+    const totalCells = (sixthWeekStart.getMonth() !== m) ? 35 : 42;
+
+    let html = `<div class="dow-row"><div class="dow-cell kw-hdr">KW</div>` +
+      DOWS.map((d,i)=>`<div class="dow-cell${i>=5?' wknd':''}">${d}</div>`).join('') +
+      `</div><div class="month-grid">`;
+
+    const kwMap = kwPhaseMap();
+    for(let i=0;i<totalCells;i++){
+      const d = new Date(start.getFullYear(), start.getMonth(), start.getDate()+i);
+      const ds = iso(d);
+      const dowIdx = i % 7;
+      if(dowIdx === 0){
+        const kw = getKW(d);
+        const mw = (filter==='coach' && mode!=='simple') ? kwMap[String(kw)] : null;
+        const phBadge = mw && mw.phase ? `<span class="kw-phase" title="${esc(mw.focus||mw.phase)}">${esc(mw.phase.slice(0,6))}</span>` : '';
+        html += `<div class="kw-cell" onclick="openWeekOf('${ds}')" title="Wochenansicht KW ${kw} öffnen"><span>${kw}</span>${phBadge}</div>`;
+      }
+      const isOther = d.getMonth() !== m;
+      const isToday = ds === DATA.today;
+      const isWknd = dowIdx >= 5;
+      const dayMatches = [];
+      DATA.items.forEach((it, idx) => {
+        if(keepItem(it) && it.start <= ds && ds <= it.end) dayMatches.push({it, idx});
+      });
+      const dLabel = (d.getDate()===1 && !isToday) ? `1. ${MONTHS_SHORT[d.getMonth()]}` : d.getDate();
+      const shown = dayMatches.slice(0, 3);
+      const more = dayMatches.length - shown.length;
+
+      html += `<div class="day${isOther?' other':''}${isToday?' today':''}${isWknd?' wknd':''}" onclick="if(event.target===this||event.target.classList.contains('dhead')||event.target.classList.contains('dnum-txt'))showDayModal('${ds}')">`;
+      html += `<div class="dhead"><span class="dnum-txt">${dLabel}</span>${isToday?'<span class="today-tag">Heute</span>':(dayMatches.length>1?`<span class="dcount">${dayMatches.length}</span>`:'')}</div>`;
+      for(const {it, idx} of shown){
+        const c = compactTitle(it.what);
+        const spanInfo = it.start !== it.end ? ` (${it.start.slice(8)}–${it.end.slice(8)})` : '';
+        const fbBadge = (mode!=='simple' && it.kind==='workout' && it.status==='done')
+          ? (it.feedback ? `<span class="fb-badge ok" title="${esc(it.feedback)}">✓</span>` : (it.feedback_pending ? `<span class="fb-badge warn" title="Check-in Feedback fehlt">⚠</span>` : ''))
+          : '';
+        const rideMeta = (mode!=='simple' && it.kind==='workout' && (it.w_bal_min_pct!=null || it.matches_burned))
+          ? `W'bal ${it.w_bal_min_pct!=null?Math.round(it.w_bal_min_pct)+'%':''}${it.matches_burned?' · 🔥'+it.matches_burned:''}`
+          : c.meta;
+        const cbInline = (it.can_toggle && it.kind==='todo')
+          ? `<button class="cb-btn ${it.status==='done'?'done':''}" style="width:14px;height:14px;font-size:.58rem" onclick="toggleDatedItem(${idx}, event)" title="To-Do abhaken">${it.status==='done'?'✓':''}</button>`
+          : `<span class="pill-ico">${icon(it)}</span>`;
+        html += `<div class="${pillClass(it)}" onclick="event.stopPropagation();showItemModal(${idx})" title="${esc(it.what)} (${esc(it.rel)})">
+          <div class="pill-top">
+            ${cbInline}
+            ${it.time?`<span class="pill-time">${esc(it.time)}</span>`:''}
+            <span class="pill-txt">${esc(c.main)}${esc(spanInfo)}</span>
+            ${fbBadge}
+          </div>
+          ${rideMeta?`<div class="pill-meta">${esc(rideMeta)}</div>`:''}
+          ${it.kind==='workout' ? renderWkoBars(it, false) : ''}
+        </div>`;
+      }
+      if(more > 0){
+        html += `<div class="more-pill" onclick="event.stopPropagation();showDayModal('${ds}')">+${more} weitere</div>`;
+      }
+      html += `</div>`;
+    }
+    html += `</div>`;
+    mainEl.innerHTML = html;
+  } else if(layout==='week'){
+    const dowOffset = (cur.getDay() + 6) % 7;
+    const wStart = new Date(cur.getFullYear(), cur.getMonth(), cur.getDate() - dowOffset);
+    const wEnd = new Date(wStart.getFullYear(), wStart.getMonth(), wStart.getDate() + 6);
+    const kw = getKW(wStart);
+    document.getElementById('mlabel').textContent = `KW ${kw} · ${wStart.getDate()}. ${MONTHS_SHORT[wStart.getMonth()]} – ${wEnd.getDate()}. ${MONTHS_SHORT[wEnd.getMonth()]} ${wEnd.getFullYear()}`;
+
+    let html = `<div class="week-list">`;
+    for(let i=0;i<7;i++){
+      const d = new Date(wStart.getFullYear(), wStart.getMonth(), wStart.getDate()+i);
+      const ds = iso(d);
+      const isToday = ds === DATA.today;
+      const dayMatches = [];
+      DATA.items.forEach((it, idx) => {
+        if(keepItem(it) && it.start <= ds && ds <= it.end) dayMatches.push({it, idx});
+      });
+      html += `<div class="wday-row${isToday?' today':''}" onclick="if(event.target===this)showDayModal('${ds}')">
+        <div class="wday-left" onclick="showDayModal('${ds}')">
+          <span class="wday-dow">${DOWS[i]}${isToday?' · HEUTE':''}</span>
+          <span class="wday-date">${d.getDate()}. ${MONTHS_SHORT[d.getMonth()]}</span>
+        </div>
+        <div class="wday-right">`;
+      if(dayMatches.length){
+        for(const {it, idx} of dayMatches){
+          html += `<div class="row ${it.status==='done'?'is-done':''}" onclick="showItemModal(${idx})">
+            ${it.can_toggle ? `<button class="cb-btn ${it.status==='done'?'done':''}" onclick="toggleDatedItem(${idx}, event)" title="Abhaken">${it.status==='done'?'✓':''}</button>` : ''}
+            <div class="row-main">
+              <div class="row-title">${icon(it)} ${it.time?`<strong>${esc(it.time)}</strong> `:''}${esc(it.what)}</div>
+              <div class="row-sub"><span>${esc(it.kind)}${it.subkind?':'+esc(it.subkind):''}</span> · <span>${esc(it.rel)}</span></div>
+            </div>
+            <span class="tag">${esc(deltaLabel(it.delta))}</span>
+          </div>`;
+        }
+      } else {
+        html += `<div class="wday-empty" onclick="showDayModal('${ds}')">${filter==='coach'?'Freies Bewegungsfenster (Klicken für Vorlage)':'Keine Termine eingetragen'}</div>`;
+      }
+      html += `</div></div>`;
+    }
+    html += `</div>`;
+    mainEl.innerHTML = html;
+  } else {
+    document.getElementById('mlabel').textContent = `Agenda · ${cur.getFullYear()}`;
+    const groups = new Map();
+    DATA.items.forEach((it, idx) => {
+      if(!keepItem(it) || (it.delta < -14 && it.status !== 'open')) return;
+      const ym = it.start.slice(0, 7);
+      if(!groups.has(ym)) groups.set(ym, []);
+      groups.get(ym).push({it, idx});
+    });
+    if(!groups.size){
+      mainEl.innerHTML = `<div class="agenda-view"><div class="empty-box">Keine Einträge für diesen Filter gefunden.</div></div>`;
+    } else {
+      let html = `<div class="agenda-view">`;
+      for(const [ym, arr] of groups.entries()){
+        const [yy, mm] = ym.split('-').map(Number);
+        html += `<div class="ag-group"><div class="ag-month-hdr"><span>${MONTHS[mm-1]} ${yy}</span><span>${arr.length} Einträge</span></div>`;
+        for(const {it, idx} of arr){
+          const dObj = parseIso(it.start);
+          const dow = DOWS[(dObj.getDay()+6)%7];
+          html += `<div class="ag-item ${it.status==='done'?'is-done':''}" onclick="showItemModal(${idx})">
+            <div class="ag-date-col">
+              <span class="ag-date-main">${dow}, ${fmtDateDE(it.start).slice(0,6)}</span>
+              <span class="ag-date-sub">KW ${getKW(dObj)}${it.time?' · '+esc(it.time):''}</span>
+            </div>
+            <div class="row-main" style="display:flex;flex-direction:row;align-items:center;gap:9px">
+              ${it.can_toggle ? `<button class="cb-btn ${it.status==='done'?'done':''}" onclick="toggleDatedItem(${idx}, event)" title="Abhaken">${it.status==='done'?'✓':''}</button>` : ''}
+              <div style="min-width:0">
+                <div class="row-title">${icon(it)} ${esc(it.what)}</div>
+                <div class="row-sub"><span>${esc(it.rel)}</span></div>
+              </div>
+            </div>
+            <span class="tag ${it.delta<0 && it.status!=='done'?'overdue':(it.kind==='goal'?'goal':'')}">${esc(deltaLabel(it.delta))}</span>
+          </div>`;
+        }
+        html += `</div>`;
+      }
+      html += `</div>`;
+      mainEl.innerHTML = html;
+    }
+  }
+}
+
+function renderGraphSidebar(){
+  const s1T = document.getElementById('s1-title'), s1C = document.getElementById('s1-cnt'), s1L = document.getElementById('s1-list');
+  const s2T = document.getElementById('s2-title'), s2C = document.getElementById('s2-cnt'), s2L = document.getElementById('s2-list');
+  const s3T = document.getElementById('s3-title'), s3C = document.getElementById('s3-cnt'), s3L = document.getElementById('s3-list');
+  const g = DATA.graph || {nodes:[], edges:[], stats:{}};
+  const node = graphSelectedRel ? g.nodes.find(n => n.rel === graphSelectedRel) : null;
+
+  if(!node){
+    const attention = g.nodes.filter(n => n.stale_verified || n.expired_valid_until || (n.broken_links && n.broken_links.length) || n.isolated).slice(0, 12);
+    const hubs = [...g.nodes].filter(n => !n.is_hub).sort((a,b)=>(b.degree||0)-(a.degree||0)).slice(0, 10);
+    s1T.textContent = '🔍 Seiten-Inspektor';
+    s1C.textContent = `${g.nodes.length} Seiten`;
+    s1L.innerHTML = `<div class="empty-box">
+      <div>Klicke links im Graphen auf einen Knoten, um <strong>Summary, Tags, verified:, Outlinks, Backlinks</strong> und <strong>Unlinked Mentions</strong> zu inspizieren.</div>
+    </div>` + hubs.map(n => `
+      <div class="row" onclick="selectGraphNode('${esc(n.rel)}', true)">
+        <div class="row-main">
+          <div class="row-title">${esc(n.title)}</div>
+          <div class="row-sub"><span>${esc(n.rel)}</span></div>
+        </div>
+        <span class="tag low">${n.degree||0} Links</span>
+      </div>
+    `).join('');
+
+    s2T.textContent = '🏝️ Orphans &amp; Faktencheck-Radar';
+    s2C.textContent = attention.length;
+    s2L.innerHTML = attention.length ? attention.map(n => {
+      const badge = (n.broken_links&&n.broken_links.length) ? `<span class="tag high">Broken (${n.broken_links.length})</span>`
+        : (n.stale_verified ? `<span class="tag med">Stale ${n.verified_age_days}d</span>` : `<span class="tag">Orphan</span>`);
+      return `<div class="row" onclick="selectGraphNode('${esc(n.rel)}', true)">
+        <div class="row-main">
+          <div class="row-title">${esc(n.title)}</div>
+          <div class="row-sub"><span>${esc(n.rel)}</span></div>
+        </div>
+        ${badge}
+      </div>`;
+    }).join('') : `<div class="empty-box" style="color:#a7f3d0;border-color:rgba(16,185,129,0.3)">✓ Keine isolierten oder veralteten Seiten im Brain!</div>`;
+
+    const withMentions = g.nodes.filter(n => n.unlinked_mentions && n.unlinked_mentions.length).slice(0, 10);
+    s3T.textContent = '💡 Unlinked Mentions (Global)';
+    s3C.textContent = (g.stats && g.stats.unlinked_mentions) || 0;
+    s3L.innerHTML = withMentions.length ? withMentions.map(n => `
+      <div class="row" onclick="selectGraphNode('${esc(n.rel)}', true)">
+        <div class="row-main">
+          <div class="row-title">${esc(n.title)}</div>
+          <div class="row-sub"><span>${esc(n.rel)}</span></div>
+        </div>
+        <span class="tag goal">${n.unlinked_mentions.length}× erwähnt</span>
+      </div>
+    `).join('') : `<div class="empty-box">Keine offenen unverlinkten Erwähnungen gefunden.</div>`;
+    return;
+  }
+
+  // Selected Node Inspector
+  const verBadge = node.expired_valid_until
+    ? `<span class="tag high">Abgelaufen (valid_until: ${esc(node.valid_until)})</span>`
+    : (node.stale_verified
+      ? `<span class="tag med">🕰️ verified: ${esc(node.verified)} (vor ${node.verified_age_days}d)</span>`
+      : (node.verified ? `<span class="tag ok">✓ verified: ${esc(node.verified)}</span>` : `<span class="tag">kein verified:</span>`));
+  const tagsHtml = (node.tags || []).map(t => `<span class="tag low" style="cursor:pointer" onclick="document.getElementById('q-in').value='${esc(t)}';setQuery('${esc(t)}')">#${esc(t)}</span>`).join(' ');
+  const brkHtml = (node.broken_links && node.broken_links.length)
+    ? `<div class="empty-box" style="border-color:rgba(244,63,94,0.45);color:#fecdd3"><strong>⚠ Defekte Links (${node.broken_links.length}):</strong><div>${node.broken_links.map(esc).join('<br>')}</div></div>`
+    : '';
+
+  s1T.textContent = '📄 ' + node.title;
+  s1C.textContent = node.domain;
+  s1L.innerHTML = `
+    <div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center">
+      ${verBadge}
+      <span class="tag">${node.in_degree} Backlinks · ${node.out_degree} Outlinks</span>
+      ${node.isolated ? `<span class="tag med">🏝️ Orphan</span>` : ''}
+    </div>
+    <div class="code-hint" onclick="navigator.clipboard.writeText('brain/${esc(node.rel)}');showToast('Pfad kopiert: brain/${esc(node.rel)}')">📋 brain/${esc(node.rel)}</div>
+    <div style="font-size:.79rem;color:var(--text-dim);line-height:1.45">${node.summary ? esc(node.summary) : '<em style="color:var(--muted)">Keine summary: im Frontmatter.</em>'}</div>
+    ${tagsHtml ? `<div style="display:flex;flex-wrap:wrap;gap:5px">${tagsHtml}</div>` : ''}
+    ${brkHtml}
+    <div><button class="btn-act" style="width:100%" onclick="selectGraphNode(null)">← Zurück zur Graph-Übersicht</button></div>
+  `;
+
+  // Card 2: Backlinks & Outlinks
+  const backs = node.backlinks || [];
+  const outs = node.outlinks || [];
+  s2T.textContent = '⇄ Backlinks &amp; Outlinks';
+  s2C.textContent = `${backs.length}↙ · ${outs.length}↗`;
+  let linksHtml = '';
+  if(backs.length){
+    linksHtml += `<div style="font-size:.68rem;font-weight:700;text-transform:uppercase;color:var(--accent)">↙ Backlinks (${backs.length})</div>`;
+    linksHtml += backs.map(b => `
+      <div class="row" onclick="selectGraphNode('${esc(b.src)}', true)">
+        <div class="row-main">
+          <div class="row-title">${esc(b.title)} ${b.anchor?`<span class="tag low">#${esc(b.anchor)}</span>`:''}</div>
+          <div class="row-sub"><span>${esc(b.src)}</span> · <span>${esc(b.kind)}</span></div>
+          ${b.context ? `<div class="ctx-snip">${esc(b.context)}</div>` : ''}
+        </div>
+      </div>
+    `).join('');
+  }
+  if(outs.length){
+    linksHtml += `<div style="font-size:.68rem;font-weight:700;text-transform:uppercase;color:var(--muted-hi);margin-top:4px">↗ Outlinks (${outs.length})</div>`;
+    linksHtml += outs.map(o => `
+      <div class="row" onclick="selectGraphNode('${esc(o.dst)}', true)">
+        <div class="row-main">
+          <div class="row-title">${esc(o.title)} ${o.anchor?`<span class="tag low">#${esc(o.anchor)}</span>`:''}</div>
+          <div class="row-sub"><span>${esc(o.dst)}</span> · <span>${esc(o.kind)}</span></div>
+        </div>
+      </div>
+    `).join('');
+  }
+  s2L.innerHTML = linksHtml || `<div class="empty-box">Keine eingehenden oder ausgehenden Querverweise.</div>`;
+
+  // Card 3: Unlinked Mentions
+  const ums = node.unlinked_mentions || [];
+  s3T.textContent = '💡 Unlinked Mentions';
+  s3C.textContent = ums.length;
+  s3L.innerHTML = ums.length ? ums.map(u => `
+    <div class="row" onclick="selectGraphNode('${esc(u.src)}', true)">
+      <div class="row-main">
+        <div class="row-title">${esc(u.title)} <span class="tag goal">Z.${u.line}</span></div>
+        <div class="row-sub"><span>${esc(u.src)}</span> · Begriff: <strong>${esc(u.matched)}</strong></div>
+        ${u.context ? `<div class="ctx-snip">${esc(u.context)}</div>` : ''}
+      </div>
+    </div>
+  `).join('') + `<div class="code-hint" onclick="navigator.clipboard.writeText('python3 -I brain/_atlas/tools/atlas.py link --related --execute');showToast('Befehl in Zwischenablage kopiert')">📋 atlas.py link --related --execute</div>`
+  : `<div class="empty-box">Keine unverlinkten Text-Erwähnungen dieser Entität im Brain.</div>`;
+}
+
+function renderSidebar(){
+  if(filter === 'graph'){
+    renderGraphSidebar();
+    return;
+  }
+  const s1T = document.getElementById('s1-title'), s1C = document.getElementById('s1-cnt'), s1L = document.getElementById('s1-list');
+  const s2T = document.getElementById('s2-title'), s2C = document.getElementById('s2-cnt'), s2L = document.getElementById('s2-list');
+  const s3T = document.getElementById('s3-title'), s3C = document.getElementById('s3-cnt'), s3L = document.getElementById('s3-list');
+  const coach = DATA.coach || {metrics:[], macro_goals:[], schedule:''};
+
+  if(filter==='coach'){
+    const mode = coachMode();
+    const datedGoals = DATA.items.map((it,idx)=>({it,idx})).filter(x => x.it.kind==='goal' && x.it.delta>=0 && x.it.status==='open');
+    const macros = coach.macro_goals || [];
+    s1T.textContent = mode==='simple' ? '🎯 Ziele &amp; Bewegungsvorsätze' : '🏆 Saisonziele &amp; Athletik-Fokus';
+    s1C.textContent = datedGoals.length + macros.length;
+    let gHtml = datedGoals.map(({it,idx}) => `
+      <div class="row" onclick="showItemModal(${idx})">
+        <div class="row-main">
+          <div class="row-title">🏆 ${esc(it.what)}</div>
+          <div class="row-sub">${fmtDateDE(it.start)} · ${esc(it.subkind||'Ziel')}</div>
+        </div>
+        <span class="tag goal">in ${it.delta}d</span>
+      </div>
+    `).join('');
+    gHtml += macros.map(m => `
+      <div class="row" style="cursor:default">
+        <div class="row-main">
+          <div class="row-title">🎯 ${esc(m.title)}</div>
+          <div class="row-sub">${esc(m.detail)}</div>
+        </div>
+        <span class="tag goal">${esc(m.cat||'Fokus')}</span>
+      </div>
+    `).join('');
+    s1L.innerHTML = gHtml || `<div class="empty-box">Keine aktiven Ziele eingetragen.<div class="code-hint">- [ ] YYYY-MM-DD [goal] Mein Ziel</div></div>`;
+
+    // Card 2: Workouts (-14d .. +14d) with 1-click toggle
+    const wos = DATA.items.map((it,idx)=>({it,idx})).filter(x => x.it.kind==='workout' && x.it.delta>=-14 && x.it.delta<=14);
+    s2T.textContent = mode==='simple' ? '👟 Einheiten (-14d bis +14d)' : '🚴 Trainingsblock (-14d bis +14d)';
+    s2C.textContent = wos.length;
+    s2L.innerHTML = wos.length ? wos.map(({it,idx}) => `
+      <div class="row ${it.status==='done'?'is-done':''}" onclick="showItemModal(${idx})">
+        ${it.can_toggle ? `<button class="cb-btn ${it.status==='done'?'done':''}" onclick="toggleDatedItem(${idx}, event)" title="Einheit abhaken">${it.status==='done'?'✓':''}</button>` : ''}
+        <div class="row-main">
+          <div class="row-title">${icon(it)} ${esc(it.what)}</div>
+          <div class="row-sub">
+            <span>${fmtDateDE(it.start)} · ${esc(it.subkind||'workout')}</span>
+            ${mode!=='simple' && it.zwo_xml?`<span class="tag low" onclick="event.stopPropagation();downloadZwo(${idx})" title=".zwo herunterladen">⬇ .zwo</span>`:''}
+            ${mode!=='simple' && it.w_bal_min_pct!=null?`<span class="tag ${it.w_bal_min_pct<25?'med':'ok'}">W'bal ${Math.round(it.w_bal_min_pct)}%</span>`:''}
+            ${it.feedback?`<span class="tag ok" title="${esc(it.feedback)}">✓ Notiz</span>`:(mode!=='simple' && it.feedback_pending?`<span class="tag med">⚠ Check-in</span>`:'')}
+          </div>
+          ${renderWkoBars(it, false)}
+        </div>
+        <span class="tag ${it.status==='done'?'ok':''}">${it.status==='done'?'✓ erledigt':deltaLabel(it.delta)}</span>
+      </div>
+    `).join('') : `<div class="empty-box">
+      <div>Noch keine Einheiten für diese Woche in <code>calendar/README.md</code> geplant.</div>
+      <div class="code-hint" onclick="navigator.clipboard.writeText('- [ ] ${DATA.today} [workout] 45m Bewegung')">📋 Vorlage kopieren</div>
+    </div>`;
+
+    // Card 3: Simple Mode -> clean Blockers/Schedule; Standard/Pro -> 3-Epoch + Multi-Tier kJ/kg Durability
+    const blk = DATA.items.map((it,idx)=>({it,idx})).filter(x => x.it.delta>=0 && x.it.delta<=28 && x.it.status==='open' && (x.it.kind==='blocked' || (x.it.kind==='event' && x.it.time)));
+    const blkHtml = blk.length ? blk.map(({it,idx}) => `
+      <div class="row" onclick="showItemModal(${idx})">
+        <div class="row-main">
+          <div class="row-title">${icon(it)} ${it.time?esc(it.time)+' ':''}${esc(it.what)}</div>
+          <div class="row-sub">${fmtDateDE(it.start)}${it.end!==it.start?'..'+fmtDateDE(it.end):''}</div>
+        </div>
+        <span class="tag high">${deltaLabel(it.delta)}</span>
+      </div>
+    `).join('') : `<div class="empty-box" style="border-color:rgba(16,185,129,0.3);color:#a7f3d0">✅ 100 % freie Verfügbarkeit in den nächsten 28 Tagen.</div>`;
+
+    if(mode === 'simple'){
+      s3T.innerHTML = '🗓️ Termine &amp; Blocker (28d)';
+      s3C.textContent = blk.length ? `${blk.length} Termine` : 'Frei';
+      s3L.innerHTML = blkHtml;
+    } else {
+      const pc = (coach.power_curve && coach.power_curve.fresh) || {};
+      const pcf = (coach.power_curve && coach.power_curve.fatigued) || {};
+      const dtMap = coach.durability_tiers || {};
+      const durs = ['5s','1m','5m','20m','60m'].filter(d => pc[d]);
+      const hasDur = Object.keys(dtMap).length > 0;
+      s3T.innerHTML = `<span>⚡ Power &amp; Durability</span>` + (durs.length && hasDur ? ` <span class="mini-tabs"><button class="${pcurveTab==='epochs'?'active':''}" onclick="setPcurveTab('epochs')">Epochen</button><button class="${pcurveTab==='durability'?'active':''}" onclick="setPcurveTab('durability')">kJ/kg</button></span>` : '');
+      s3C.textContent = blk.length ? `${blk.length} Blocker` : 'MMP';
+      let c3Html = '';
+      if(durs.length && pcurveTab === 'durability' && hasDur){
+        c3Html += `<table class="pcurve-tbl"><thead><tr><th>Dauer</th><th>Fresh</th><th>&gt;15kJ/kg</th><th>&gt;25kJ/kg</th><th>&gt;35kJ/kg</th></tr></thead><tbody>` +
+          durs.map(d => {
+            const f90 = (pc[d] && (pc[d]['90d'] || pc[d]['42d'])) || '—';
+            const r15 = dtMap['15kj_kg'] || dtMap.kjkg_15 || {};
+            const r25 = dtMap['25kj_kg'] || dtMap.kjkg_25 || {};
+            const r35 = dtMap['35kj_kg'] || dtMap.kjkg_35 || {};
+            const t15 = (r15[d] && r15[d]['90d']) ? r15[d]['90d']+'W' : '—';
+            const t25 = (r25[d] && r25[d]['90d']) ? r25[d]['90d']+'W' : '—';
+            const t35 = (r35[d] && r35[d]['90d']) ? r35[d]['90d']+'W' : '—';
+            return `<tr><td>${d}</td><td>${esc(f90)}</td><td>${esc(t15)}</td><td>${esc(t25)}</td><td>${esc(t35)}</td></tr>`;
+          }).join('') + `</tbody></table>`;
+      } else if(durs.length){
+        c3Html += `<table class="pcurve-tbl"><thead><tr><th>Dauer</th><th>42d</th><th>90d</th><th>365d</th><th>&gt;1500kJ</th></tr></thead><tbody>` +
+          durs.map(d => {
+            const r = pc[d] || {};
+            const rf = pcf[d] || {};
+            return `<tr><td>${d}</td><td>${esc(r['42d']||'—')}</td><td>${esc(r['90d']||'—')}</td><td>${esc(r['365d']||'—')}</td><td>${esc(rf['42d']||rf['90d']||'—')}</td></tr>`;
+          }).join('') + `</tbody></table>`;
+      }
+      c3Html += blkHtml;
+      s3L.innerHTML = c3Html;
+    }
+  } else if(filter==='todo'){
+    s1T.textContent = '☑️ Offene To-Dos (Backlog)';
+    s1C.textContent = DATA.todos.length;
+    s1L.innerHTML = DATA.todos.length ? DATA.todos.map((t, tIdx) => `
+      <div class="row ${t.status==='done'?'is-done':''}" onclick="${t.can_toggle ? `toggleUndatedTodo(${tIdx}, event)` : ''}">
+        ${t.can_toggle ? `<button class="cb-btn ${t.status==='done'?'done':''}" onclick="toggleUndatedTodo(${tIdx}, event)" title="To-Do abhaken">${t.status==='done'?'✓':''}</button>` : ''}
+        <div class="row-main">
+          <div class="row-title">${esc(t.what)}</div>
+          <div class="row-sub"><span>${esc(t.rel)}</span></div>
+        </div>
+        <span class="tag ${esc(t.prio)}">${esc(t.prio)}</span>
+      </div>
+    `).join('') : `<div class="empty-box">Keine offenen Backlog-To-Dos.</div>`;
+
+    const d90 = DATA.items.map((it,idx)=>({it,idx})).filter(x => isTodoItem(x.it) && x.it.delta>=-7 && x.it.delta<=90 && x.it.status==='open');
+    s2T.textContent = '⏳ Fristen &amp; Stichtage (90 Tage)';
+    s2C.textContent = d90.length;
+    s2L.innerHTML = d90.length ? d90.map(({it,idx}) => `
+      <div class="row" onclick="showItemModal(${idx})">
+        ${it.can_toggle ? `<button class="cb-btn ${it.status==='done'?'done':''}" onclick="toggleDatedItem(${idx}, event)" title="Abhaken">${it.status==='done'?'✓':''}</button>` : ''}
+        <div class="row-main">
+          <div class="row-title">${icon(it)} ${esc(it.what)}</div>
+          <div class="row-sub">${fmtDateDE(it.start)} · ${esc(it.rel)}</div>
+        </div>
+        <span class="tag ${it.delta<0?'overdue':(it.delta<=14?'med':'')}">${deltaLabel(it.delta)}</span>
+      </div>
+    `).join('') : `<div class="empty-box">Keine Fristen in den nächsten 90 Tagen.</div>`;
+
+    const dLong = DATA.items.map((it,idx)=>({it,idx})).filter(x => isTodoItem(x.it) && x.it.delta>90 && x.it.status==='open');
+    s3T.textContent = '📆 Langfristige Stichtage (&gt; 90d)';
+    s3C.textContent = dLong.length;
+    s3L.innerHTML = dLong.length ? dLong.map(({it,idx}) => `
+      <div class="row" onclick="showItemModal(${idx})">
+        <div class="row-main">
+          <div class="row-title">${icon(it)} ${esc(it.what)}</div>
+          <div class="row-sub">${fmtDateDE(it.start)} · ${esc(it.rel)}</div>
+        </div>
+        <span class="tag">${deltaLabel(it.delta)}</span>
+      </div>
+    `).join('') : `<div class="empty-box">Keine langfristigen Fristen.</div>`;
+  } else {
+    const ag30 = DATA.items.map((it,idx)=>({it,idx})).filter(x => keepItem(x.it) && x.it.delta>=0 && x.it.delta<=30 && x.it.status==='open');
+    s1T.textContent = '📅 Nächste 30 Tage (Agenda)';
+    s1C.textContent = ag30.length;
+    s1L.innerHTML = ag30.length ? ag30.map(({it,idx}) => `
+      <div class="row" onclick="showItemModal(${idx})">
+        ${it.can_toggle ? `<button class="cb-btn ${it.status==='done'?'done':''}" onclick="toggleDatedItem(${idx}, event)" title="Abhaken">${it.status==='done'?'✓':''}</button>` : ''}
+        <div class="row-main">
+          <div class="row-title">${icon(it)} ${it.time?esc(it.time)+' ':''}${esc(it.what)}</div>
+          <div class="row-sub">${fmtDateDE(it.start)}${it.end!==it.start?'..'+fmtDateDE(it.end):''} · ${esc(it.rel)}</div>
+        </div>
+        <span class="tag ${it.delta<=7?'med':''}">${deltaLabel(it.delta)}</span>
+      </div>
+    `).join('') : `<div class="empty-box">Keine Einträge in den nächsten 30 Tagen.</div>`;
+
+    s2T.textContent = '☑️ Offene To-Dos &amp; Checklisten';
+    s2C.textContent = DATA.todos.length;
+    s2L.innerHTML = DATA.todos.length ? DATA.todos.map((t, tIdx) => `
+      <div class="row ${t.status==='done'?'is-done':''}" onclick="${t.can_toggle ? `toggleUndatedTodo(${tIdx}, event)` : ''}">
+        ${t.can_toggle ? `<button class="cb-btn ${t.status==='done'?'done':''}" onclick="toggleUndatedTodo(${tIdx}, event)" title="To-Do abhaken">${t.status==='done'?'✓':''}</button>` : ''}
+        <div class="row-main">
+          <div class="row-title">${esc(t.what)}</div>
+          <div class="row-sub">${esc(t.rel)}</div>
+        </div>
+        <span class="tag ${esc(t.prio)}">${esc(t.prio)}</span>
+      </div>
+    `).join('') : `<div class="empty-box">Keine offenen To-Dos.</div>`;
+
+    const hi = DATA.items.map((it,idx)=>({it,idx})).filter(x => x.it.delta>=0 && x.it.status==='open' && (x.it.kind==='goal' || x.it.kind==='birthday' || x.it.delta>30));
+    s3T.textContent = '🏆 Ziele, Geburtstage &amp; Ausblick';
+    s3C.textContent = hi.length;
+    s3L.innerHTML = hi.length ? hi.map(({it,idx}) => `
+      <div class="row" onclick="showItemModal(${idx})">
+        <div class="row-main">
+          <div class="row-title">${icon(it)} ${esc(it.what)}</div>
+          <div class="row-sub">${fmtDateDE(it.start)} · ${esc(it.rel)}</div>
+        </div>
+        <span class="tag ${it.kind==='goal'?'goal':''}">${deltaLabel(it.delta)}</span>
+      </div>
+    `).join('') : `<div class="empty-box">Keine weiteren Jahrestermine.</div>`;
+  }
+}
+
+function render(){
+  for(const k of ['all','coach','todo','graph']){
+    const el = document.getElementById('f-'+k);
+    if(el) el.classList.toggle('active', k===filter);
+  }
+  for(const l of ['month','week','agenda']){
+    const el = document.getElementById('v-'+l);
+    if(el) el.classList.toggle('active', l===layout);
+  }
+  const isGraph = filter === 'graph';
+  document.getElementById('layout-seg').style.display = isGraph ? 'none' : 'inline-flex';
+  document.getElementById('cal-nav').style.display = isGraph ? 'none' : 'inline-flex';
+  document.getElementById('q-in').placeholder = isGraph ? 'Graph durchsuchen… (/)' : 'Filtern… (/)';
+
+  const coachCnt = DATA.items.filter(isCoachItem).length + ((DATA.coach&&DATA.coach.macro_goals)||[]).length;
+  const todoCnt = DATA.items.filter(isTodoItem).length + DATA.todos.length;
+  const graphCnt = (DATA.graph && DATA.graph.stats && DATA.graph.stats.nodes) || ((DATA.graph && DATA.graph.nodes) ? DATA.graph.nodes.length : 0);
+  document.getElementById('cnt-all').textContent = DATA.items.length;
+  document.getElementById('cnt-coach').textContent = coachCnt;
+  document.getElementById('cnt-todo').textContent = todoCnt;
+  document.getElementById('cnt-graph').textContent = graphCnt;
+
+  renderKPIs();
+  renderMain();
+  renderSidebar();
+}
+
+// Keyboard shortcuts
+document.addEventListener('keydown', e => {
+  if(e.target.tagName==='INPUT' || e.target.tagName==='TEXTAREA'){
+    if(e.key==='Escape') e.target.blur();
+    return;
+  }
+  if(e.key==='Escape') closeModal();
+  else if(e.key==='ArrowLeft') stepNav(-1);
+  else if(e.key==='ArrowRight') stepNav(1);
+  else if(e.key==='t' || e.key==='T') goToday();
+  else if(e.key==='1') setFilter('all');
+  else if(e.key==='2') setFilter('coach');
+  else if(e.key==='3') setFilter('todo');
+  else if(e.key==='4' || e.key==='g' || e.key==='G') setFilter('graph');
+  else if(e.key==='m' || e.key==='M') setLayout('month');
+  else if(e.key==='w' || e.key==='W') setLayout('week');
+  else if(e.key==='a' || e.key==='A') setLayout('agenda');
+  else if(e.key==='/'){ e.preventDefault(); document.getElementById('q-in').focus(); }
+});
+
+window.addEventListener('resize', () => { if(filter==='graph') drawGraphFrame(); });
+
+// Seamless background live-sync (preserves filter, month, graph selection & scroll state)
+setInterval(async () => {
+  try {
+    const res = await fetch(window.location.pathname, {cache: 'no-store'});
+    if(!res.ok) return;
+    const html = await res.text();
+    const m = html.match(/let DATA = (\{.*?\});\n/);
+    if(m){
+      const nextData = JSON.parse(m[1]);
+      if(JSON.stringify(nextData) !== JSON.stringify(DATA)){
+        DATA = nextData;
+        graphSim.key = '';
+        render();
+      }
+    }
+  } catch(_e){}
+}, 15000);
+
+render();
+</script></body></html>

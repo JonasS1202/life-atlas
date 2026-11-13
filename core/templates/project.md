@@ -2,6 +2,7 @@
 summary: <one line: goal and current state>
 tags: [project]
 aliases: []
+related: []
 status: active
 due: []
 ---

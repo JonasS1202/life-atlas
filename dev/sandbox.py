@@ -17,6 +17,8 @@ import os
 import subprocess
 import sys
 
+sys.dont_write_bytecode = True
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 TOOL = os.path.join(REPO, "core", "tools", "atlas.py")
@@ -36,7 +38,7 @@ DEMO = {
 
 
 def run(*args, check=True):
-    res = subprocess.run([sys.executable, "-I", *args], capture_output=True, text=True, encoding="utf-8",
+    res = subprocess.run([sys.executable, "-I", "-B", *args], capture_output=True, text=True, encoding="utf-8",
                          errors="replace")
     out = (res.stdout + res.stderr).strip()
     if out:

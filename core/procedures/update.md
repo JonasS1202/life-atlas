@@ -24,16 +24,19 @@ What this command does automatically in one step:
   keeping all user data (`self/`, `people/`, `areas/`, `projects/`, `howto/`, `journal/`, `inbox/`, `skills/`,
   `_secrets/`, `calendar/`, `coach/`, and the personal `## About` section of `ROUTER.md`) 100% untouched.
 - Runs declarative upgrades and post-upgrade initializers (`coach --init`), auto-detects and re-wires every connected
-  agent (`.agents/skills/`, `.claude/skills/`, hooks, preserving `router_mode`), probes the hooks (rolling back
-  automatically if any probe fails), and commits `atlas: update-check core <old> -> <new>`.
+  agent (`.agents/skills/`, `.agents/plugins/atlas-subagents/`, `.claude/skills/`, `.claude/agents/`, hooks, preserving
+  `router_mode`), probes the hooks (rolling back automatically if any probe fails), and commits
+  `atlas: update-check core <old> -> <new>`.
 - Prints the full `changelog:` between the versions and what changed.
 
 After running `core-apply --execute`:
 1. **Tell the user immediately what version was installed and summarise what is new** from the printed `changelog:` in
-   friendly, plain words. Mention in one short line that if skills changed, opening a fresh chat loads the updated
-   skills.
-2. **Agent tasks** from the upgrades (e.g. `agent task ...`): do them in the grown layer, in the user's language,
-   without overwriting their content.
+   friendly, plain words. Mention in one short line that if skills or subagents changed, opening a fresh chat loads them.
+2. **Agent tasks & Wiki-Graph weaving** from the upgrades (e.g. `agent task ...`): do them in the grown layer, in the
+   user's language, without overwriting their content. When upgrading to `0.9.0+`, run `atlas.py index` and
+   `atlas.py link --journals --related --execute` so existing individualized notes and daily logs are woven into the
+   Knowledge Graph (`_atlas/cache/index.sqlite`) with zero prose risk; mention `atlas.py link --scan` / `--inline` if
+   inline prose links are desired.
 3. **Conflicts** (if any file was changed both locally and upstream on the same lines): `core-apply` leaves the local
    file untouched and writes the conflict files to `_atlas/migrations/<run>/conflicts/`. Show the user both sides,
    propose the merge, apply it after their yes, and run `atlas.py core-accept <file>`.

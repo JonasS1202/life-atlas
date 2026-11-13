@@ -1,0 +1,14 @@
+{
+  "dirs": ["coach", "coach/workouts"],
+  "skeleton_add": [
+    "coach/readiness.md"
+  ],
+  "tags_add": [
+    ["sport", "Sport, endurance training, coaching, workouts, physiology", "training, laufen, running, triathlon, athletik"],
+    ["mail", "Emails, postboxes, IMAP accounts, correspondence", "email, e-mail, postfach"]
+  ],
+  "notes": [
+    "Coach v1.0.0 scales automatically via `depth: auto | simple | standard | pro` in `brain/coach/profile.md` (preserving any existing customized profile untouched) and tracks daily recovery/PMC load in `brain/coach/readiness.md` (`atlas.py coach note --rhr ... --sleep ...`).",
+    "Use `python -I <ROOT>/brain/_atlas/tools/atlas.py mail ingest` (add `--execute` to save) to bridge `.ics` invites and `.pdf` documents with provenance stubs into `brain/inbox/`, and `/atlas-interview` to review stale `verified:` dates and open `atlas.py conflicts`."
+  ]
+}

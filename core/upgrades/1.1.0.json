@@ -1,0 +1,5 @@
+{
+  "notes": [
+    "Open the upgraded local Atlas Hub via `python -I <ROOT>/brain/_atlas/tools/atlas.py calendar --view graph --open` to explore the interactive `🕸️ Brain Graph` (outlinks, backlinks with context, orphans, stale `verified:` rings, and unlinked mentions), toggle to-dos directly via checkboxes, and view the adaptive Simple-to-Pro Coach dashboard."
+  ]
+}

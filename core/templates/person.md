@@ -2,6 +2,7 @@
 summary: <one line: who this is to the user>
 tags: [person]
 aliases: []
+related: []
 due: []
 ---
 # <First Last>

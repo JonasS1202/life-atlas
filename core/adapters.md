@@ -1,6 +1,6 @@
 # Adapters: how Atlas plugs into each agent
 
-Verified: **2026-11-07** against the official docs listed below. `/atlas-update` compares this page with the current
+Verified: **2026-11-13** against the official docs listed below. `/atlas-update` compares this page with the current
 official documentation and proposes changes (charter §7). Anything marked *unconfirmed* must be tested on the real
 machine (`atlas.py probe`, a fresh chat) and fixed here when it turns out differently.
 
@@ -35,13 +35,14 @@ Blogs, forums and videos are hints only. On 2026-11-07 third-party pages still s
 | Project rules, loaded only when the repo is touched | `ROOT/.claude/rules/atlas-<slug>.md` with `paths: - "code/<repo>/**"` (patterns relative to the working folder). Claude Code also loads the repo's own `CLAUDE.md` natively when it reads files in `code/<repo>/` | `ROOT/.agents/rules/atlas-<slug>.md` with `trigger: glob`, `globs: code/<repo>/**`. Nested `AGENTS.md` are **not** loaded natively (only workspace folder and parents): the router tells the agent to read them |
 | Projects outside ROOT | no path rules (patterns are relative); routing by the hook; `wire --grant` adds the folder to `permissions.additionalDirectories` plus `Edit`/`Read` allow rules (`//abs` form, **unconfirmed** for Windows drive letters) | routing by the hook; whether the agent may read and edit folders outside the workspace is **unconfirmed**; prefer `ROOT/code/` |
 | Memory | `autoMemoryDirectory` → `ROOT/brain/_atlas/memory` (absolute path; confirmed in project settings 2026-11-07); first 200 lines / 25 KB of `MEMORY.md` load at start | no documented memory redirect; the router names `brain/_atlas/memory/MEMORY.md`; Antigravity's `/learn` (manual, writes rules/skills, not facts) is steered into the brain by the router and adopted by `atlas.py adopt` |
-| Subagents | `ROOT/.claude/agents/atlas-search.md`, `atlas-maintainer.md` (big searches and weekly maintenance outside the main chat) | none documented; done in the main chat |
+| Subagents | `ROOT/.claude/agents/atlas-search.md`, `atlas-maintainer.md` (big searches and weekly maintenance outside the main chat) | `ROOT/.agents/plugins/atlas-subagents/` (`plugin.json` + `agents/{atlas-search,atlas-maintainer}.md` with `subagent: true`, `mainAgent: false`, and Antigravity tool names; user scope: `~/.gemini/config/plugins/atlas-subagents-<slug>/`) |
 | On the phone | Claude app with Remote Control of the session on the computer: the session runs in ROOT, hooks and brain work as usual | Antigravity app connected to the instance on the computer: same |
 | Workflows | – | deprecated in favour of skills |
 
-Optional **user scope** (`--scope user`): the same router, hooks and skills in `~/.claude/` and `~/.gemini/`
-(`~/.gemini/AGENTS.md`, `~/.gemini/config/hooks.json`, `~/.gemini/config/skills/`), so Atlas is also present in chats
-opened elsewhere. No path rules (they are relative to each chat's folder). Not needed when every chat starts in ROOT.
+Optional **user scope** (`--scope user`): the same router, hooks, skills and subagents in `~/.claude/` and `~/.gemini/`
+(`~/.gemini/AGENTS.md`, `~/.gemini/config/hooks.json`, `~/.gemini/config/skills/`, `~/.gemini/config/plugins/`), so Atlas
+is also present in chats opened elsewhere. No path rules (they are relative to each chat's folder). Not needed when every
+chat starts in ROOT.
 
 ## Hook protocol
 
@@ -61,14 +62,14 @@ If a future agent version drops or renames these events, the heartbeat goes miss
 
 Every changed file is backed up to `brain/_atlas/migrations/<run>/wiring-backup/` first. Blocks are marked
 `<!-- atlas:start -->` … `<!-- atlas:end -->`; hook entries are identified by `atlas_hook.py` (Claude) or the key
-`atlas` (Antigravity); skills and rules by their folder or `atlas-` prefix. `atlas.py unwire --agent …` removes exactly
-these parts. Content outside them is never touched; an unreadable JSON file stops the wiring.
+`atlas` (Antigravity); skills, rules and subagent plugins by their folder or `atlas-` prefix. `atlas.py unwire --agent …`
+removes exactly these parts. Content outside them is never touched; an unreadable JSON file stops the wiring.
 
 ## Open checks (fill in after the first real install)
 
-- [ ] Antigravity: does `@[Atlas router](brain/ROUTER.md)` in `ROOT/GEMINI.md` load the router? If not: `wire --router-mode copy`.
-- [ ] Antigravity: do `trigger: glob` rules fire for `code/<repo>/**` when the agent edits files there?
+- [x] Antigravity: `@[Atlas router](brain/ROUTER.md)` in `ROOT/GEMINI.md` loads the router (`wire --router-mode copy` remains as fallback).
+- [x] Antigravity: `trigger: glob` rules fire for `code/<repo>/**` when the agent edits files there.
 - [ ] Antigravity: can the agent read and edit folders outside the workspace (projects not in `code/`)?
 - [ ] Antigravity: which shell runs hook commands on Windows; is `ephemeralMessage` visible to the model in that turn?
-- [ ] Antigravity: transcript format for the stop hook's work detection (currently a text heuristic).
-- [ ] Claude Code: `paths:` rules and nested `CLAUDE.md` load when files in `code/<repo>/` are read (`/context`).
+- [x] Antigravity: transcript format for the stop hook's work detection (`transcript.jsonl` / `transcriptPath`).
+- [x] Claude Code: `paths:` rules and nested `CLAUDE.md` load when files in `code/<repo>/` are read (`/context`).

@@ -2,6 +2,10 @@
 summary: <one line: what it is, the key number, the next date>
 tags: [contract]
 aliases: []
+related: []
+verified: YYYY-MM-DD
+valid_until:
+sources: []
 due:
   - YYYY-MM-DD what is due (e.g. last day to cancel)
 ---

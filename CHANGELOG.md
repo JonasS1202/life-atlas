@@ -2,6 +2,37 @@
 
 Written for users: `/atlas-update` shows the sections between the installed and the new version.
 
+## [1.1.0] - 2026-11-13
+
+- **Interactive `🕸️ Brain Graph` Explorer (`calendar.html?view=graph`, `atlas.py calendar --view graph`):**
+  - **Zero-Dependency Force-Directed Knowledge Graph (`core/templates/calendar.html` + `cal_engine.py`):** Renders the entire `brain/` knowledge graph directly from `index.sqlite` on an offline-capable HTML5 `<canvas>` with high-DPI scaling, smooth pan/zoom, node dragging, search (`/`), and domain filters (`All`, `People`, `Areas`, `Projects`, `Howto`, `Orphans`, `Stale / Broken`, plus a `Hubs` toggle).
+  - **Visual Health Encoding & Side Inspector:** Encodes domain by color, node radius by horizontal degree, dashed amber warning rings for stale `verified:` dates (`> 365` days) or expired `valid_until:`, and solid red rings for broken links. Clicking any node opens the Side Inspector with `summary:`, clickable `#tags`, `verified:` freshness, **Backlinks** (including `#anchor` targets and surrounding line context), **Outlinks**, and **Unlinked Mentions** ready for `atlas.py link`.
+- **Interactive Loopback Dashboard (`atlas-cal-v3`) & 1-Click To-Do Toggling (`POST /toggle-todo`):**
+  - **CSRF-Protected Markdown Checkbox Write-Back:** Clicking checkboxes on to-dos or workouts across Month, Week, Agenda, Sidebar, or Detail Modal views sends a loopback-only, CSRF-verified (`cal_csrf.txt` + `Origin`/`Host` validation) `POST /toggle-todo` request that safely toggles `- [ ]` $\leftrightarrow$ `- [x]` in the source Markdown file (skipping YAML frontmatter and fenced code blocks, with strict `realpath` confinement inside `brain/`) and re-renders `calendar.html` immediately.
+  - **Modular Template Extraction:** Extracted the embedded dashboard HTML/CSS/JS and loopback server out of `core/hooks/atlas_hook.py` into `core/templates/calendar.html` and `core/tools/atlas_lib/cal_engine.py` (with safe `<\/script>` JSON serialization and deterministic `core-apply` updates that preserve user-customized `templates/*.md` files).
+- **Adaptive Simple-to-Pro `🚴 Coach View` UI:**
+  - **Simple Mode (`depth: simple`):** Presents a calm, clutter-free weekly habit and movement view (completed vs. planned sessions, active minutes, rhythm window, and 28-day availability) with zero FTP, `CP/W'`, `CTL`, or `kJ/kg` jargon.
+  - **Pro Mode (`depth: pro` or active power/stream telemetry):** Displays the daily `Readiness` badge (`GREEN | AMBER | RED`) with physiological guardrails, `CP / W'` & Muscle Fiber `Typology` (`Fast-Twitch`, `Allrounder`, `Diesel`), running `CS / D'`, `VO₂max` & `FatMax` chips, a `CTL / ATL / TSB / ACWR` load strip with an inline 42-day SVG trend sparkline, per-ride `W'bal min %` & `Matches`, and a switchable **Multi-Tier Durability (`>15`, `>25`, `>35 kJ/kg`)** table.
+
+## [1.0.0] - 2026-11-13
+
+- **Adaptive Simple-to-Pro Sports-Science & Physiology Engine (`coach_engine.py`, `/atlas-coach`):**
+  - **Progressive Disclosure (`depth: auto | simple | standard | pro`):** Automatically adapts both CLI context (`atlas.py coach context`) and coaching guidance from beginner-friendly habit building (`simple`) to full sports-science telemetry (`pro`) without breaking existing customized `brain/coach/profile.md` setups.
+  - **Zero-Token 1Hz Stream Physics & Biochemistry:** Computes 2-parameter **Critical Power (`CP` & `W'`)** and Running **Critical Speed (`CS` & `D'`)** with `R²` quality gates, **Skiba Differential `W'` Balance (`W'bal`)** (`w_bal_min_pct` & burned matches), **PDC Muscle Fiber Typology** (`P5s/CP`, `P15s/CP`, power-law decay exponent `b`), **Torque-Cadence (`Nm` vs. `rpm`)** quadrant profiling, **Storer / Uth / Daniels `VO₂max`** cross-checks, honest **Glycolytic / Lactate Clearance Index** bands (`CP/P5m`, `P15s/P5m`), **FatMax & Carbohydrate (`g CHO/h`)** fueling targets, and **Multi-Tier Durability** (`>15`, `>25`, `>35 kJ/kg` + `>5 kJ/kg` above `CP`).
+  - **Cross-Sport Systemic Load (`CTL / ATL / TSB / ACWR`), Readiness & Guardrails (`brain/coach/readiness.md`):** Unifies cycling `TSS`, running `rTSS`, HR `hrTSS`, and strength `sRPE` into longitudinal `CTL`, `ATL`, `TSB`, `7d Ramp`, and `ACWR`, paired with morning readiness check-ins (`atlas.py coach note --rhr ... --sleep ... --soreness ...`), Peronnet altitude & indoor/heat `Pw:Hr` normalization, **Bosquet A-Race Taper** windows, and `AMPK/mTORC1` interference guardrails.
+- **High-Throughput IMAP Header Sync & Zero-Token Mail-to-Brain Bridge (`atlas_mail.py`, `atlas.py mail ingest`):**
+  - **Fast Header-Only Scanning & Server-Side `UID SEARCH`:** `list`, `search`, and `audit` now fetch lightweight `BODY.PEEK[HEADER.FIELDS ...] RFC822.SIZE` metadata instead of full MIME bodies during listing, compile ASCII criteria into server-side IMAP `UID SEARCH` queries, and reuse pooled read-only IMAP connections across multi-folder audits.
+  - **Mail Ingest (`atlas.py mail ingest`):** Deterministically extracts `.ics` calendar invitations and `.pdf` documents from matching emails into `brain/inbox/` with provenance sidecar stubs (`dry-run` by default; writes only with `--execute`, never setting `\Seen`).
+- **Bi-Temporal Provenance (`verified:`, `valid_until:`, `sources:`) & Conflict Tracking (`atlas.py conflicts`):**
+  - Added frontmatter support and validation for `verified: YYYY-MM-DD`, `valid_until: YYYY-MM-DD`, and `sources:` across `brain/`, `atlas.py conflicts` (`list | add | resolve`) backed by `_atlas/conflicts.json`, and upgraded `/atlas-interview` to prioritize open contradictions, expired `valid_until:` dates, and stale facts (`verified:` older than 365 days).
+
+## [0.9.0] - 2026-11-13
+
+- **Dual-Tokenizer SQLite FTS5 & Knowledge-Graph Engine (`graph_engine.py`, `_atlas/cache/index.sqlite`):**
+  - **Incremental SQLite Index (`index.sqlite`):** Replaces flat JSON index scans with a self-healing SQLite cache combining `unicode61` FTS5 (with German umlaut normalization `ä/ae`, `ö/oe`, `ü/ue`, `ß/ss`), a substring `trigram` FTS5 table for compound words (e.g. `haftpflicht` inside `Privathaftpflichtversicherung`), and a typed `edges` + `headings` graph (`related`, `body`, `journal`, `tree`).
+  - **Code-Block-Safe `[[Wikilink]]` Compiler & Graph CLI:** `atlas.py check --fix` compiles `[[Target#Section|Label]]` outside fenced/inline code blocks into portable relative Markdown links and validates `#anchor` fragments. Added `atlas.py graph <page>`, `atlas.py context <page> [--budget N]`, and `atlas.py link` (`--scan`, `--journals`, `--related`, `--inline`, `--execute`) for safe retroactive wiki-linking.
+  - **Specificity-Weighted 1-Hop Hints & Cross-Agent Subagent Parity:** `prompt()` now surfaces 1-hop graph neighbors weighted by inverse hub degree (`1 / log2(2 + degree)`), `stop()` skips regenerating `calendar.html` when inputs are unchanged, `pull()` fails fast when offline, `hook_errors.log` auto-rotates at 50 KB, and `wire --agent antigravity` installs native `.agents/agents/atlas-search.md` and `atlas-maintainer.md` subagents alongside Claude Code.
+
 ## [0.8.0] - 2026-11-11
 
 - **Native Multi-Account IMAP Mail Engine (`/atlas-mail`, `atlas_mail.py`, `atlas.py mail`):**

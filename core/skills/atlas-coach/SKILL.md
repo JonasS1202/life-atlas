@@ -1,6 +1,6 @@
 ---
 name: atlas-coach
-description: "Endurance & hybrid sport coach (cycling, running, strength): Strava sync, power curves, ride feedback, macro & 14d workout planner, .zwo compiler."
+description: "Adaptive simple-to-pro sport coach (cycling, running, strength): casual fitness or CP/W'bal/load telemetry, readiness, macro/14d plans, .zwo."
 ---
 
 Read `{{BRAIN}}/_atlas/procedures/coach.md` completely and follow it.

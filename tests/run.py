@@ -15,6 +15,8 @@ import sys
 import time
 import unittest
 
+sys.dont_write_bytecode = True
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC_TOOL = os.path.join(REPO, "core", "tools", "atlas.py")
 BASE_DIR = os.path.join(os.path.expanduser("~"), ".atlas-tests")
@@ -54,14 +56,14 @@ class AtlasCase(unittest.TestCase):
 
     # helpers
     def atlas(self, *args, tool=None, check=True, root=None):
-        res = subprocess.run([sys.executable, "-I", tool or self.tool, "--root", root or self.root, *args],
+        res = subprocess.run([sys.executable, "-I", "-B", tool or self.tool, "--root", root or self.root, *args],
                              capture_output=True, text=True, encoding="utf-8", errors="replace")
         if check and res.returncode:
             self.fail(f"atlas {' '.join(args)} -> {res.returncode}\n{res.stdout}\n{res.stderr}")
         return res
 
     def hook(self, agent, event, payload, hookf=None):
-        res = subprocess.run([sys.executable, "-I", hookf or self.hookf, agent, event], input=json.dumps(payload),
+        res = subprocess.run([sys.executable, "-I", "-B", hookf or self.hookf, agent, event], input=json.dumps(payload),
                              capture_output=True, text=True, encoding="utf-8", errors="replace")
         self.assertEqual(res.returncode, 0, res.stderr)
         out = res.stdout.strip()
@@ -478,7 +480,7 @@ class Calendar(AtlasCase):
                      "    def log_message(self, *args, **kwargs): pass\n"
                      "handler = functools.partial(_QuietHandler, directory=sys.argv[2])\n"
                      "http.server.ThreadingHTTPServer(('127.0.0.1', int(sys.argv[1])), handler).serve_forever()\n")
-        proc = subprocess.Popen([sys.executable, "-I", srv_py, str(free_port), os.path.dirname(html_path)],
+        proc = subprocess.Popen([sys.executable, "-I", "-B", srv_py, str(free_port), os.path.dirname(html_path)],
                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             ok = False
@@ -541,10 +543,13 @@ class Coach(AtlasCase):
         self.assertIn('<SteadyState Duration="1140" Power="0.68"/>', zwo_xml)
         self.assertIn('<Cooldown Duration="600" PowerLow="0.65" PowerHigh="0.50"/>', zwo_xml)
 
-        # 3. Mock Strava sync with >1500 kJ 1Hz power stream & running velocity stream
+        # 3. Mock Strava sync with >1500 kJ 1Hz power + cadence + altitude + temp streams & running velocity stream
         # 6000s @ 260W = 1,560,000 J (1560 kJ), then 300s @ 340W after >1500 kJ!
         watts_stream = [260] * 6000 + [340] * 300
         hr_stream = [142] * 6000 + [174] * 300
+        cad_stream = [88] * 6000 + [96] * 300
+        alt_stream = [1850.0] * 6300
+        temp_stream = [29.0] * 6300
         mock_acts = [
             {
                 "id": "9001",
@@ -554,7 +559,13 @@ class Coach(AtlasCase):
                 "moving_time": 6300,
                 "distance": 62500.0,
                 "total_elevation_gain": 480,
-                "streams": {"watts": watts_stream, "heartrate": hr_stream},
+                "streams": {
+                    "watts": watts_stream,
+                    "heartrate": hr_stream,
+                    "cadence": cad_stream,
+                    "altitude": alt_stream,
+                    "temp": temp_stream,
+                },
             },
             {
                 "id": "9002",
@@ -576,27 +587,47 @@ class Coach(AtlasCase):
         self.assertIn("1 calendar workout(s) marked [x]", res_sync)
         self.assertIn("1 ride check-in(s) pending", res_sync)
 
-        # Check 3-Epoch Power Curve (Fresh & Fatigued >1500 kJ) and Running Paces
+        # Check 3-Epoch Power Curve (Fresh & Fatigued >1500 kJ + Multi-Tier Durability) and Running Paces
         pc_text = self.read(os.path.join(self.brain, "coach", "power-curve.md"))
         self.assertIn("340 W", pc_text)
         self.assertIn("4:10/km", pc_text)
+        self.assertIn("Multi-Tier Durability", pc_text)
 
         # Check calendar [x] auto-match and pending feedback check-in
         cal_after = self.read(cal_path)
         self.assertIn(f"- [x] {d_yest} 17:30 [workout:cycling]", cal_after)
         self.assertIn("[feedback: pending]", cal_after)
 
-        # Save athlete ride feedback note
-        res_note = self.atlas("coach", "note", "--date", d_yest, "--text", "Beine top im Finale", "--rpe", "7").stdout
+        # Save athlete ride feedback note + morning readiness (RHR, sleep, sleep-quality, soreness)
+        res_note = self.atlas(
+            "coach", "note", "--date", d_yest, "--text", "Beine top im Finale",
+            "--rpe", "7", "--rhr", "48", "--sleep", "7.8", "--sleep-quality", "good", "--soreness", "2", "--execute",
+        ).stdout
         self.assertIn("RPE 7/10 — Beine top im Finale", res_note)
+        self.assertIn("[readiness=GREEN", res_note)
         self.assertIn("[feedback: RPE 7/10 — Beine top im Finale]", self.read(cal_path))
         self.assertNotIn("[feedback: pending]", self.read(cal_path))
+        rdy_md = self.read(os.path.join(self.brain, "coach", "readiness.md"))
+        self.assertIn("| 48 | 7.8 (good) | 7 | 2 |", rdy_md)
 
-        # 4. Verify Coach Context Slicing, 1-Click Strava Connect Link & Hook Routing + Staleness Detection
+        # Also test standalone morning readiness check-in with `--sleep-quality poor` triggering AMBER
+        res_sq_poor = self.atlas(
+            "coach", "note", "--date", today.isoformat(),
+            "--rhr", "49", "--sleep", "7.0", "--sleep-quality", "poor", "--soreness", "2", "--execute",
+        ).stdout
+        self.assertIn("[readiness=AMBER", res_sq_poor)
+        self.assertIn("| 49 | 7.0 (poor) |", self.read(os.path.join(self.brain, "coach", "readiness.md")))
+
+        # 4. Verify Pro Telemetry Context, 1-Click Strava Connect Link & Hook Routing + Staleness Detection
         auth_out = self.atlas("coach", "auth-strava").stdout
         self.assertIn("/strava-connect", auth_out)
         self.assertIn("client_id=91804", auth_out)
         ctx_out = self.atlas("coach", "context", "--mode", "plan-14d", "--no-sync").stdout
+        self.assertIn("PHYSIOLOGICAL TELEMETRY & LOAD", ctx_out)
+        self.assertIn("VO2max", ctx_out)
+        self.assertIn("hypoxia", ctx_out)
+        self.assertIn("[thermal drift]", ctx_out)
+        self.assertIn("Torque", ctx_out)
         self.assertIn("ATHLETE PROFILE & THRESHOLDS", ctx_out)
         self.assertIn("3-EPOCH POWER & PACE CURVE", ctx_out)
         self.assertIn("/strava-connect", ctx_out)
@@ -614,7 +645,48 @@ class Coach(AtlasCase):
         self.assertIn("Atlas coach -> mode 'plan-14d'", hook_out)
         self.assertIn("Macro plan is STALE", hook_out)
 
-        # 5. Verify atlas.py check passes with 0 errors, 0 orphans, and within skill description budget
+        # 5. Adaptive SIMPLE mode (jargon-free casual user) + v1.0.0 upgrade profile guard & readiness link
+        prof_path = os.path.join(self.brain, "coach", "profile.md")
+        custom_casual_profile = (
+            "---\nsummary: Casual Fitness Profile\ntags: [sport]\ndepth: auto\n---\n"
+            "# Athlete Profile\n\n"
+            "- **Primary Sport:** Running & Mobility\n"
+            "- **Weekly Budget:** Run 2x/week, stay healthy, nothing fancy\n"
+            "- **Schedule:** Tue & Sat mornings\n"
+        )
+        with open(prof_path, "w", encoding="utf-8") as fh:
+            fh.write(custom_casual_profile)
+        with open(os.path.join(self.brain, "coach", "activities.json"), "w", encoding="utf-8") as fh:
+            fh.write("[]")
+        with open(os.path.join(self.brain, "coach", "readiness.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nsummary: Readiness\ntags: [sport, log]\n---\n# Readiness\n")
+        with open(cal_path, "a", encoding="utf-8") as fh:
+            fh.write(f"\n- [ ] {(today + dt.timedelta(days=3)).isoformat()} [blocked] Familienausflug\n")
+
+        simple_ctx = self.atlas("coach", "context", "--mode", "plan-14d", "--no-sync").stdout
+        self.assertIn("COACH CONTEXT (SIMPLE", simple_ctx)
+        self.assertIn("Familienausflug", simple_ctx)
+        for jargon in ("PHYSIOLOGICAL TELEMETRY", "FTP", "W'bal", "CTL", "ACWR", ".zwo", "/strava-connect"):
+            self.assertNotIn(jargon, simple_ctx)
+
+        # Simulate upgrading an existing v0.9.0 coach brain to v1.0.0:
+        # must preserve customized profile.md AND auto-link readiness.md in coach/README.md (0 orphans)
+        coach_readme = os.path.join(self.brain, "coach", "README.md")
+        with open(coach_readme, "w", encoding="utf-8") as fh:
+            fh.write(
+                "---\nsummary: Coach Hub\ntags: [sport]\n---\n# Coach Hub\n\n"
+                "- [profile.md](profile.md)\n- [macro-plan.md](macro-plan.md)\n"
+                "- [power-curve.md](power-curve.md)\n- [activities.md](activities.md)\n"
+            )
+        os.replace(os.path.join(self.brain, "coach", "readiness.md"), os.path.join(self.tmp, "readiness.bak"))
+        with open(os.path.join(self.brain, "_atlas", "VERSION"), "w", encoding="utf-8") as fh:
+            fh.write("0.9.0\n")
+        self.atlas("core-apply", "--source", REPO, "--execute", tool=SRC_TOOL)
+        self.assertEqual(self.read(prof_path), custom_casual_profile)
+        self.assertTrue(os.path.isfile(os.path.join(self.brain, "coach", "readiness.md")))
+        self.assertIn("[readiness.md](readiness.md)", self.read(coach_readme))
+
+        # 6. Verify atlas.py check passes with 0 errors, 0 orphans, and within skill description budget
         self.wire_both()
         chk = self.atlas("check", check=False).stdout
         self.assertNotIn("ERROR", chk, chk)
@@ -630,6 +702,8 @@ class Mail(AtlasCase):
         state = {
             "examine_count": 0,
             "select_rw_count": 0,
+            "fetch_specs": [],
+            "search_queries": [],
             "folders": {
                 "INBOX": {
                     "flags": r"\HasNoChildren",
@@ -658,6 +732,32 @@ class Mail(AtlasCase):
                                 b"Message-ID: <msg-102@example.com>\r\n"
                                 b"Content-Type: text/plain; charset=utf-8\r\n\r\n"
                                 b"Unsubscribe anytime.\r\n"
+                            ),
+                        },
+                        "103": {
+                            "flags": [],
+                            "labels": ["Travel"],
+                            "raw": (
+                                b"From: Konferenzbuero <orga@example.org>\r\n"
+                                b"To: test@example.com\r\n"
+                                b"Subject: Ticket & Termin Projektkongress\r\n"
+                                b"Date: Thu, 12 Nov 2026 09:15:00 +0100\r\n"
+                                b"Message-ID: <msg-103@example.org>\r\n"
+                                b"MIME-Version: 1.0\r\n"
+                                b'Content-Type: multipart/mixed; boundary="BOUND103"\r\n\r\n'
+                                b"--BOUND103\r\n"
+                                b"Content-Type: text/plain; charset=utf-8\r\n\r\n"
+                                b"Anbei Ihre Rechnung und der Kalendereintrag.\r\n"
+                                b"--BOUND103\r\n"
+                                b'Content-Type: application/pdf; name="rechnung-2026.pdf"\r\n'
+                                b'Content-Disposition: attachment; filename="rechnung-2026.pdf"\r\n\r\n'
+                                b"%PDF-1.4 mock-pdf-bytes\r\n"
+                                b"--BOUND103\r\n"
+                                b'Content-Type: text/calendar; charset=utf-8; name="kongress.ics"\r\n'
+                                b'Content-Disposition: attachment; filename="kongress.ics"\r\n\r\n'
+                                b"BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nSUMMARY:Projektkongress\r\n"
+                                b"DTSTART:20261125T100000Z\r\nDTEND:20261125T160000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+                                b"--BOUND103--\r\n"
                             ),
                         },
                     },
@@ -708,6 +808,7 @@ class Mail(AtlasCase):
                             state["select_rw_count"] += 1
                         cnt = len(state["folders"][cur_folder]["messages"])
                         self.send_line(f"* {cnt} EXISTS")
+                        self.send_line("* OK [UIDVALIDITY 4242] UIDs valid")
                         rw = "READ-ONLY" if cmd == "EXAMINE" else "READ-WRITE"
                         self.send_line(f"{tag} OK [{rw}] {cmd} completed")
                     elif cmd == "CREATE":
@@ -720,22 +821,37 @@ class Mail(AtlasCase):
                         sub_rest = sub_parts[1] if len(sub_parts) == 2 else (sub_parts[1] + " " + sub_parts[2] if len(sub_parts) > 2 else "")
                         msgs = state["folders"][cur_folder]["messages"]
                         if sub_cmd == "SEARCH":
-                            uids = [
-                                u for u, m in sorted(msgs.items())
-                                if ("UNSEEN" not in sub_rest.upper() or r"\Seen" not in m["flags"])
-                            ]
+                            state["search_queries"].append(sub_rest)
+                            q_m = None
+                            if 'SUBJECT "' in sub_rest.upper():
+                                idx_s = sub_rest.upper().find('SUBJECT "') + 9
+                                q_m = sub_rest[idx_s:sub_rest.find('"', idx_s)].lower()
+                            uids = []
+                            for u, m in sorted(msgs.items(), key=lambda kv: int(kv[0])):
+                                if "UNSEEN" in sub_rest.upper() and r"\Seen" in m["flags"]:
+                                    continue
+                                if q_m and q_m not in m["raw"].decode("utf-8", errors="replace").lower():
+                                    continue
+                                uids.append(u)
                             self.send_line("* SEARCH " + " ".join(uids) if uids else "* SEARCH")
                             self.send_line(f"{tag} OK UID SEARCH completed")
                         elif sub_cmd == "FETCH":
                             uid, _spec = sub_rest.split(" ", 1)
+                            state["fetch_specs"].append((uid, _spec))
                             if uid not in msgs:
                                 self.send_line(f"{tag} OK UID FETCH empty")
                                 continue
                             m = msgs[uid]
                             f_str = " ".join(m["flags"])
                             l_str = " ".join(f'"{x}"' for x in m["labels"])
-                            payload = m["raw"]
-                            header_resp = f"* 1 FETCH (UID {uid} FLAGS ({f_str}) X-GM-LABELS ({l_str}) BODY[] {{{len(payload)}}}"
+                            if "HEADER.FIELDS" in _spec.upper():
+                                hdr_only = m["raw"].split(b"\r\n\r\n", 1)[0] + b"\r\n\r\n"
+                                payload = hdr_only
+                                body_tok = "BODY[HEADER.FIELDS (FROM TO CC SUBJECT DATE MESSAGE-ID CONTENT-TYPE)]"
+                            else:
+                                payload = m["raw"]
+                                body_tok = "BODY[]"
+                            header_resp = f"* 1 FETCH (UID {uid} FLAGS ({f_str}) X-GM-LABELS ({l_str}) {body_tok} {{{len(payload)}}}"
                             self.wfile.write((header_resp + "\r\n").encode("utf-8"))
                             self.wfile.write(payload)
                             self.wfile.write(b")\r\n")
@@ -798,19 +914,59 @@ class Mail(AtlasCase):
             with open(env_file, "a", encoding="utf-8") as fh:
                 fh.write('MAIL_WORK_SSL="false"\n')
 
-            # 2. Test Read-Only `accounts`, `folders` (UTF-7 decoding), `list`, `read`, `search`
+            # 2. Test Read-Only `accounts`, `folders` (UTF-7 decoding), header-only `list`, server-side `search`, and 0-token `ingest`
             acc_out = self.atlas("mail", "accounts").stdout
-            self.assertIn("Status: OK | INBOX: 2 | IMAP: MOVE,UIDPLUS,X-GM-EXT-1", acc_out)
+            self.assertIn("Status: OK | INBOX: 3 | IMAP: MOVE,UIDPLUS,X-GM-EXT-1", acc_out)
             fld_out = self.atlas("mail", "folders", "-a", "work").stdout
             self.assertIn("Entwürfe", fld_out)
             self.assertIn("Papierkorb", fld_out)
 
+            state["fetch_specs"].clear()
             lst_out = self.atlas("mail", "list", "-a", "work", "--unread").stdout
             self.assertIn("UID 101 [UNSEEN]", lst_out)
             self.assertIn("Steuerbescheid 2026", lst_out)
-            # Ensure read-only commands NEVER opened a folder in read-write mode (SELECT)
+            self.assertIn("UID 103 [UNSEEN]", lst_out)
+            # Verify `mail list` fetched ONLY headers (`HEADER.FIELDS`), never full `BODY.PEEK[]`
+            self.assertTrue(all("HEADER.FIELDS" in sp for _u, sp in state["fetch_specs"]), state["fetch_specs"])
+
+            # Verify server-side `UID SEARCH` + Gmail label fallback
+            state["search_queries"].clear()
+            srch_out = self.atlas("mail", "search", "Steuerbescheid", "-a", "work").stdout
+            self.assertIn("UID 101", srch_out)
+            self.assertTrue(any('SUBJECT "Steuerbescheid"' in q for q in state["search_queries"]), state["search_queries"])
+            srch_lbl = self.atlas("mail", "search", "Travel", "-a", "work").stdout
+            self.assertIn("UID 103", srch_lbl)
+
+            # Verify 0-token `mail ingest --execute`: extracts .pdf + .ics + provenance .md stub with UIDVALIDITY cursor
+            ing_out = self.atlas("mail", "ingest", "-a", "work", "--execute").stdout
+            self.assertIn("1 item(s) saved to brain/inbox/", ing_out)
+            inbox_files = sorted(os.listdir(os.path.join(self.brain, "inbox")))
+            self.assertTrue(any(f.endswith("rechnung-2026.pdf") for f in inbox_files), inbox_files)
+            self.assertTrue(any(f.endswith("kongress.ics") for f in inbox_files), inbox_files)
+            stub_files = [f for f in inbox_files if f.endswith(".md") and f != "README.md"]
+            self.assertEqual(len(stub_files), 1)
+            stub_txt = self.read(os.path.join(self.brain, "inbox", stub_files[0]))
+            self.assertIn("Projektkongress", stub_txt)
+            self.assertIn("uidvalidity=4242;uid=103", stub_txt)
+
+            st_json = json.loads(self.read(os.path.join(self.brain, "_atlas", "state.json")))
+            self.assertEqual(st_json["mail_ingest"]["work:INBOX"]["uidvalidity"], "4242")
+            self.assertEqual(st_json["mail_ingest"]["work:INBOX"]["last_uid"], 103)
+
+            # Second `mail ingest` run is 100% idempotent (0 duplicates)
+            ing_idem = self.atlas("mail", "ingest", "-a", "work", "--execute").stdout
+            self.assertIn("0 item(s) saved to brain/inbox/", ing_idem)
+
+            # Ensure ALL read/search/ingest commands NEVER opened a folder in read-write mode (SELECT)
             self.assertEqual(state["select_rw_count"], 0)
             self.assertGreater(state["examine_count"], 0)
+
+            # Verify ingested provenance stub passes `atlas.py check` with 0 missing_sources or errors
+            with open(os.path.join(self.brain, "tags.md"), "a", encoding="utf-8") as fh:
+                fh.write("| **mail** | Mail | email, postfach |\n")
+            chk_mail = self.atlas("check", check=False).stdout
+            self.assertNotIn("ERROR", chk_mail, chk_mail)
+            self.assertNotIn("missing source", chk_mail, chk_mail)
 
             # 3. Test Safety Gate: calling `move` without `--yes` in non-interactive mode MUST block with exit code 2
             res_blocked = self.atlas("mail", "move", "101", "-t", "Steuern & Belege", "-a", "work", "--create-folder", check=False)
@@ -842,6 +998,252 @@ class Mail(AtlasCase):
         finally:
             srv.shutdown()
             srv.server_close()
+
+
+TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+if TESTS_DIR not in sys.path:
+    sys.path.insert(0, TESTS_DIR)
+from test_graph_engine import GraphEngineUnit  # noqa: E402,F401
+from test_coach_mail import CoachMailUnit  # noqa: E402,F401
+from test_ui_cal import UiCalUnit  # noqa: E402,F401
+
+
+class WikiGraph(AtlasCase):
+    def test_sqlite_graph_context_retroactive_link_check_and_conflicts(self):
+        with open(os.path.join(self.brain, "tags.md"), "a", encoding="utf-8") as fh:
+            fh.write("| **finance** | Finance | geld, bank |\n")
+
+        self.page(
+            "areas/finanzen/README.md",
+            "---\nsummary: Finanzen Übersicht\ntags: [finance]\n---\n# Finanzen\n\n"
+            "- [Nordbank](nordbank.md)\n- [Steuern](steuern.md)\n",
+        )
+        with open(os.path.join(self.brain, "INDEX.md"), "a", encoding="utf-8") as fh:
+            fh.write("\n- [Finanzen](areas/finanzen/README.md)\n- [Max Mustermann](people/max-mustermann.md)\n")
+
+        doc_path = os.path.join(self.brain, "areas", "finanzen", "files", "vertrag.pdf")
+        os.makedirs(os.path.dirname(doc_path), exist_ok=True)
+        with open(doc_path, "w", encoding="utf-8") as fh:
+            fh.write("pdf-placeholder\n")
+
+        self.page(
+            "people/max-mustermann.md",
+            "---\nsummary: Ansprechpartner Nordbank\ntags: [person]\naliases: [Berater Mustermann]\n---\n"
+            "# Max Mustermann\n\n## Konditionen & Kontakt\n\nDirektdurchwahl vereinbart.\n",
+        )
+        self.page(
+            "areas/finanzen/nordbank.md",
+            "---\nsummary: Tagesgeld & Giro Nordbank\ntags: [finance, contract]\n"
+            "verified: 2020-01-15\nsources: [files/vertrag.pdf, files/missing-scan.pdf]\n---\n"
+            "# Konto Nordbank\n\n"
+            "Betreut durch [[Max Mustermann#Konditionen & Kontakt|Bankberater]].\n"
+            "Siehe auch [Falscher Anker](../finanzen/steuern.md#nicht-da).\n"
+            "Code-Beispiel: `[[Max Mustermann]]` bleibt unverändert.\n"
+            "Notiz zur Kundenrückgewinnung.\n",
+        )
+        self.page(
+            "areas/finanzen/steuern.md",
+            "---\nsummary: Steuererklärung\ntags: [finance]\n---\n"
+            "# Steuern\n\nBelege der Konto Nordbank und Rückfrage bei Berater Mustermann prüfen.\n"
+            "URL https://example.org/Max-Mustermann darf nicht verlinkt werden.\n",
+        )
+        self.page(
+            "journal/2026/2026-05-01.md",
+            "---\nsummary: Daily log 2026-05-01\ntags: [log]\n---\n# 2026-05-01 · Log\n\n"
+            "- 10:00 · — · Update in areas/finanzen/nordbank.md und `people/max-mustermann.md`\n",
+        )
+
+        # 1. `atlas.py index` builds `_atlas/cache/index.sqlite`
+        idx_out = self.atlas("index").stdout
+        self.assertIn("index.sqlite", idx_out)
+        self.assertTrue(os.path.isfile(os.path.join(self.brain, "_atlas", "cache", "index.sqlite")))
+
+        # 2. `atlas.py check` flags broken #anchor, missing local source, stale verified info, and ready wikilink
+        chk1 = self.atlas("check", check=False).stdout
+        self.assertIn("broken #section anchor", chk1)
+        self.assertIn("steuern.md#nicht-da", chk1)
+        self.assertIn("missing-scan.pdf", chk1)
+        self.assertIn("`verified:` older than 365 days", chk1)
+        self.assertIn("ready to compile", chk1)
+
+        # 3. `atlas.py check --fix` compiles `[[Max Mustermann#...]]` outside code blocks into relative Markdown link
+        fix_out = self.atlas("check", "--fix", check=False).stdout
+        self.assertIn("wikilinks in areas/finanzen/nordbank.md: 1", fix_out)
+        nb_txt = self.read(os.path.join(self.brain, "areas", "finanzen", "nordbank.md"))
+        self.assertIn("[Bankberater](../../people/max-mustermann.md#konditionen-kontakt)", nb_txt)
+        self.assertIn("`[[Max Mustermann]]`", nb_txt)
+
+        # 4. `atlas.py find` + 1-hop `↳ linked:` expansion + prompt hook 1-hop hints
+        f_out = self.atlas("find", "rückgewinnung").stdout
+        self.assertIn("areas/finanzen/nordbank.md", f_out)
+        self.assertIn("↳ linked: people/max-mustermann.md", f_out)
+        p_hint = self.hook("claude", "prompt", {"prompt": "was war bei der Kundenrückgewinnung?", "session_id": "wg1"})
+        self.assertIn("areas/finanzen/nordbank.md", p_hint)
+        self.assertIn("↳ linked:", p_hint)
+        self.assertIn("people/max-mustermann.md", p_hint)
+
+        # 5. `atlas.py graph` shows outlinks, backlinks, and unlinked mentions (before `link` runs)
+        g_json = json.loads(self.atlas("graph", "Max Mustermann", "--json").stdout)
+        self.assertEqual(g_json["page"]["rel"], "people/max-mustermann.md")
+        self.assertTrue(any(b["src"] == "areas/finanzen/nordbank.md" and b["anchor"] == "konditionen-kontakt"
+                            for b in g_json["backlinks"]))
+        self.assertTrue(any(u["src"] == "areas/finanzen/steuern.md" for u in g_json["unlinked_mentions"]))
+
+        # 6. `atlas.py link` (`--scan`, `--journals --related --execute`, `--inline --execute`, idempotency)
+        scan_out = self.atlas("link", "--scan").stdout
+        self.assertIn("areas/finanzen/steuern.md", scan_out)
+        self.assertIn("journal/2026/2026-05-01.md", scan_out)
+
+        self.atlas("link", "--journals", "--related", "--execute")
+        j_txt = self.read(os.path.join(self.brain, "journal", "2026", "2026-05-01.md"))
+        self.assertIn("[areas/finanzen/nordbank.md](../../areas/finanzen/nordbank.md)", j_txt)
+        self.assertIn("[people/max-mustermann.md](../../people/max-mustermann.md)", j_txt)
+        st_txt = self.read(os.path.join(self.brain, "areas", "finanzen", "steuern.md"))
+        self.assertIn("related: [areas/finanzen/nordbank.md, people/max-mustermann.md]", st_txt)
+
+        self.atlas("link", "--inline", "--execute")
+        st_txt2 = self.read(os.path.join(self.brain, "areas", "finanzen", "steuern.md"))
+        self.assertIn("[Konto Nordbank](nordbank.md)", st_txt2)
+        self.assertIn("[Berater Mustermann](../../people/max-mustermann.md)", st_txt2)
+        self.assertIn("https://example.org/Max-Mustermann", st_txt2)
+        # Idempotent second run changes 0 files
+        idem = self.atlas("link", "--journals", "--related", "--inline", "--execute").stdout
+        self.assertIn("0 file(s)", idem)
+
+        # 7. `atlas.py context` builds token-budgeted dossier with `#section` extraction
+        ctx = self.atlas("context", "areas/finanzen/nordbank.md", "--hops", "1", "--budget", "2500").stdout
+        self.assertIn("## Primary: areas/finanzen/nordbank.md", ctx)
+        self.assertIn("people/max-mustermann.md#konditionen-kontakt", ctx)
+        self.assertLessEqual(len(ctx), 2600)
+
+        # 8. `atlas.py conflicts` + briefing integration + `core-diff` ignores `_atlas/conflicts.json`
+        c_added = json.loads(
+            self.atlas("conflicts", "add", "--pages", "areas/finanzen/nordbank.md", "areas/finanzen/steuern.md",
+                       "--summary", "Zinssatz widersprüchlich", "--json").stdout
+        )
+        cid = c_added["id"]
+        self.assertIn(cid, self.atlas("conflicts", "list").stdout)
+        brief = self.hook("claude", "session", {"session_id": "wg-brief", "cwd": fwd(self.root)})
+        self.assertIn("Conflicts (1 open", brief)
+        self.assertIn("Zinssatz widersprüchlich", brief)
+        diff_out = self.atlas("core-diff", "--source", REPO).stdout
+        self.assertNotIn("conflicts.json", diff_out)
+        self.atlas("conflicts", "resolve", cid, "--resolution", "Geklärt laut Vertrag")
+        self.assertIn("(no open conflicts)", self.atlas("conflicts", "list").stdout)
+
+
+class HookUpgrades(AtlasCase):
+    def test_cal_html_conditional_stop_autolink_offline_pull_errlog_and_ag_subagents(self):
+        # 1. `hook_module(brain)` sets `CAL_HTML` inside the target brain, not the source repo
+        sys.path.insert(0, os.path.join(REPO, "core", "tools"))
+        import atlas as atlas_cli
+        hk = atlas_cli.hook_module(self.brain)
+        self.assertEqual(fwd(hk.CAL_HTML), fwd(os.path.join(self.brain, "_atlas", "cache", "calendar.html")))
+
+        # 2. Antigravity subagent plugin wiring (project & user scope) + clean unwire
+        self.wire_both()
+        ag_plug = os.path.join(self.root, ".agents", "plugins", "atlas-subagents")
+        self.assertTrue(os.path.isfile(os.path.join(ag_plug, "plugin.json")))
+        self.assertTrue(os.path.isfile(os.path.join(ag_plug, "agents", "atlas-search.md")))
+        self.assertTrue(os.path.isfile(os.path.join(ag_plug, "agents", "atlas-maintainer.md")))
+        ag_search = self.read(os.path.join(ag_plug, "agents", "atlas-search.md"))
+        self.assertIn("subagent: true", ag_search)
+        self.assertIn("mainAgent: false", ag_search)
+        self.assertIn("tools: [read_file, run_command, manage_task]", ag_search)
+        self.assertNotIn("model:", ag_search)
+
+        self.atlas("wire", "--agent", "antigravity", "--scope", "user", "--user-home", self.home, "--execute")
+        user_plugs = os.path.join(self.home, ".gemini", "config", "plugins")
+        self.assertTrue(any(d.startswith("atlas-subagents-") for d in os.listdir(user_plugs)))
+        self.atlas("unwire", "--agent", "antigravity", "--scope", "user", "--user-home", self.home, "--execute")
+        self.assertFalse(os.path.exists(user_plugs))
+
+        # 3. `daily_log()` auto-links existing brain paths + conditional `render_calendar_html()` in `stop()`
+        self.page("howto/git-regeln.md", "---\nsummary: Git Regeln\ntags: [howto]\n---\n# Git Regeln\n")
+        # First session renders `calendar.html`
+        self.hook("claude", "session", {"session_id": "h1", "cwd": fwd(self.root)})
+        cal_html = os.path.join(self.brain, "_atlas", "cache", "calendar.html")
+        self.assertTrue(os.path.isfile(cal_html))
+        mtime_before_stop = os.path.getmtime(cal_html)
+        time.sleep(0.05)
+
+        # Stop turn touching only `howto/` mention in daily log -> `calendar.html` mtime must NOT change
+        self.hook("claude", "stop", {
+            "session_id": "h1",
+            "stop_hook_active": True,
+            "last_assistant_message": "Fertig.\n\nAtlas: Regel ergänzt in howto/git-regeln.md und howto/nicht-da.md",
+        })
+        self.assertEqual(os.path.getmtime(cal_html), mtime_before_stop)
+        logs = [os.path.join(dp, f) for dp, _d, fs in os.walk(os.path.join(self.brain, "journal"))
+                for f in fs if f[:4].isdigit()]
+        log_txt = self.read(logs[0])
+        self.assertIn("[howto/git-regeln.md](../../howto/git-regeln.md)", log_txt)
+        self.assertIn("howto/nicht-da.md", log_txt)
+        self.assertNotIn("[howto/nicht-da.md]", log_txt)
+
+        # Modifying `calendar/README.md` -> next `stop()` MUST re-render `calendar.html`
+        time.sleep(0.05)
+        self.page("calendar/README.md", "---\nsummary: Kalender\ntags: [calendar]\n---\n# Calendar\n\n## Timeline\n- [ ] 2026-12-24 [event] Heiligabend\n")
+        self.hook("claude", "stop", {"session_id": "h1", "stop_hook_active": True, "last_assistant_message": "ok"})
+        self.assertGreater(os.path.getmtime(cal_html), mtime_before_stop)
+
+        # 4. Offline remote in `pull()` fails silently (no false `Sync:` conflict warning)
+        self.git(self.brain, "remote", "add", "origin", "http://127.0.0.1:1/offline-brain.git")
+        sess_offline = self.hook("claude", "session", {"session_id": "h2", "cwd": fwd(self.root)})
+        self.assertIn("Atlas · ok", sess_offline)
+        self.assertNotIn("Sync:", sess_offline)
+
+        # 5. Bounded `_atlas/cache/hook_errors.log` (<= 50 KB) + 1-line warning in next `session` hook
+        for i in range(120):
+            hk._log_hook_error(f"test.loop.{i}", RuntimeError("x" * 600))
+        self.assertTrue(os.path.isfile(hk.ERR_LOG))
+        self.assertLessEqual(os.path.getsize(hk.ERR_LOG), 50_000)
+        sess_warn = self.hook("claude", "session", {"session_id": "h3", "cwd": fwd(self.root)})
+        self.assertIn("Hook warning", sess_warn)
+        # Second session does not repeat the same error warning
+        sess_warn2 = self.hook("claude", "session", {"session_id": "h4", "cwd": fwd(self.root)})
+        self.assertNotIn("Hook warning", sess_warn2)
+
+
+class UiReleaseV11(AtlasCase):
+    def test_v110_calendar_graph_view_and_core_apply_template_sync(self):
+        # 1. Installed `_atlas/templates/calendar.html` is present after `init`
+        inst_tpl = os.path.join(self.brain, "_atlas", "templates", "calendar.html")
+        self.assertTrue(os.path.isfile(inst_tpl))
+        self.assertIn("🕸️ Brain Graph", self.read(inst_tpl))
+
+        # 2. `atlas.py calendar --view graph` prints `?view=graph` URL and compiles graph payload
+        self.page("people/erika-muster.md", "---\nsummary: Erika Muster\ntags: [person]\nverified: 2024-02-01\n---\n# Erika Muster\n")
+        self.atlas("index")
+        out_graph = self.atlas("calendar", "--view", "graph").stdout
+        self.assertIn("calendar.html?view=graph", out_graph)
+        cal_html = os.path.join(self.brain, "_atlas", "cache", "calendar.html")
+        html_txt = self.read(cal_html)
+        self.assertIn("erika-muster.md", html_txt)
+        self.assertIn("csrf_token", html_txt)
+
+        # 3. `core-apply` deterministically updates `templates/calendar.html` (`HARD_CORE_PREFIXES`)
+        #    while preserving user customizations in `templates/person.md` (`keep-local` 3-way merge)!
+        person_tpl = os.path.join(self.brain, "_atlas", "templates", "person.md")
+        with open(person_tpl, "a", encoding="utf-8", newline="\n") as fh:
+            fh.write("\n## Custom Local Section\n")
+        with open(inst_tpl, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("<!DOCTYPE html><html><body>outdated-v1.0-template</body></html>\n")
+        with open(os.path.join(self.brain, "_atlas", "VERSION"), "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("1.0.0\n")
+        self.git(self.brain, "add", "-A")
+        self.git(self.brain, "commit", "-q", "-m", "local template edits")
+
+        diff_out = self.atlas("core-diff", "--source", REPO).stdout
+        self.assertIn("update (upstream changed, yours untouched): _atlas/templates/calendar.html", diff_out)
+        self.assertIn("kept: changed only in this Atlas: _atlas/templates/person.md", diff_out)
+        self.assertIn("1.1.0", diff_out)
+
+        self.atlas("core-apply", "--source", REPO, "--execute")
+        self.assertIn("🕸️ Brain Graph", self.read(inst_tpl))
+        self.assertIn("## Custom Local Section", self.read(person_tpl))
+        self.assertEqual(self.read(os.path.join(self.brain, "_atlas", "VERSION")).strip(), "1.1.0")
+        self.assertIn("ok", self.atlas("check").stdout.lower())
 
 
 if __name__ == "__main__":

@@ -38,7 +38,7 @@ agent memories, scattered documents and code repositories included), and ends wi
 | **One entry point** | Open `C:\Atlas` (or `~/Atlas`) as your project in Claude Code or workspace in Antigravity. No switching folders. |
 | **Routing at any scale** | Project names, aliases, folders and paths are matched against a registry; tested with 300 projects and 20,000 pages. The always-loaded part does not grow with them. |
 | **Normal coding inside a project** | After routing, the agent reads the project page and the repository's own `CLAUDE.md`/`AGENTS.md`; project rules load only when that project is touched. |
-| **Findable by design** | Every page has a one-line `summary:` and `tags:` from a fixed vocabulary with synonyms. Search reads headers first (`atlas.py find`, grep) and opens pages last. |
+| **Findable & connected** | Every page has `summary:`, `tags:`, optional `related:` links, and `verified:` provenance. Search combines dual-tokenizer SQLite FTS5 (`unicode61` + `trigram` compound matching) with 1-hop knowledge-graph expansion (`atlas.py find`, `graph`, `context`, `link`). |
 | **Token budget** | Always loaded: a router of about 1,000 tokens and short skill descriptions. Hooks print nothing when nothing matches. `/atlas-check` measures it. |
 | **Learns like you would** | Clear rule for what is worth keeping, learning signals ("remember", "from now on", corrections) that are never ignored, `/atlas-learn` to review a chat. Better than Antigravity's `/learn`: facts too, one brain for both agents, and whatever `/learn` writes elsewhere is adopted. |
 | **Daily log** | Each `Atlas:` line lands in `journal/<year>/<date>.md`: "what did we do last Tuesday" has an answer, at no token cost. |
@@ -94,19 +94,19 @@ to file what was learned (always after a learning signal, otherwise throttled).
 | In chat | What it does |
 |---|---|
 | `/atlas-brief` | what is due, in 3–6 lines |
-| `/atlas-calendar` | open and manage the native Atlas-First visual calendar and to-do hub |
-| `/atlas-coach` | (coach module) Cycling, Running & Strength coach: macro periodization, 14d workouts, `.zwo` export, Strava sync |
-| `/atlas-mail` | multi-account IMAP mail client & organizer: read-only inbox/search/audit + safety-gated `move` (`target_folder`), `trash`, `flags` & `labels` |
+| `/atlas-calendar` | open and manage the native Atlas-First visual calendar, 1-click to-do hub & interactive `🕸️ Brain Graph` (`--view graph`) |
+| `/atlas-coach` | adaptive Simple-to-Pro Cycling, Running & Strength coach: macro periodization, 14d workouts, `.zwo` export, `CP/W'`, `W'bal`, `CTL/ATL/TSB`, Strava sync |
+| `/atlas-mail` | multi-account IMAP mail client, header-fast search/audit, `mail ingest` bridge, and safety-gated `move`, `trash`, `flags` & `labels` |
 | `/atlas-sort` | file the inbox (and the cloud inbox), or bring a messy folder into Atlas |
 | `/atlas-learn` | review this chat: file facts, propose rules and skills |
-| `/atlas-interview` | structured fact-check & gap radar (finances, contracts, insurances, dates, projects) |
+| `/atlas-interview` | structured fact-check, staleness (`verified:` / `valid_until:`), conflict & gap radar |
 | `/atlas-deep` | Pro-Ultra friend-and-psychologist mode for deep understanding |
 | `/atlas-maintain` | the weekly self-maintenance, on demand |
 | `/atlas-check` | health and token budget |
 | `/atlas-update` | agent changes, core updates, self-healing |
 | `/atlas-adopt-repo` | (developer module) bring a repository under Atlas |
 
-The engine: `python -I brain/_atlas/tools/atlas.py <init|wire|unwire|routes|projects|index|find|probe|check|deadlines|calendar|coach|mail|inventory|move|verify|undo|mark|adopt|code-sync|core-diff|core-apply|state>`.
+The engine: `python -I brain/_atlas/tools/atlas.py <init|wire|unwire|routes|projects|index|find|graph|context|link|conflicts|probe|check|deadlines|calendar|coach|mail|inventory|move|verify|undo|mark|adopt|code-sync|core-diff|core-apply|state>`.
 
 ## Updates and development
 
@@ -131,5 +131,5 @@ test suite (`python -I tests/run.py`) and a separate test Atlas (`python -I dev/
 
 ## Status
 
-Version 0.4.0. Built from a setup in daily professional use, generalised for every part of life. The Antigravity wiring
-follows the official docs as of 2026-11-07; open checks are listed in [`core/adapters.md`](core/adapters.md).
+Version 1.1.0. Built from a setup in daily professional use, generalised for every part of life. The Antigravity and
+Claude Code wiring follows the official docs as of 2026-11-13; open checks are listed in [`core/adapters.md`](core/adapters.md).

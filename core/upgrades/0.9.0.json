@@ -1,0 +1,5 @@
+{
+  "notes": [
+    "Build the SQLite search & knowledge-graph index (`python -I <ROOT>/brain/_atlas/tools/atlas.py index`), then scan the existing brain for retroactive wiki-linking (`atlas.py link --scan`). Apply safe zero-prose-risk frontmatter and journal links via `atlas.py link --journals --related --execute` (and offer `--inline` if the user wants prose entity links)."
+  ]
+}

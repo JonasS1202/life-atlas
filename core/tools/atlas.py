@@ -13,8 +13,12 @@ Commands
   wire        connect an agent (claude | antigravity), scope project (default: ROOT) or user (~); `unwire` reverses
   routes      (re)write the per-project path rules for projects inside ROOT (part of `wire`)
   projects    show the project registry the router uses
-  index       build the search cache in full (after a large import; hooks otherwise build it a little per call)
-  find        ranked search: tags, aliases, title, summary, then full text; one line per page
+  index       build the SQLite search & graph cache in full (`_atlas/cache/index.sqlite`)
+  find        ranked search: tags, aliases, title, summary, FTS5 + trigram full text, plus 1-hop linked leads
+  graph       inspect a page's outlinks, backlinks (with context & #anchor), and unlinked mentions
+  context     assemble a token-budgeted Markdown context dossier (target page + top specificity-ranked neighbors)
+  link        retroactive wiki-linking (`--scan`, `--journals`, `--related`, `--inline`, `--execute`)
+  conflicts   manage unresolved fact contradictions in `_atlas/conflicts.json` (`list`, `add`, `resolve`)
   mark        record `maintenance` or `update-check` as a commit (seen by every device)
   adopt       move rules/skills/text written outside Atlas (e.g. Antigravity /learn) into the brain
   code-sync   clone project repositories missing on this device (`path:` + `remote:` on the project page)
@@ -46,8 +50,14 @@ import sys
 import tempfile
 import time
 
+sys.dont_write_bytecode = True
+
 DEFAULT_UPSTREAM = "https://github.com/JonasS1202/life-atlas.git"
 TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
+if TOOLS_DIR not in sys.path:
+    sys.path.insert(0, TOOLS_DIR)
+from atlas_lib import coach_engine, graph_engine
+
 INSTALLED_BRAIN = os.path.normpath(os.path.join(TOOLS_DIR, "..", ".."))
 HOOK_FILE = os.path.normpath(os.path.join(TOOLS_DIR, "..", "hooks", "atlas_hook.py"))
 CORE_MARK = ("<!-- atlas:start -->", "<!-- atlas:end -->")
@@ -234,7 +244,10 @@ def hook_module(brain):
     spec.loader.exec_module(mod)
     mod.BRAIN = brain
     mod.STATE = state_path(brain)
-    mod.CACHE = os.path.join(brain, "_atlas", "cache", "index.json")
+    mod.CACHE = os.path.join(brain, "_atlas", "cache", "index.sqlite")
+    mod.CAL_HTML = os.path.join(brain, "_atlas", "cache", "calendar.html")
+    mod.ERR_LOG = os.path.join(brain, "_atlas", "cache", "hook_errors.log")
+    mod.CONFLICTS_FILE = os.path.join(brain, "_atlas", "conflicts.json")
     return mod
 
 
@@ -320,6 +333,8 @@ def _copy_plan(base, target):
     for dp, dns, fns in os.walk(base):
         dns[:] = [d for d in dns if d != "__pycache__"]
         for fn in fns:
+            if fn.endswith((".pyc", ".pyo")):
+                continue
             s = os.path.join(dp, fn)
             out.append((s, os.path.join(target, os.path.relpath(s, base))))
     return out
@@ -355,12 +370,16 @@ def _targets(agent, scope, root, user_home):
                 "hooks": os.path.join(base, "settings.json"), "skills": os.path.join(base, "skills"),
                 "rules": os.path.join(base, "rules") if scope == "project" else None,
                 "agents": os.path.join(base, "agents")}
+    slug = re.sub(r"[^a-z0-9-]+", "-", os.path.basename(os.path.abspath(root)).lower()).strip("-") or "atlas"
+    pname = f"atlas-subagents-{slug}"
     if scope == "project":
         return {"router": os.path.join(root, "GEMINI.md"), "hooks": os.path.join(root, ".agents", "hooks.json"),
-                "skills": os.path.join(root, ".agents", "skills"), "rules": os.path.join(root, ".agents", "rules")}
+                "skills": os.path.join(root, ".agents", "skills"), "rules": os.path.join(root, ".agents", "rules"),
+                "ag_plugin": os.path.join(root, ".agents", "plugins", "atlas-subagents"), "ag_plugin_name": pname}
     g = os.path.join(user_home, ".gemini")
     return {"router": os.path.join(g, "AGENTS.md"), "hooks": os.path.join(g, "config", "hooks.json"),
-            "skills": os.path.join(g, "config", "skills"), "rules": None}
+            "skills": os.path.join(g, "config", "skills"), "rules": None,
+            "ag_plugin": os.path.join(g, "config", "plugins", pname), "ag_plugin_name": pname}
 
 
 def cmd_wire(args, remove=False):
@@ -378,6 +397,8 @@ def cmd_wire(args, remove=False):
         changes += _rule_changes(brain, root, args.agent, t["rules"], remove)
     if t.get("agents"):
         changes += _agent_changes(brain, t["agents"], remove)
+    if t.get("ag_plugin"):
+        changes += _ag_subagent_changes(brain, t["ag_plugin"], t["ag_plugin_name"], remove)
     say(f"{'unwire' if remove else 'wire'} {key}: {len(changes)} change(s)")
     for path, _new, desc in changes:
         say(f"  {fwd(path)}: {desc}")
@@ -413,10 +434,16 @@ def _apply(brain, changes, tag):
         backup(brain, path, tag)
     for path, new, _desc in changes:
         if new is None:
+            parent = os.path.dirname(path)
             if os.path.isdir(path):
                 shutil.rmtree(path)
             elif os.path.exists(path):
                 os.remove(path)
+            if os.path.basename(parent) == "plugins" and os.path.isdir(parent) and not os.listdir(parent):
+                try:
+                    os.rmdir(parent)
+                except OSError:
+                    pass
         else:
             write(path, new)
 
@@ -553,7 +580,7 @@ def _skill_changes(brain, target_dir, remove):
 
 
 def _agent_changes(brain, target_dir, remove):
-    """Claude Code subagents shipped with the core (atlas-search, atlas-maintainer). Antigravity has none."""
+    """Claude Code subagents shipped with the core (atlas-search, atlas-maintainer)."""
     out, keep = [], set()
     src_dir = os.path.join(brain, "_atlas", "agents")
     if not remove and os.path.isdir(src_dir):
@@ -568,6 +595,59 @@ def _agent_changes(brain, target_dir, remove):
         for fn in os.listdir(target_dir):
             if fn.startswith(RULE_PREFIX) and fn.endswith(".md") and fn not in keep:
                 out.append((os.path.join(target_dir, fn), None, f"remove subagent {fn}"))
+    return out
+
+
+def _ag_subagent_changes(brain, plugin_dir, plugin_name, remove):
+    """Antigravity local plugin bundle (`plugin.json` + `agents/*.md`) exposing `atlas-search` & `atlas-maintainer`."""
+    if remove:
+        if os.path.exists(plugin_dir):
+            return [(plugin_dir, None, f"remove Antigravity plugin {os.path.basename(plugin_dir)}")]
+        return []
+    src_dir = os.path.join(brain, "_atlas", "agents")
+    if not os.path.isdir(src_dir):
+        return []
+    out, keep = [], set()
+    manifest_path = os.path.join(plugin_dir, "plugin.json")
+    manifest_text = json.dumps(
+        {"name": plugin_name, "description": "Atlas search and maintenance subagents."},
+        indent=2,
+        ensure_ascii=False,
+    ) + "\n"
+    if not os.path.exists(manifest_path) or read(manifest_path) != manifest_text:
+        out.append((manifest_path, manifest_text, "Antigravity subagent plugin manifest"))
+    agents_dir = os.path.join(plugin_dir, "agents")
+    for fn in sorted(os.listdir(src_dir)):
+        if not (fn.startswith(RULE_PREFIX) and fn.endswith(".md")):
+            continue
+        keep.add(fn)
+        rendered = render(read(os.path.join(src_dir, fn)), {"BRAIN": fwd(brain)})
+        fm = graph_engine.parse_frontmatter(rendered)
+        body = rendered[graph_engine.frontmatter_end_offset(rendered):].lstrip("\n")
+        name = graph_engine.as_str(fm.get("name")) or os.path.splitext(fn)[0]
+        desc = graph_engine.as_str(fm.get("description")) or f"Atlas subagent {name}"
+        raw_tools = str(fm.get("tools") or "")
+        if "Edit" in raw_tools or "Write" in raw_tools or "maintainer" in name:
+            ag_tools = "[read_file, edit_file, write_file, run_command, manage_task]"
+        else:
+            ag_tools = "[read_file, run_command, manage_task]"
+        ag_md = (
+            "---\n"
+            f"name: {name}\n"
+            f"description: {json.dumps(desc, ensure_ascii=False)}\n"
+            "subagent: true\n"
+            "mainAgent: false\n"
+            f"tools: {ag_tools}\n"
+            "---\n\n"
+            + body.rstrip("\n") + "\n"
+        )
+        dst = os.path.join(agents_dir, fn)
+        if not os.path.exists(dst) or read(dst) != ag_md:
+            out.append((dst, ag_md, f"Antigravity subagent {fn}"))
+    if os.path.isdir(agents_dir):
+        for fn in os.listdir(agents_dir):
+            if fn.startswith(RULE_PREFIX) and fn.endswith(".md") and fn not in keep:
+                out.append((os.path.join(agents_dir, fn), None, f"remove Antigravity subagent {fn}"))
     return out
 
 
@@ -644,55 +724,157 @@ def cmd_projects(args):
 
 
 def cmd_find(args):
-    """Ranked search over the cached frontmatter first (tags, aliases, title, summary), then the full text."""
+    """Ranked search over SQLite FTS5 + trigram cache (`tags`, `aliases`, `title`, `summary`, `norm_body`) + 1-hop leads."""
     _root, brain = paths(args)
     hk = hook_module(brain)
     idx = hk.load_index()
     vocab = hk.tag_vocab()
-    words = [w.lower() for w in args.terms]
-    canon = {}
-    for tag, syns in vocab.items():
-        for w in [tag] + syns:
-            canon[w] = tag
-    scores, why = {}, {}
-    for rel, e in idx.items():
-        if rel.startswith("_") or rel in ("tags.md", "settings.md"):
-            continue
-        hay_title, hay_sum = e.get("title", "").lower(), e.get("summary", "").lower()
-        aliases = [a.lower() for a in e.get("aliases", [])]
-        page_tags = {canon.get(t, t) for t in e.get("tags", [])}
-        for w in words:
-            pts = 0
-            if canon.get(w, w) in page_tags:
-                pts += 5
-            if any(w in a for a in aliases):
-                pts += 4
-            if w in hay_title:
-                pts += 3
-            if w in hay_sum:
-                pts += 2
-            if w in rel.lower():
-                pts += 1
-            if pts:
-                scores[rel] = scores.get(rel, 0) + pts
-                why.setdefault(rel, set()).add(w)
-    if not args.no_text:
-        for w in words:
-            try:
-                for rel, c in hk._grep_counts(w, False).items():
-                    if rel in idx and rel not in ("tags.md", "settings.md"):
-                        scores[rel] = scores.get(rel, 0) + min(c, 5) * 0.3
-                        why.setdefault(rel, set()).add(w)
-            except Exception:
-                break
-    # pages that match every word first
-    ranked = sorted(scores, key=lambda r: (-len(why[r]), -scores[r], r))[: args.limit]
+    ranked, neighbors = graph_engine.search_pages(
+        brain, args.terms, idx=idx, tag_vocab_map=vocab, limit=args.limit,
+        text_search=not args.no_text, db_path=hk.CACHE,
+    )
     for rel in ranked:
         e = idx.get(rel, {})
         tags = ",".join(e.get("tags", []))
         say(f"{rel} — {e.get('summary') or e.get('title') or ''}" + (f" [{tags}]" if tags else ""))
+    for n_rel, _sc, via_rel, _kind in neighbors:
+        ne = idx.get(n_rel, {})
+        say(f"  ↳ linked: {n_rel} — {ne.get('summary') or ne.get('title') or ''} (via {via_rel})")
     if not ranked:
         say("(nothing found)")
+
+
+def cmd_graph(args):
+    """Show a page's outlinks, backlinks (with context & #anchor), and unlinked mentions."""
+    _root, brain = paths(args)
+    hk = hook_module(brain)
+    idx = hk.load_index()
+    info = graph_engine.inspect_page_graph(brain, args.page, idx=idx, db_path=hk.CACHE)
+    if args.json:
+        say(json.dumps(info, indent=2, ensure_ascii=False))
+        if "error" in info:
+            sys.exit(1)
+        return
+    if "error" in info:
+        say(f"ERROR {info['error']}" + (f" (candidates: {', '.join(info['candidates'])})" if info.get("candidates") else ""))
+        sys.exit(1)
+    p = info["page"]
+    say(f"Page: {p['rel']}" + (f" — {p['title']}" if p.get("title") else ""))
+    if p.get("summary"):
+        say(f"  summary: {p['summary']}")
+    meta = []
+    if p.get("tags"):
+        meta.append(f"tags=[{', '.join(p['tags'])}]")
+    if p.get("verified"):
+        meta.append(f"verified={p['verified']}")
+    if p.get("valid_until"):
+        meta.append(f"valid_until={p['valid_until']}")
+    if p.get("sources"):
+        meta.append(f"sources={p['sources']}")
+    if meta:
+        say("  " + "  ".join(meta))
+    say(f"Outlinks ({len(info['outlinks'])}):")
+    for o in info["outlinks"]:
+        anc = f"#{o['anchor']}" if o.get("anchor") else ""
+        say(f"  - [{o['kind']}] {o['dst']}{anc}" + (f" — {o['summary']}" if o.get("summary") else ""))
+    say(f"Backlinks ({len(info['backlinks'])}):")
+    for b in info["backlinks"]:
+        anc = f"#{b['anchor']}" if b.get("anchor") else ""
+        say(f"  - [{b['kind']}] {b['src']}{anc}: {b['context']}")
+    say(f"Unlinked Mentions ({len(info['unlinked_mentions'])}):")
+    for u in info["unlinked_mentions"]:
+        say(f"  - {u['src']}:{u['line']} (\"{u['matched']}\"): {u['context']}")
+
+
+def cmd_context(args):
+    """Assemble a token-budgeted Markdown context dossier (target page + top specificity-ranked neighbors)."""
+    _root, brain = paths(args)
+    hk = hook_module(brain)
+    idx = hk.load_index()
+    dossier = graph_engine.build_context_dossier(
+        brain, args.target, hops=args.hops, budget=args.budget,
+        tag_vocab_map=hk.tag_vocab(), idx=idx, db_path=hk.CACHE,
+    )
+    say(dossier.rstrip("\n"))
+
+
+def cmd_link(args):
+    """Retroactive wiki-linking for existing brains (`--scan`, `--journals`, `--related`, `--inline`, `--execute`)."""
+    _root, brain = paths(args)
+    hk = hook_module(brain)
+    do_any = bool(args.journals or args.related or args.inline)
+    if args.scan and not do_any or not do_any:
+        scan = graph_engine.scan_retroactive_links(brain, idx=hk.load_index(), db_path=hk.CACHE)
+        if args.json:
+            say(json.dumps(scan, indent=2, ensure_ascii=False))
+            return
+        j_count = sum(len(v) for v in scan["journal_paths"].values())
+        rel_cands = sum(1 for v in scan["mentions"].values() for h in v if not h["has_related"] and not h["has_body"])
+        inl_cands = sum(1 for v in scan["mentions"].values() for h in v if not h["has_body"])
+        say(f"link scan: {scan['lexicon_size']} canonical entities ({scan['ambiguous_skipped']} ambiguous skipped)")
+        say(f"  journal paths ready to link: {j_count} across {len(scan['journal_paths'])} file(s)")
+        for j_rel, hits in list(scan["journal_paths"].items())[:8]:
+            say(f"    - {j_rel}: {', '.join(h['dst'] for h in hits[:4])}")
+        say(f"  unlinked entity mentions: {inl_cands} inline / {rel_cands} frontmatter `related:` across {len(scan['mentions'])} page(s)")
+        for s_rel, hits in list(scan["mentions"].items())[:12]:
+            unlinked = [h for h in hits if not h["has_body"] and not h["has_related"]]
+            if unlinked:
+                say(f"    - {s_rel}: " + ", ".join(f"'{h['matched']}' -> {h['dst']}" for h in unlinked[:4]))
+        say("Next: run `atlas.py link --journals --related --execute` (safe zero-prose-risk) or add `--inline`.")
+        return
+
+    res = graph_engine.apply_retroactive_links(
+        brain, do_journals=args.journals, do_related=args.related, do_inline=args.inline,
+        execute=args.execute, db_path=hk.CACHE,
+    )
+    if args.json:
+        say(json.dumps(res, indent=2, ensure_ascii=False))
+        return
+    mode_lbl = "applied" if args.execute else "dry-run"
+    say(f"link ({mode_lbl}): {res['files_changed']} file(s), {res['links_added']} link(s)")
+    for act in res["actions"][:30]:
+        say(f"  {act}")
+    if not args.execute and res["files_changed"]:
+        say("Dry run. Add --execute to write changes.")
+
+
+def cmd_conflicts(args):
+    """Manage structured fact contradictions in `brain/_atlas/conflicts.json` (`list`, `add`, `resolve`)."""
+    _root, brain = paths(args)
+    hk = hook_module(brain)
+    cpath = hk.CONFLICTS_FILE
+    if args.action == "add":
+        if not args.summary:
+            sys.exit("conflicts add requires --summary \"...\" (and optional --pages p1 p2)")
+        entry = graph_engine.add_conflict(brain, args.pages or [], args.summary, conflicts_path=cpath)
+        if args.json:
+            say(json.dumps(entry, indent=2, ensure_ascii=False))
+        else:
+            pgs = ", ".join(entry.get("pages", []))
+            say(f"[{entry['id']}] {entry['status']}: {entry['summary']}" + (f" ({pgs})" if pgs else ""))
+        return
+    if args.action == "resolve":
+        cid = args.target_id or args.id
+        if not cid:
+            sys.exit("conflicts resolve requires a conflict ID (positional or --id)")
+        resolved = graph_engine.resolve_conflict(brain, cid, resolution=args.resolution or "", conflicts_path=cpath)
+        if not resolved:
+            sys.exit(f"Conflict not found: {cid}")
+        if args.json:
+            say(json.dumps(resolved, indent=2, ensure_ascii=False))
+        else:
+            say(f"Resolved [{resolved['id']}]: {resolved['summary']}")
+        return
+    items = graph_engine.load_conflicts(brain, cpath) if args.all else graph_engine.open_conflicts(brain, cpath)
+    if args.json:
+        say(json.dumps(items, indent=2, ensure_ascii=False))
+        return
+    if not items:
+        say("(no open conflicts)" if not args.all else "(no conflicts recorded)")
+        return
+    for it in items:
+        pgs = ", ".join(it.get("pages", []))
+        say(f"[{it.get('id')}] {it.get('status', 'open')}: {it.get('summary', '')}" + (f" ({pgs})" if pgs else ""))
 
 
 # ================================================================= probe
@@ -816,36 +998,48 @@ def cmd_check(args):
             warns.append(f"brain/{name} exists: agents load it natively, the router would load twice")
     pages = _pages(brain)
     rels = {fwd(os.path.relpath(p, brain)): p for p in pages}
-    by_base = {}
-    for r in rels:
-        by_base.setdefault(os.path.basename(r).lower(), []).append(r)
-    graph, broken, fixes = {}, [], {}
-    for rel, p in rels.items():
-        text = read(p)
-        targets = set()
-        for m in LINK_RX.finditer(text):
-            t = m.group(1).split("#")[0]
-            if not t or re.match(r"^[a-z]+:", t) or t.startswith(("/", "~")) or "<" in t:
-                continue
-            tgt = fwd(os.path.normpath(os.path.join(os.path.dirname(rel), t)))
-            full = os.path.join(brain, tgt)
-            if not os.path.exists(full):
-                if not rel.startswith("_atlas/"):
-                    broken.append(f"{rel} -> {t}")
-                    cand = by_base.get(os.path.basename(t).lower(), [])
-                    if len(cand) == 1:  # moved page with a unique name: the fix is unambiguous
-                        new_t = fwd(os.path.relpath(os.path.join(brain, cand[0]), os.path.join(brain, os.path.dirname(rel))))
-                        fixes.setdefault(rel, []).append((m.group(1).split("#")[0], new_t))
-            elif tgt.endswith(".md"):
-                targets.add(tgt)
-            elif os.path.isdir(full) and os.path.isfile(os.path.join(full, "README.md")):
-                targets.add(fwd(os.path.join(tgt, "README.md")))
-        for m in TICK_RX.finditer(text):
-            if os.path.exists(os.path.join(brain, m.group(1))):
-                targets.add(m.group(1))
-        graph[rel] = targets
+    hk = hook_module(brain)
+    idx = hk.load_index()
+    gcheck = graph_engine.validate_and_analyze_brain(brain, root, rels, idx=idx, db_path=hk.CACHE)
+    graph = gcheck["graph"]
+    broken = gcheck["broken"]
+    fixes = gcheck["fixes"]
     if broken:
         warns.append(f"{len(broken)} broken link(s):\n    " + "\n    ".join(broken[:30]))
+    if gcheck["broken_anchors"]:
+        warns.append(f"{len(gcheck['broken_anchors'])} broken #section anchor(s):\n    "
+                     + "\n    ".join(gcheck["broken_anchors"][:20]))
+    if gcheck["ambiguous_wikilinks"]:
+        warns.append(f"{len(gcheck['ambiguous_wikilinks'])} ambiguous [[wikilink]](s):\n    "
+                     + "\n    ".join(gcheck["ambiguous_wikilinks"][:20]))
+    if gcheck["missing_sources"]:
+        warns.append(f"{len(gcheck['missing_sources'])} missing local file(s) in `sources:`:\n    "
+                     + "\n    ".join(gcheck["missing_sources"][:20]))
+    if gcheck["wikilink_count"]:
+        infos.append(f"{gcheck['wikilink_count']} [[wikilink]](s) in {len(gcheck['wikilink_files'])} page(s) ready "
+                     "to compile (check --fix)")
+    if gcheck["isolated"]:
+        infos.append(f"{len(gcheck['isolated'])} horizontally isolated leaf page(s) (0 body/related wiki edges; "
+                     "run `atlas.py link --scan`)")
+    if gcheck["stale_verified"]:
+        infos.append(f"{len(gcheck['stale_verified'])} page(s) with `verified:` older than 365 days: "
+                     + ", ".join(gcheck["stale_verified"][:8]))
+    today_chk = dt.date.today()
+    expiring_valid = []
+    for r_chk, e_chk in sorted(idx.items()):
+        vu = str(e_chk.get("valid_until") or "").strip()
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", vu):
+            try:
+                rem_d = (dt.date.fromisoformat(vu) - today_chk).days
+                if rem_d < 0:
+                    expiring_valid.append(f"{r_chk} (expired {vu})")
+                elif rem_d <= 60:
+                    expiring_valid.append(f"{r_chk} (valid_until {vu}, in {rem_d}d)")
+            except ValueError:
+                pass
+    if expiring_valid:
+        infos.append(f"{len(expiring_valid)} page(s) with expired or upcoming `valid_until:`: "
+                     + ", ".join(expiring_valid[:8]))
     seen, todo = set(), [r for r in ("ROUTER.md", "INDEX.md") if r in graph]
     while todo:
         r = todo.pop()
@@ -856,7 +1050,7 @@ def cmd_check(args):
         if r.endswith("README.md"):  # a folder index covers its folder's pages
             folder = os.path.dirname(r)
             todo += [x for x in graph if os.path.dirname(x) == folder and x not in seen]
-    reg = registry(brain)
+    reg = hk.projects(idx)
     reg_pages = {p["page"] for p in reg}
     orphans = [r for r in rels if r not in seen and r not in reg_pages and not r.startswith(HUB_SKIP) and "/" in r]
     if orphans:
@@ -869,8 +1063,6 @@ def cmd_check(args):
     if dups:
         warns.append("identical pages: " + "; ".join(" = ".join(v) for v in dups[:10]))
     # Tags and summaries (D22): every content page carries `summary:` and `tags:` from brain/tags.md.
-    hk = hook_module(brain)
-    idx = hk.load_index()
     vocab = hk.tag_vocab()
     canon = {s: t for t, syns in vocab.items() for s in syns}
     content = [r for r in idx if r.startswith(("areas/", "people/", "projects/", "howto/", "self/", "coach/"))
@@ -980,13 +1172,17 @@ def cmd_check(args):
             say(f"{title:5} {it}")
     say(f"check: {len(errors)} error(s), {len(warns)} warning(s), {len(pages)} pages")
     if args.fix:
-        _check_fix(args, root, brain, fixes, synonyms)
+        _check_fix(args, root, brain, fixes, synonyms, gcheck["wikilink_files"])
     sys.exit(1 if errors else 0)
 
 
-def _check_fix(args, root, brain, link_fixes, synonyms):
-    """Mechanical repairs only (0 tokens): links to moved pages with a unique name, tag synonyms -> tag, cache, routes."""
+def _check_fix(args, root, brain, link_fixes, synonyms, wikilink_files=None):
+    """Mechanical repairs only (0 tokens): [[wikilink]] compilation, moved-page links, tag synonyms -> tag, cache, routes."""
     done = []
+    for rel, (compiled_text, n_comp) in (wikilink_files or {}).items():
+        p = os.path.join(brain, rel)
+        write(p, compiled_text)
+        done.append(f"wikilinks in {rel}: {n_comp}")
     for rel, pairs in link_fixes.items():
         p = os.path.join(brain, rel)
         text = read(p)
@@ -1220,8 +1416,11 @@ def _calendar_init(root, brain, hk, execute):
         f"{len(harvest_timeline)} timeline item(s) and {len(harvest_todos)} open to-do(s) harvested from brain.")
 
 
-def _open_visual_calendar(hk, idx, open_now=False):
+def _open_visual_calendar(hk, idx, open_now=False, view=None):
     cal_url = hk.render_calendar_html(idx, start_server=True)
+    if view and view in ("coach", "todo", "graph"):
+        sep = "&" if "?" in cal_url else "?"
+        cal_url = f"{cal_url}{sep}view={view}"
     say(f"Visual calendar: [📅 Atlas Kalender öffnen]({cal_url})")
     if open_now:
         try:
@@ -1240,9 +1439,10 @@ def _open_visual_calendar(hk, idx, open_now=False):
 def cmd_calendar(args):
     root, brain = paths(args)
     hk = hook_module(brain)
+    req_view = getattr(args, "view", None)
     if args.init:
         _calendar_init(root, brain, hk, args.execute)
-        _open_visual_calendar(hk, hk.load_index(), getattr(args, "open", False))
+        _open_visual_calendar(hk, hk.load_index(), getattr(args, "open", False), view=req_view)
         return
     today = dt.date.today()
     if args.sync_ics:
@@ -1269,7 +1469,7 @@ def cmd_calendar(args):
                 cur = cur.rstrip() + "\n\n## Timeline\n\n" + "\n".join(added) + "\n"
             write(cal_readme, cur)
             say("Applied to brain/calendar/README.md.")
-        _open_visual_calendar(hk, hk.load_index(), getattr(args, "open", False))
+        _open_visual_calendar(hk, hk.load_index(), getattr(args, "open", False), view=req_view)
         return
     idx = hk.load_index()
     if getattr(args, "for_role", None) == "coach":
@@ -1305,7 +1505,7 @@ def cmd_calendar(args):
             say(f"  {box_map.get(w['status'], '[ ]')} {w['start'].isoformat()} [{k}] {w['what']}")
         if not workouts:
             say("  (none)")
-        _open_visual_calendar(hk, idx, getattr(args, "open", False))
+        _open_visual_calendar(hk, idx, getattr(args, "open", False), view=req_view or "coach")
         return
     horizon = 10 ** 6 if args.all else args.days
     items = hk.calendar_items(idx, days=horizon, past_days=365 if args.include_done else 3650,
@@ -1330,44 +1530,43 @@ def cmd_calendar(args):
         say("calendar: no upcoming items or open to-dos")
     if args.ics:
         _write_ics(args.ics, _deadlines(brain, None if args.all else args.days))
-    _open_visual_calendar(hk, idx, getattr(args, "open", False))
+    _open_visual_calendar(hk, idx, getattr(args, "open", False), view=req_view)
 
 
 # ================================================================= coach (Cycling, Running & Strength)
 
-COACH_DURATIONS = (
-    ("5s", 5), ("15s", 15), ("30s", 30), ("1m", 60), ("3m", 180),
-    ("5m", 300), ("8m", 480), ("12m", 720), ("20m", 1200), ("30m", 1800), ("60m", 3600),
-)
+COACH_DURATIONS = coach_engine.COACH_DURATIONS
 
 COACH_DEFAULT_README = """---
-summary: Atlas Sport-Coach hub: athlete profile, thresholds, macro periodization, 3-epoch power curve, and activity log
+summary: Atlas Sport-Coach hub: adaptive Simple-to-Pro athlete profile, macro periodization, 3-epoch power curve, readiness, and activity log
 tags: [atlas, sport]
 aliases: [Sport Coach, Trainingssteuerung, Radsport Coach, Lauf Coach]
 ---
 # Atlas · Sport-Coach Hub
 
-Stand: {{DATE}}. Native training and physiology hub for {{USER_NAME}} (Cycling, Running & Strength).
+Stand: {{DATE}}. Native training and physiology hub for {{USER_NAME}} (Cycling, Running & Strength), scaling seamlessly via `depth: auto | simple | standard | pro` in [profile.md](profile.md).
 
 ## Architecture & Pages
 
 | Page | Purpose |
 |---|---|
-| [profile.md](profile.md) | Athlete biometrics, cycling & running thresholds (FTP, zones, HRmax), weekly time budget, learned bio-rules |
+| [profile.md](profile.md) | Coaching depth (`auto \\| simple \\| standard \\| pro`), biometrics, cycling & running thresholds (`FTP`, `CP/W'`, `CS/D'`), weekly time budget, bio-rules |
 | [macro-plan.md](macro-plan.md) | Season macro periodization (Base, Build, Peak, Taper, Deload) anchored to `[goal]` and `[blocked]` in [../calendar/README.md](../calendar/README.md) |
-| [power-curve.md](power-curve.md) | 3-Epoch Mean Maximal Power (`42d` · `90d` · `365d`, Fresh vs. Fatigued `> 1500 kJ`) & Running Best Paces |
-| [activities.md](activities.md) | 3-Tier Strava activity log, interval compliance, and subjective athlete feedback (`RPE` / feel) |
+| [power-curve.md](power-curve.md) | 3-Epoch Mean Maximal Power (`42d` · `90d` · `365d`), PDC Fiber Typology, Multi-Tier Durability (`15/25/35 kJ/kg` + `>CP`) & Running Splits |
+| [activities.md](activities.md) | 3-Tier Strava activity log, `W'bal`, torque/cadence, CHO burn, steady `Pw:Hr`, and subjective athlete feedback (`RPE` / feel) |
+| [readiness.md](readiness.md) | Daily readiness & recovery log (`RHR`, sleep, soreness, `GREEN/AMBER/RED`) + longitudinal `CTL/ATL/TSB/ACWR` state |
 | `workouts/` | Deterministically generated `.zwo` workout files for Hammerhead Karoo / Zwift / Wahoo / Elite trainers |
 """
 
 COACH_DEFAULT_PROFILE = """---
-summary: Athlete physiology profile: biometrics, cycling FTP & power zones, running threshold & paces, weekly time budget, bio-rules
+summary: Athlete physiology profile: coaching depth, biometrics, cycling FTP/CP & zones, running CS/D' threshold, weekly time budget, bio-rules
 tags: [self, sport]
 aliases: [Athletenprofil, FTP, Trainingszonen, Leistungsdaten, Schwellenwerte]
+depth: auto
 ---
 # Athlete Profile & Thresholds
 
-Stand: {{DATE}}. Central physiological parameters and scheduling rules for {{USER_NAME}}.
+Stand: {{DATE}}. Central physiological parameters and scheduling rules for {{USER_NAME}} (`depth: auto | simple | standard | pro`).
 
 ## 1. Biometrics & Core Thresholds
 
@@ -1375,9 +1574,10 @@ Stand: {{DATE}}. Central physiological parameters and scheduling rules for {{USE
 |---|---|---|
 | **Biometrie** | {biometrie} | Height & Current Weight |
 | **FTP (Cycling)** | {ftp} | Functional Threshold Power |
-| **Max HR / Rest HR** | {hr} | Heart rate anchors |
+| **CP & W' (Cycling)** | CP: — W · W': — kJ | 2-param Critical Power & anaerobic work capacity |
+| **Max HR / Rest HR** | {hr} | Heart rate & LTHR anchors |
 | **VO₂max (est.)** | {vo2max} | Aerobic ceiling |
-| **Running Threshold** | — min/km | 10k / LT2 pace anchor |
+| **Running Threshold (CS & D')** | — min/km | LT2 / Critical Speed pace anchor |
 | **Weekly Time Budget** | {volumen} | Target endurance + strength budget |
 | **Athletik & Kraft** | {kraft} | Upper body / core / injury prevention |
 
@@ -1389,12 +1589,12 @@ Stand: {{DATE}}. Central physiological parameters and scheduling rules for {{USE
 
 ## 3. Learned Coaching Rules & Bio-Feedback
 
-- Document lasting physiological insights here (e.g., indoor cooling limits, nutrition per hour, recovery needs after `> 1500 kJ` rides, muscular vs. central fatigue patterns).
+- Document lasting physiological insights here (e.g., indoor cooling limits, nutrition per hour, recovery needs after high-kJ/kg rides, muscular vs. central fatigue patterns).
 """
 
 COACH_DEFAULT_MACRO = """---
 summary: Season macro periodization: weekly training phases (Base, Build, Peak, Taper, Deload) and target volume up to A/B goals
-tags: [sport, planung]
+tags: [sport, calendar]
 updated: {{DATE}}
 active_phase: Base
 goals_hash: {goals_hash}
@@ -1416,7 +1616,7 @@ Stand: {{DATE}}. High-level season roadmap for {{USER_NAME}}, linking `[goal:A/B
 """
 
 COACH_DEFAULT_PCURVE = """---
-summary: 3-Epoch Cycling Power Curve (42d Current, 90d Meso, 365d Season; Fresh vs. Fatigued >1500 kJ) and Running Best Paces
+summary: 3-Epoch Cycling Power Curve (42d/90d/365d), CP/W' & PDC Fiber Typology, Multi-Tier kJ/kg Durability, and Running Best Paces
 tags: [sport]
 updated: {{DATE}}
 ---
@@ -1432,24 +1632,32 @@ Stand: {{DATE}}. Precomputed peak performance matrix across 3 time horizons (`42
 | **15s** | — | — | — | — |
 | **30s** | — | — | — | — |
 | **1m** | — | — | — | — |
+| **2m** | — | — | — | — |
 | **3m** | — | — | — | — |
 | **5m** | — | — | — | — |
 | **8m** | — | — | — | — |
+| **10m** | — | — | — | — |
 | **12m** | — | — | — | — |
 | **20m** | — | — | — | — |
 | **30m** | — | — | — | — |
 | **60m** | — | — | — | — |
 
-## 2. Cycling Durability — Fatigued (`> 1500 kJ` Prior Work)
+## 2. Critical Power (`CP / W'`), PDC Decay Slope & Fiber Typology
 
-| Duration | 42d (`>1500 kJ`) | 90d (`>1500 kJ`) | 365d (`>1500 kJ`) | Retention vs. Fresh |
-|---|---|---|---|---|
-| **5s** | — | — | — | — |
-| **1m** | — | — | — | — |
-| **5m** | — | — | — | — |
-| **20m** | — | — | — | — |
+- **90d CP / W' Model:** `—`
+- **PDC Decay Slope & Typology:** `—`
 
-## 3. Running Best Split Paces
+## 3. Multi-Tier Cycling Durability (`>15 / >25 / >35 kJ/kg`, `>5 kJ/kg >CP` & `>1500 kJ`)
+
+| Tier | 5s (90d) | 1m (90d) | 5m (90d) | 20m (90d) | 5m Retention vs. Fresh |
+|---|---|---|---|---|---|
+| **`>15 kJ/kg`** | — | — | — | — | — |
+| **`>25 kJ/kg`** | — | — | — | — | — |
+| **`>35 kJ/kg`** | — | — | — | — | — |
+| **`>5 kJ/kg >CP`** | — | — | — | — | — |
+| **`>1500 kJ`** | — | — | — | — | — |
+
+## 4. Running Best Split Paces & `CS / D'`
 
 | Distance | 42d (Current) | 90d (Meso) | 365d (Season) |
 |---|---|---|---|
@@ -1460,8 +1668,8 @@ Stand: {{DATE}}. Precomputed peak performance matrix across 3 time horizons (`42
 """
 
 COACH_DEFAULT_ACTIVITIES = """---
-summary: 3-Tier Strava activity log, physiological telemetry (NP, IF, HR, kJ, MMP peaks), and athlete ride feedback
-tags: [sport]
+summary: 3-Tier Strava activity log, physiological telemetry (NP, IF, W'bal, torque, CHO, HR, MMP peaks), and athlete ride feedback
+tags: [sport, log]
 updated: {{DATE}}
 ---
 # Activity & Feedback Log (3-Tier History)
@@ -1481,6 +1689,23 @@ Stand: {{DATE}}. Synced via `atlas.py coach sync` and annotated via `atlas.py co
 
 | Month / Block | Rides / Runs | Total Hours | Total Work (kJ) | Key Highlights |
 |---|---|---|---|---|
+"""
+
+COACH_DEFAULT_READINESS = """---
+summary: Daily athlete readiness log (morning RHR, sleep, soreness, RPE) and longitudinal CTL/ATL/TSB/ACWR state
+tags: [sport, log]
+aliases: [Readiness, Erholung, Ruhepuls, Schlaf, Recovery, Tagesform]
+updated: {{DATE}}
+---
+# Athlete Readiness & Systemic Load Log
+
+Stand: {{DATE}}. Part of [Sport-Coach Hub](README.md). Updated deterministically via
+`atlas.py coach note --rhr <bpm> --sleep <h> --soreness <1-5> [--rpe <1-10>] [--text "..."]`.
+
+## Daily Readiness & PMC State
+
+| Date | RHR (bpm) | Sleep (h) | RPE (1-10) | Soreness (1-5) | CTL | ATL | TSB | ACWR | Readiness | Notes |
+|---|---|---|---|---|---|---|---|---|---|---|
 """
 
 
@@ -1522,7 +1747,36 @@ def _save_strava_env(brain, env_dict):
             pass
 
 
-def _coach_init(root, brain, hk, execute=True, quiet=False):
+def _ensure_coach_readiness_link(brain, execute=True):
+    """Ensure brain/coach/README.md links readiness.md whenever coach/readiness.md exists (prevents check orphan)."""
+    rdy_path = os.path.join(brain, "coach", "readiness.md")
+    readme_path = os.path.join(brain, "coach", "README.md")
+    if not os.path.isfile(rdy_path) or not os.path.isfile(readme_path):
+        return False
+    txt = read(readme_path)
+    if "readiness.md" in txt:
+        return False
+    if execute:
+        row = "| [readiness.md](readiness.md) | Daily readiness log (`RHR`, sleep, soreness, `RPE`) & longitudinal `CTL/ATL/TSB/ACWR` |\n"
+        if "| [activities.md](activities.md)" in txt:
+            txt = txt.replace("| [activities.md](activities.md)", row + "| [activities.md](activities.md)", 1)
+        elif "| [power-curve.md](power-curve.md)" in txt:
+            lines = txt.splitlines(keepends=True)
+            out_l = []
+            inserted = False
+            for ln in lines:
+                out_l.append(ln)
+                if not inserted and "[power-curve.md](power-curve.md)" in ln:
+                    out_l.append(row)
+                    inserted = True
+            txt = "".join(out_l)
+        else:
+            txt = txt.rstrip("\n") + "\n- [readiness.md](readiness.md)\n"
+        write(readme_path, txt)
+    return True
+
+
+def _coach_init(root, brain, hk, execute=True, quiet=False, preserve_existing_profile=False):
     """Scaffold brain/coach/ files, harvest existing athlete thresholds from brain/self/ or areas/, and link INDEX.md."""
     values = _router_values(brain, root)
     coach_dir = os.path.join(brain, "coach")
@@ -1530,11 +1784,12 @@ def _coach_init(root, brain, hk, execute=True, quiet=False):
     idx = hk.load_index()
     idx_no_prof = {k: v for k, v in idx.items() if k != "coach/profile.md"}
     prof_path = os.path.join(brain, "coach", "profile.md")
-    prof_is_skeleton = (not os.path.isfile(prof_path)) or any(
-        s in read(prof_path) for s in ("186 cm", "75.0 kg", "180 cm", "— cm · — kg")
+    prof_exists = os.path.isfile(prof_path)
+    prof_is_skeleton = (not prof_exists) or (
+        not preserve_existing_profile and coach_engine.is_untouched_skeleton_profile(read(prof_path))
     )
-    if prof_is_skeleton and os.path.isfile(prof_path):
-        # Temporarily hide skeleton profile.md so _extract_coach_context harvests from self/ and areas/
+    if prof_is_skeleton and prof_exists:
+        # Temporarily hide untouched skeleton profile.md so _extract_coach_context harvests from self/ and areas/
         tmp_p = prof_path + ".tmp_init"
         os.replace(prof_path, tmp_p)
         try:
@@ -1542,7 +1797,7 @@ def _coach_init(root, brain, hk, execute=True, quiet=False):
         finally:
             os.replace(tmp_p, prof_path)
     else:
-        ctx = hk._extract_coach_context(idx_no_prof if not os.path.isfile(prof_path) else idx)
+        ctx = hk._extract_coach_context(idx_no_prof if not prof_exists else idx)
     m_map = {m["label"]: m["value"] for m in ctx.get("metrics", [])}
     ghash = hk.compute_goals_hash()
 
@@ -1561,6 +1816,7 @@ def _coach_init(root, brain, hk, execute=True, quiet=False):
         ("coach/profile.md", prof_filled),
         ("coach/macro-plan.md", macro_filled),
         ("coach/power-curve.md", render(COACH_DEFAULT_PCURVE, values)),
+        ("coach/readiness.md", render(COACH_DEFAULT_READINESS, values)),
         ("coach/activities.md", render(COACH_DEFAULT_ACTIVITIES, values)),
     ]
     created = []
@@ -1568,7 +1824,10 @@ def _coach_init(root, brain, hk, execute=True, quiet=False):
         os.makedirs(workouts_dir, exist_ok=True)
     for rel, content in files:
         dst = os.path.join(brain, rel)
-        if not os.path.isfile(dst) or (rel == "coach/profile.md" and prof_is_skeleton and m_map):
+        should_write = (not os.path.isfile(dst)) or (
+            rel == "coach/profile.md" and not preserve_existing_profile and prof_is_skeleton and bool(m_map)
+        )
+        if should_write:
             created.append(rel)
             if execute:
                 write(dst, content)
@@ -1577,6 +1836,7 @@ def _coach_init(root, brain, hk, execute=True, quiet=False):
         m_txt = read(macro_dst)
         if "goals_hash: none" in m_txt and ghash != "none":
             write(macro_dst, m_txt.replace("goals_hash: none", f"goals_hash: {ghash}", 1))
+    _ensure_coach_readiness_link(brain, execute=execute)
     linked = _ensure_coach_index_link(brain, execute=execute)
     st = get_state(brain)
     mods = list(st.get("modules", []))
@@ -1597,186 +1857,74 @@ def _coach_init(root, brain, hk, execute=True, quiet=False):
 
 
 def _extract_profile_numbers(brain, hk):
-    """Return (ftp_watts, weight_kg) from brain/coach/profile.md or _extract_coach_context."""
-    ftp_w = 275
-    weight_kg = 67.0
+    """Return (ftp_watts, weight_kg) from brain/coach/profile.md with safe numeric fallbacks."""
     prof_path = os.path.join(brain, "coach", "profile.md")
     text = read(prof_path) if os.path.isfile(prof_path) else ""
-    if text:
-        for line in text.splitlines():
-            low = line.lower()
-            if "ftp" in low and "|" in line:
-                m = re.search(r"(\d{2,3})\s*w\b", low)
-                if m:
-                    ftp_w = int(m.group(1))
-            if ("biometrie" in low or "weight" in low or "körpermaße" in low) and "|" in line:
-                m_kg = re.search(r"(\d{2,3}(?:[.,]\d)?)\s*kg\b", low)
-                if m_kg:
-                    weight_kg = float(m_kg.group(1).replace(",", "."))
+    pinfo = coach_engine.parse_athlete_profile(text, fallback_ftp=275, fallback_weight=67.0)
+    ftp_w = int(pinfo.get("ftp_w") or pinfo.get("cp_w") or 275)
+    weight_kg = float(pinfo.get("weight_kg") or 67.0)
     return ftp_w, weight_kg
 
 
 def _mmp_from_watts(watts):
     """Compute Mean Maximal Power dict for COACH_DURATIONS in O(N) using prefix sums."""
-    n = len(watts)
-    if not n:
-        return {}
-    pref = [0.0] * (n + 1)
-    for i, w in enumerate(watts):
-        pref[i + 1] = pref[i] + max(0.0, float(w or 0.0))
-    peaks = {}
-    for label, sec in COACH_DURATIONS:
-        if n < sec:
-            continue
-        best = 0.0
-        for i in range(n - sec + 1):
-            avg = (pref[i + sec] - pref[i]) / sec
-            if avg > best:
-                best = avg
-        if best > 0:
-            peaks[label] = int(round(best))
-    return peaks
+    return coach_engine.mmp_from_watts(watts, durations=COACH_DURATIONS)
 
 
-def _compute_stream_metrics(streams, ftp_watts=275, weight_kg=67.0, sport="cycling"):
-    """Compute NP, work_kj, IF, TSS, Fresh MMP, Fatigued MMP (>1500 kJ), Pw:Hr decoupling, and running split paces."""
-    watts = [float(x or 0.0) for x in (streams.get("watts") or [])]
-    hr = [float(x or 0.0) for x in (streams.get("heartrate") or [])]
-    vel = [float(x or 0.0) for x in (streams.get("velocity_smooth") or [])]
-    out = {}
-    if watts:
-        n = len(watts)
-        joules = sum(max(0.0, w) for w in watts)
-        out["work_kj"] = int(round(joules / 1000.0))
-        out["avg_w"] = int(round(joules / n))
-        # 30-second rolling average for Normalized Power (NP)
-        if n >= 30:
-            w_sum = sum(watts[:30])
-            fourth_sum = (w_sum / 30.0) ** 4
-            cnt = 1
-            for i in range(30, n):
-                w_sum += watts[i] - watts[i - 30]
-                fourth_sum += (max(0.0, w_sum) / 30.0) ** 4
-                cnt += 1
-            np_w = int(round((fourth_sum / cnt) ** 0.25))
-        else:
-            np_w = out["avg_w"]
-        out["np_w"] = np_w
-        if ftp_watts > 0:
-            if_val = round(np_w / float(ftp_watts), 2)
-            out["if"] = if_val
-            out["tss"] = int(round((n * np_w * if_val) / (ftp_watts * 3600.0) * 100.0))
-        out["peaks_fresh"] = _mmp_from_watts(watts)
-        # Fatigued MMP after accumulating 1,500,000 Joules (1500 kJ)
-        cum_j = 0.0
-        idx_1500 = None
-        for i, w in enumerate(watts):
-            cum_j += max(0.0, w)
-            if cum_j >= 1_500_000.0:
-                idx_1500 = i + 1
-                break
-        if idx_1500 is not None and idx_1500 < n:
-            out["peaks_fatigued"] = _mmp_from_watts(watts[idx_1500:])
-        else:
-            out["peaks_fatigued"] = {}
-        # Aerobic Decoupling (Pw:Hr %) between 1st half and 2nd half (after warmup 10m)
-        if n >= 1200 and len(hr) == n:
-            start_i = 600 if n >= 2400 else 0
-            mid_i = start_i + (n - start_i) // 2
-            w1 = sum(watts[start_i:mid_i]) / max(1, mid_i - start_i)
-            h1 = sum(hr[start_i:mid_i]) / max(1, mid_i - start_i)
-            w2 = sum(watts[mid_i:n]) / max(1, n - mid_i)
-            h2 = sum(hr[mid_i:n]) / max(1, n - mid_i)
-            if h1 > 80 and h2 > 80 and w1 > 50:
-                ef1 = w1 / h1
-                ef2 = w2 / h2
-                out["decoupling_pct"] = round(((ef1 - ef2) / ef1) * 100.0, 1)
-    if hr:
-        valid_hr = [x for x in hr if x > 30]
-        if valid_hr:
-            out["avg_hr"] = int(round(sum(valid_hr) / len(valid_hr)))
-            out["max_hr"] = int(round(max(valid_hr)))
-    if sport == "running" and vel:
-        # Compute best split paces (1km, 3km, 5km, 10km) from 1Hz velocity_smooth (m/s)
-        n_v = len(vel)
-        pref_d = [0.0] * (n_v + 1)
-        for i, v in enumerate(vel):
-            pref_d[i + 1] = pref_d[i] + max(0.0, v)
-        best_paces = {}
-        for d_lbl, dist_m in (("1km", 1000.0), ("3km", 3000.0), ("5km", 5000.0), ("10km", 10000.0)):
-            if pref_d[-1] < dist_m:
-                continue
-            best_sec = None
-            j = 0
-            for i in range(n_v):
-                while j < n_v and (pref_d[j] - pref_d[i]) < dist_m:
-                    j += 1
-                if (pref_d[j] - pref_d[i]) >= dist_m:
-                    sec = j - i
-                    if best_sec is None or sec < best_sec:
-                        best_sec = sec
-            if best_sec and best_sec > 0:
-                sec_per_km = best_sec / (dist_m / 1000.0)
-                mm = int(sec_per_km // 60)
-                ss = int(round(sec_per_km % 60))
-                if ss == 60:
-                    mm += 1
-                    ss = 0
-                best_paces[d_lbl] = {"sec_per_km": round(sec_per_km, 1), "fmt": f"{mm}:{ss:02d}/km"}
-        if best_paces:
-            out["best_paces"] = best_paces
-    return out
+def _compute_stream_metrics(streams, ftp_watts=275, weight_kg=67.0, sport="cycling", cp_watts=None, w_prime_j=None):
+    """Compute full 1Hz physics & physiological stream metrics via coach_engine."""
+    return coach_engine.compute_stream_metrics(
+        streams,
+        ftp_watts=ftp_watts,
+        weight_kg=weight_kg,
+        sport=sport,
+        cp_watts=cp_watts,
+        w_prime_j=w_prime_j,
+    )
 
 
 def _rebuild_coach_markdown_files(brain, activities, ftp_watts=275, weight_kg=67.0):
-    """Deterministically regenerate brain/coach/power-curve.md and brain/coach/activities.md from activities list."""
+    """Deterministically regenerate brain/coach/power-curve.md, activities.md, and coach_telemetry.json."""
     today = dt.date.today()
-    # Sort newest first
     acts = sorted(
         [a for a in activities if isinstance(a, dict) and a.get("date")],
-        key=lambda x: (x.get("date", ""), x.get("id", 0)),
+        key=lambda x: (x.get("date", ""), str(x.get("id", ""))),
         reverse=True,
     )
-    # 1. Compute 3-Epoch Power Curve (42d, 90d, 365d) Fresh & Fatigued (>1500 kJ) + Running Best Paces
-    epochs = (("42d", 42), ("90d", 90), ("365d", 365))
-    fresh_ep = {lbl: {} for lbl, _ in COACH_DURATIONS}
-    fatig_ep = {lbl: {} for lbl, _ in COACH_DURATIONS}
-    run_ep = {d: {} for d in ("1km", "3km", "5km", "10km")}
+    prof_path = os.path.join(brain, "coach", "profile.md")
+    rdy_path = os.path.join(brain, "coach", "readiness.md")
+    prof_text = read(prof_path) if os.path.isfile(prof_path) else ""
+    rdy_text = read(rdy_path) if os.path.isfile(rdy_path) else ""
 
-    for a in acts:
-        try:
-            adate = dt.date.fromisoformat(a["date"][:10])
-        except ValueError:
-            continue
-        age = (today - adate).days
-        if age < 0 or age > 365:
-            continue
-        pf = a.get("peaks_fresh") or {}
-        p_fat = a.get("peaks_fatigued") or {}
-        for dur_lbl, _sec in COACH_DURATIONS:
-            val = pf.get(dur_lbl)
-            if val:
-                for ep_name, ep_days in epochs:
-                    if age <= ep_days and val > fresh_ep[dur_lbl].get(ep_name, 0):
-                        fresh_ep[dur_lbl][ep_name] = int(val)
-            fval = p_fat.get(dur_lbl)
-            if fval:
-                for ep_name, ep_days in epochs:
-                    if age <= ep_days and fval > fatig_ep[dur_lbl].get(ep_name, 0):
-                        fatig_ep[dur_lbl][ep_name] = int(fval)
-        bp = a.get("best_paces") or {}
-        for d_lbl in ("1km", "3km", "5km", "10km"):
-            pinfo = bp.get(d_lbl)
-            if isinstance(pinfo, dict) and pinfo.get("sec_per_km"):
-                spk = float(pinfo["sec_per_km"])
-                for ep_name, ep_days in epochs:
-                    cur_best = run_ep[d_lbl].get(ep_name)
-                    if age <= ep_days and (cur_best is None or spk < cur_best[0]):
-                        run_ep[d_lbl][ep_name] = (spk, pinfo.get("fmt", ""))
+    telemetry = coach_engine.build_coach_telemetry(
+        profile_text=prof_text,
+        activities=acts,
+        readiness_text=rdy_text,
+        strava_connected=os.path.isfile(_strava_env_path(brain)),
+        fallback_ftp=ftp_watts,
+        fallback_weight=weight_kg,
+        today=today,
+    )
+    curves = telemetry["curves"]
+    fresh_ep = curves["fresh"]
+    fatig_ep = curves["fatigued_1500kj"]
+    dur_ep = curves["durability_tiers"]
+    run_ep = curves["run_splits"]
+    cp_m = telemetry["cp_model"]
+    cs_m = telemetry["cs_model"]
+    typ = telemetry["typology"]
+    met = telemetry["metabolic"]
+    eff_bw = float(telemetry["profile"].get("weight_kg") or weight_kg or 67.0)
+
+    # Persist precomputed telemetry cache for zero-token status/UI inspection
+    cache_dir = os.path.join(brain, "_atlas", "cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    telemetry_cache = {k: v for k, v in telemetry.items() if k != "curves"}
+    dump_json(os.path.join(cache_dir, "coach_telemetry.json"), telemetry_cache)
 
     pc_lines = [
         "---",
-        "summary: 3-Epoch Cycling Power Curve (42d Current, 90d Meso, 365d Season; Fresh vs. Fatigued >1500 kJ) and Running Best Paces",
+        "summary: 3-Epoch Cycling Power Curve (42d/90d/365d, CP/W', Typology, Multi-Tier Durability) and Running CS/D' Splits",
         "tags: [sport]",
         f"updated: {today.isoformat()}",
         "---",
@@ -1786,6 +1934,23 @@ def _rebuild_coach_markdown_files(brain, activities, ftp_watts=275, weight_kg=67
         "",
         "## 1. Cycling Mean Maximal Power — Fresh (0 kJ+)",
         "",
+    ]
+    if cp_m.get("valid") and cp_m.get("cp_w"):
+        wp_kg = (cp_m["w_prime_kj"] / eff_bw) if cp_m.get("w_prime_kj") and eff_bw > 0 else 0.0
+        pc_lines.append(
+            f"- **90d Critical Power Model:** `CP = {cp_m['cp_w']} W` ({cp_m['cp_w'] / eff_bw:.2f} W/kg) · "
+            f"`W' = {cp_m['w_prime_kj']} kJ` ({wp_kg:.2f} kJ/kg) · `R² = {cp_m['r2']:.4f}`"
+        )
+    if typ.get("typology") and typ["typology"] != "Unknown":
+        pc_lines.append(
+            f"- **Muscle Fiber Typology Proxy:** **{typ['typology']}** "
+            f"(`P5s/CP = {typ.get('p5s_cp') or '—'}`, `P15s/CP = {typ.get('p15s_cp') or '—'}`, "
+            f"PDC decay `b = {typ.get('pdc_b') if typ.get('pdc_b') is not None else '—'}`) — {typ.get('coaching_hint', '')}"
+        )
+    if cp_m.get("valid") or (typ.get("typology") and typ["typology"] != "Unknown"):
+        pc_lines.append("")
+
+    pc_lines += [
         "| Duration | 42d (Current) | 90d (Meso) | 365d (Season) | W/kg (42d) |",
         "|---|---|---|---|---|",
     ]
@@ -1794,31 +1959,51 @@ def _rebuild_coach_markdown_files(brain, activities, ftp_watts=275, weight_kg=67
         v42 = f"{r['42d']} W" if r.get("42d") else "—"
         v90 = f"{r['90d']} W" if r.get("90d") else "—"
         v365 = f"{r['365d']} W" if r.get("365d") else "—"
-        wkg = f"{r['42d'] / weight_kg:.2f} W/kg" if r.get("42d") and weight_kg > 0 else "—"
+        wkg = f"{r['42d'] / eff_bw:.2f} W/kg" if r.get("42d") and eff_bw > 0 else "—"
         pc_lines.append(f"| **{dur_lbl}** | {v42} | {v90} | {v365} | {wkg} |")
 
     pc_lines += [
         "",
-        "## 2. Cycling Durability — Fatigued (`> 1500 kJ` Prior Work)",
+        "## 2. Cycling Durability — Multi-Tier Work (`kJ/kg`, `>CP`) & `> 1500 kJ`",
         "",
-        "| Duration | 42d (`>1500 kJ`) | 90d (`>1500 kJ`) | 365d (`>1500 kJ`) | Retention vs. Fresh |",
-        "|---|---|---|---|---|",
+        "| Duration | Fresh (90d) | `>15 kJ/kg` (90d) | `>25 kJ/kg` (90d) | `>35 kJ/kg` (90d) | `>5 kJ/kg >CP` (90d) | `>1500 kJ` (90d) | Retention (`>1500 kJ`) |",
+        "|---|---|---|---|---|---|---|---|",
     ]
     for dur_lbl in ("5s", "1m", "5m", "20m"):
-        rf = fatig_ep[dur_lbl]
         r0 = fresh_ep[dur_lbl]
-        v42 = f"{rf['42d']} W" if rf.get("42d") else "—"
-        v90 = f"{rf['90d']} W" if rf.get("90d") else "—"
-        v365 = f"{rf['365d']} W" if rf.get("365d") else "—"
-        base_f = rf.get("42d") or rf.get("90d") or rf.get("365d")
-        base_0 = r0.get("42d") or r0.get("90d") or r0.get("365d")
-        ret = f"{(base_f / base_0) * 100.0:.1f} %" if base_f and base_0 else "—"
-        pc_lines.append(f"| **{dur_lbl}** | {v42} | {v90} | {v365} | {ret} |")
+        rf = fatig_ep[dur_lbl]
+        f90_0 = r0.get("90d") or r0.get("42d") or r0.get("365d")
+        f90_1500 = rf.get("90d") or rf.get("42d") or rf.get("365d")
+        v0 = f"{f90_0} W" if f90_0 else "—"
+        t15 = dur_ep["15kj_kg"][dur_lbl].get("90d")
+        t25 = dur_ep["25kj_kg"][dur_lbl].get("90d")
+        t35 = dur_ep["35kj_kg"][dur_lbl].get("90d")
+        tcp = dur_ep["5kj_above_cp_kg"][dur_lbl].get("90d")
+        v15 = f"{t15} W" if t15 else "—"
+        v25 = f"{t25} W" if t25 else "—"
+        v35 = f"{t35} W" if t35 else "—"
+        vcp = f"{tcp} W" if tcp else "—"
+        v1500 = f"{f90_1500} W" if f90_1500 else "—"
+        ret = f"{(f90_1500 / f90_0) * 100.0:.1f} %" if f90_1500 and f90_0 else "—"
+        pc_lines.append(f"| **{dur_lbl}** | {v0} | {v15} | {v25} | {v35} | {vcp} | {v1500} | {ret} |")
 
     pc_lines += [
         "",
-        "## 3. Running Best Split Paces",
+        "## 3. Running Best Split Paces & Critical Speed (`CS / D'`)",
         "",
+    ]
+    if cs_m.get("valid") and cs_m.get("cs_mps"):
+        vdot_s = f" · `VDOT = {met['running_vdot']}`" if met.get("running_vdot") else ""
+        pc_lines.append(
+            f"- **90d Critical Speed Model:** `CS = {cs_m['cs_pace_fmt']}` ({cs_m['cs_mps']:.2f} m/s) · "
+            f"`D' = {cs_m['d_prime_m']} m` · `R² = {cs_m['r2']:.4f}`{vdot_s}"
+        )
+        pc_lines.append("")
+    elif met.get("running_vdot"):
+        pc_lines.append(f"- **Estimated Running VDOT:** `{met['running_vdot']}`")
+        pc_lines.append("")
+
+    pc_lines += [
         "| Distance | 42d (Current) | 90d (Meso) | 365d (Season) |",
         "|---|---|---|---|",
     ]
@@ -1854,7 +2039,7 @@ def _rebuild_coach_markdown_files(brain, activities, ftp_watts=275, weight_kg=67
 
     act_lines = [
         "---",
-        "summary: 3-Tier Strava activity log, physiological telemetry (NP, IF, HR, kJ, MMP peaks), and athlete ride feedback",
+        "summary: 3-Tier Strava activity log, physiological telemetry (NP, IF, W'bal, Torque, CHO, HR, MMP peaks), and athlete feedback",
         "tags: [sport]",
         f"updated: {today.isoformat()}",
         "---",
@@ -1874,9 +2059,9 @@ def _rebuild_coach_markdown_files(brain, activities, ftp_watts=275, weight_kg=67
         elev_m = a.get("elevation_m", 0)
         np_s = f"NP {a['np_w']} W (Avg {a.get('avg_w', '—')} W, IF {a.get('if', '—')}, {a.get('work_kj', 0)} kJ)" if a.get("np_w") else ""
         hr_s = f"HR {a['avg_hr']}/{a.get('max_hr', '—')} bpm" if a.get("avg_hr") else ""
-        dec_s = f" · Pw:Hr {a['decoupling_pct']}%" if a.get("decoupling_pct") is not None else ""
+        dec_s = f" · Steady Pw:Hr {a['decoupling_pct']}%" if a.get("decoupling_pct") is not None else ""
         pf = a.get("peaks_fresh") or {}
-        p_str = ", ".join(f"{k}: {pf[k]}W" for k in ("5s", "1m", "5m", "20m") if pf.get(k))
+        p_str = ", ".join(f"{k}: {pf[k]}W" for k in ("5s", "15s", "1m", "5m", "20m") if pf.get(k))
         pfat = a.get("peaks_fatigued") or {}
         pfat_str = ", ".join(f"{k}: {pfat[k]}W" for k in ("5s", "1m", "5m", "20m") if pfat.get(k))
         fb = a.get("feedback") or ""
@@ -1890,6 +2075,21 @@ def _rebuild_coach_markdown_files(brain, activities, ftp_watts=275, weight_kg=67
         if hr_s:
             meta_parts.append(f"**Cardio:** {hr_s}{dec_s}")
         act_lines.append("- " + " · ".join(meta_parts))
+
+        phys_parts = []
+        if a.get("w_bal_min_pct") is not None:
+            phys_parts.append(f"**W'bal min:** {a['w_bal_min_pct']}% ({a.get('matches_burned', 0)} matches)")
+        if a.get("avg_torque_nm") is not None:
+            phys_parts.append(f"**Torque:** {a['avg_torque_nm']} Nm (peak {a.get('peak_torque_nm', 0)} Nm, F_opt {a.get('f_opt_rpm', 0)} rpm)")
+        if a.get("cho_burn_g") is not None:
+            phys_parts.append(f"**Substrate:** ~{a['cho_burn_g']} g CHO / ~{a.get('fat_burn_g', 0)} g Fat (fueling target {a.get('fueling_g_h', 0)} g/h)")
+        if a.get("temp_c") is not None:
+            phys_parts.append(f"**Temp:** {a['temp_c']} °C" + (" `[thermal drift]`" if a.get("thermal_drift") else ""))
+        if a.get("hypoxia_loss_pct"):
+            phys_parts.append(f"**Altitude:** {a.get('elev_avg_m')} m (`-{a['hypoxia_loss_pct']}%` hypoxia)")
+        if phys_parts:
+            act_lines.append("- " + " · ".join(phys_parts))
+
         if p_str:
             act_lines.append(f"- **Peaks (Fresh):** {p_str}" + (f" | **Fatigued (`>1500 kJ`):** {pfat_str}" if pfat_str else ""))
         if a.get("best_paces"):
@@ -2013,6 +2213,15 @@ def _coach_sync(root, brain, hk, days=90, mock_file=None, execute=True, quiet=Fa
     """Sync Strava activities + 1Hz streams (or load mock JSON), compute 3-epoch curves & match calendar workouts."""
     _coach_init(root, brain, hk, execute=execute, quiet=True)
     ftp_w, weight_kg = _extract_profile_numbers(brain, hk)
+    prof_path = os.path.join(brain, "coach", "profile.md")
+    prof_info = coach_engine.parse_athlete_profile(
+        read(prof_path) if os.path.isfile(prof_path) else "",
+        fallback_ftp=ftp_w,
+        fallback_weight=weight_kg,
+    )
+    init_cp = float(prof_info.get("cp_w") or ftp_w)
+    init_wp_j = float(prof_info["w_prime_kj"] * 1000.0) if prof_info.get("w_prime_kj") else 20000.0
+
     act_json_path = os.path.join(brain, "coach", "activities.json")
     existing = load_json(act_json_path, [])
     if not isinstance(existing, list):
@@ -2043,6 +2252,7 @@ def _coach_sync(root, brain, hk, days=90, mock_file=None, execute=True, quiet=Fa
         os.makedirs(stream_cache_dir, exist_ok=True)
 
     synced_count = 0
+    synced_streams_mem = {}
     for raw in raw_activities:
         if not isinstance(raw, dict):
             continue
@@ -2086,10 +2296,13 @@ def _coach_sync(root, brain, hk, days=90, mock_file=None, execute=True, quiet=Fa
             entry["max_hr"] = int(round(float(raw["max_heartrate"])))
         if raw.get("kilojoules") and not entry.get("work_kj"):
             entry["work_kj"] = int(round(float(raw["kilojoules"])))
+        if raw.get("average_temp") is not None and entry.get("temp_c") is None:
+            entry["temp_c"] = round(float(raw["average_temp"]), 1)
+            entry["thermal_drift"] = bool(entry["temp_c"] > 25.0)
         if raw.get("laps") and isinstance(raw["laps"], list):
             entry["laps"] = raw["laps"]
 
-        # Load or fetch 1Hz streams
+        # Load or fetch 1Hz streams (including altitude & temp)
         s_file = os.path.join(stream_cache_dir, f"{aid}.json")
         streams = None
         if isinstance(raw.get("streams"), dict):
@@ -2103,7 +2316,10 @@ def _coach_sync(root, brain, hk, days=90, mock_file=None, execute=True, quiet=Fa
                 env_dict = _load_strava_env(brain)
                 token = _strava_refresh_if_needed(brain, env_dict)
                 import urllib.request
-                s_url = f"https://www.strava.com/api/v3/activities/{aid}/streams?keys=watts,heartrate,cadence,velocity_smooth,time&key_by_type=true"
+                s_url = (
+                    f"https://www.strava.com/api/v3/activities/{aid}/streams"
+                    "?keys=watts,heartrate,cadence,velocity_smooth,altitude,temp,time&key_by_type=true"
+                )
                 req = urllib.request.Request(s_url, headers={"Authorization": f"Bearer {token}"})
                 with urllib.request.urlopen(req, timeout=20) as resp:
                     s_raw = json.loads(resp.read().decode("utf-8", errors="replace"))
@@ -2115,7 +2331,11 @@ def _coach_sync(root, brain, hk, days=90, mock_file=None, execute=True, quiet=Fa
                 streams = None
 
         if isinstance(streams, dict):
-            m_calc = _compute_stream_metrics(streams, ftp_watts=ftp_w, weight_kg=weight_kg, sport=sport)
+            synced_streams_mem[aid] = streams
+            m_calc = _compute_stream_metrics(
+                streams, ftp_watts=ftp_w, weight_kg=weight_kg, sport=sport,
+                cp_watts=init_cp, w_prime_j=init_wp_j,
+            )
             entry.update(m_calc)
 
         # Preserve or import athlete feedback note
@@ -2139,6 +2359,41 @@ def _coach_sync(root, brain, hk, days=90, mock_file=None, execute=True, quiet=Fa
         synced_count += 1
 
     all_acts = sorted(by_id.values(), key=lambda x: (x.get("date", ""), str(x.get("id", ""))), reverse=True)
+
+    # Calibrate 90d CP/W' and CS/D' from aggregated curves; if CP/W' passes R² >= 0.98, refine Skiba W'bal & >CP durability
+    curves_90d = coach_engine.aggregate_epoch_curves(all_acts, today=today)
+    mmp_90d = {lbl: curves_90d["fresh"][lbl]["90d"] for lbl, _ in COACH_DURATIONS if curves_90d["fresh"][lbl].get("90d")}
+    run_90d = {
+        d_lbl: {"sec_per_km": curves_90d["run_splits"][d_lbl]["90d"][0], "fmt": curves_90d["run_splits"][d_lbl]["90d"][1]}
+        for d_lbl in ("1km", "3km", "5km", "10km")
+        if curves_90d["run_splits"][d_lbl].get("90d")
+    }
+    cp_sol = coach_engine.solve_cp_w_prime(mmp_90d)
+    cs_sol = coach_engine.solve_cs_d_prime(run_90d)
+    eff_cp_final = float(cp_sol["cp_w"]) if (cp_sol["valid"] and cp_sol["cp_w"]) else init_cp
+    eff_wp_final = float(cp_sol["w_prime_j"]) if (cp_sol["valid"] and cp_sol["w_prime_j"]) else init_wp_j
+    eff_cs_final = float(cs_sol["cs_mps"]) if (cs_sol["valid"] and cs_sol["cs_mps"]) else prof_info.get("cs_mps")
+
+    if cp_sol["valid"] and synced_streams_mem:
+        for a in all_acts:
+            aid = str(a.get("id") or "")
+            if aid in synced_streams_mem and a.get("sport") == "cycling":
+                a.update(_compute_stream_metrics(
+                    synced_streams_mem[aid],
+                    ftp_watts=ftp_w,
+                    weight_kg=weight_kg,
+                    sport="cycling",
+                    cp_watts=eff_cp_final,
+                    w_prime_j=eff_wp_final,
+                ))
+
+    for a in all_acts:
+        sys_tss, tss_m = coach_engine.compute_activity_load(
+            a, profile=prof_info, cs_mps=eff_cs_final, cp_watts=eff_cp_final,
+        )
+        a["systemic_tss"] = sys_tss
+        a["tss_method"] = tss_m
+
     if execute:
         dump_json(act_json_path, all_acts)
         _rebuild_coach_markdown_files(brain, all_acts, ftp_watts=ftp_w, weight_kg=weight_kg)
@@ -2155,49 +2410,124 @@ def _coach_sync(root, brain, hk, days=90, mock_file=None, execute=True, quiet=Fa
     return synced_count
 
 
-def _coach_note(root, brain, hk, date_str, text, rpe=None):
-    """Save subjective athlete ride feedback (RPE, legs, feel) to activities.json, activities.md, and calendar/README.md."""
+def _coach_note(root, brain, hk, date_str=None, text=None, rpe=None, rhr=None, sleep_h=None, sleep_quality=None, soreness=None):
+    """Save subjective ride feedback (RPE, feel) and/or daily readiness check-in (RHR, sleep, sleep_quality, soreness)."""
     _coach_init(root, brain, hk, execute=True, quiet=True)
+    eff_date = (date_str or dt.date.today().isoformat())[:10]
     ftp_w, weight_kg = _extract_profile_numbers(brain, hk)
-    note_str = f"RPE {rpe}/10 — {text.strip()}" if rpe else text.strip()
+    prof_path = os.path.join(brain, "coach", "profile.md")
+    prof_text = read(prof_path) if os.path.isfile(prof_path) else ""
+    prof_info = coach_engine.parse_athlete_profile(prof_text, fallback_ftp=ftp_w, fallback_weight=weight_kg)
+
+    clean_text = (text or "").strip()
+    clean_sq = (sleep_quality or "").strip() or None
+    if rpe is not None and clean_text:
+        note_str = f"RPE {rpe}/10 — {clean_text}"
+    elif rpe is not None and not clean_text and rhr is None and sleep_h is None and clean_sq is None and soreness is None:
+        note_str = f"RPE {rpe}/10"
+    else:
+        note_str = clean_text
+
     act_json_path = os.path.join(brain, "coach", "activities.json")
     acts = load_json(act_json_path, [])
     if not isinstance(acts, list):
         acts = []
-    updated_act = False
-    for a in acts:
-        if isinstance(a, dict) and str(a.get("date", ""))[:10] == date_str:
-            a["feedback"] = note_str
-            updated_act = True
-    if not updated_act:
-        acts.insert(0, {
-            "id": f"manual-{date_str}",
-            "date": date_str,
-            "name": "Logged Workout",
-            "sport": "cycling",
-            "duration_min": 60,
-            "feedback": note_str,
-        })
-    dump_json(act_json_path, acts)
-    _rebuild_coach_markdown_files(brain, acts, ftp_watts=ftp_w, weight_kg=weight_kg)
 
-    cal_path = os.path.join(brain, "calendar", "README.md")
-    if os.path.isfile(cal_path):
-        cal_txt = read(cal_path)
-        lines = cal_txt.splitlines()
-        for i, line in enumerate(lines):
-            m = re.match(r"^(\s*-\s*)\[([ xX\-])\](\s+)(\d{4}-\d{2}-\d{2})\b(.*)$", line)
-            if m and m.group(4) == date_str and "[workout" in m.group(5).lower():
-                rest = m.group(5)
-                if re.search(r"\[feedback:[^\]]*\]", rest, re.I):
-                    rest = re.sub(r"\[feedback:[^\]]*\]", f"[feedback: {note_str}]", rest, flags=re.I)
-                else:
-                    rest = rest.rstrip() + f" [feedback: {note_str}]"
-                lines[i] = f"{m.group(1)}[x]{m.group(3)}{date_str}{rest}"
-        write(cal_path, "\n".join(lines) + ("\n" if cal_txt.endswith("\n") else ""))
+    has_readiness_args = any(v is not None for v in (rhr, sleep_h, clean_sq, soreness))
+    # Update activity log when workout feedback (`text` or `rpe` without pure morning check-in) is provided
+    if note_str or (rpe is not None and not has_readiness_args):
+        updated_act = False
+        for a in acts:
+            if isinstance(a, dict) and str(a.get("date", ""))[:10] == eff_date:
+                if note_str:
+                    a["feedback"] = note_str
+                if rpe is not None:
+                    a["rpe"] = rpe
+                updated_act = True
+        if not updated_act and not has_readiness_args:
+            new_act = {
+                "id": f"manual-{eff_date}",
+                "date": eff_date,
+                "name": "Logged Workout",
+                "sport": "cycling",
+                "duration_min": 60,
+                "feedback": note_str,
+            }
+            if rpe is not None:
+                new_act["rpe"] = rpe
+            acts.insert(0, new_act)
+        dump_json(act_json_path, acts)
+
+        cal_path = os.path.join(brain, "calendar", "README.md")
+        if os.path.isfile(cal_path) and note_str:
+            cal_txt = read(cal_path)
+            lines = cal_txt.splitlines()
+            for i, line in enumerate(lines):
+                m = re.match(r"^(\s*-\s*)\[([ xX\-])\](\s+)(\d{4}-\d{2}-\d{2})\b(.*)$", line)
+                if m and m.group(4) == eff_date and "[workout" in m.group(5).lower():
+                    rest = m.group(5)
+                    if re.search(r"\[feedback:[^\]]*\]", rest, re.I):
+                        rest = re.sub(r"\[feedback:[^\]]*\]", f"[feedback: {note_str}]", rest, flags=re.I)
+                    else:
+                        rest = rest.rstrip() + f" [feedback: {note_str}]"
+                    lines[i] = f"{m.group(1)}[x]{m.group(3)}{eff_date}{rest}"
+            write(cal_path, "\n".join(lines) + ("\n" if cal_txt.endswith("\n") else ""))
+
+    # Update brain/coach/readiness.md when readiness metrics (RHR, sleep, soreness, or RPE) are logged
+    rdy_status_msg = ""
+    if has_readiness_args or rpe is not None:
+        rdy_path = os.path.join(brain, "coach", "readiness.md")
+        rdy_existing = read(rdy_path) if os.path.isfile(rdy_path) else ""
+        rows = coach_engine.parse_readiness_log(rdy_existing)
+        by_date_r = {r["date"]: r for r in rows}
+        cur_row = dict(by_date_r.get(eff_date) or {
+            "date": eff_date, "rhr": None, "sleep_h": None, "sleep_quality": None, "rpe": None, "soreness": None,
+            "ctl": None, "atl": None, "tsb": None, "acwr": None, "status": "", "notes": "",
+        })
+        if rhr is not None:
+            cur_row["rhr"] = int(rhr)
+        if sleep_h is not None:
+            cur_row["sleep_h"] = float(sleep_h)
+        if clean_sq is not None:
+            cur_row["sleep_quality"] = clean_sq
+        if rpe is not None:
+            cur_row["rpe"] = float(rpe)
+        if soreness is not None:
+            cur_row["soreness"] = int(soreness)
+        if clean_text:
+            cur_row["notes"] = clean_text
+        by_date_r[eff_date] = cur_row
+        merged_rows = sorted(by_date_r.values(), key=lambda x: x["date"], reverse=True)
+
+        idx_tmp = hk.load_index()
+        cal_items = hk.calendar_items(idx_tmp, days=60, past_days=14, include_done=True)
+        pmc = coach_engine.compute_pmc_metrics(acts, profile=prof_info, today=dt.date.today())
+        rdy_eval = coach_engine.evaluate_readiness_and_guardrails(
+            merged_rows, prof_info, pmc, acts, cal_items=cal_items, today=dt.date.today()
+        )
+        cur_row["ctl"] = pmc["ctl"]
+        cur_row["atl"] = pmc["atl"]
+        cur_row["tsb"] = pmc["tsb"]
+        cur_row["acwr"] = pmc["acwr"]
+        cur_row["status"] = rdy_eval["status"]
+        by_date_r[eff_date] = cur_row
+        final_rows = sorted(by_date_r.values(), key=lambda x: x["date"], reverse=True)
+        write(rdy_path, coach_engine.render_readiness_markdown(rdy_existing, final_rows, dt.date.today().isoformat()))
+        _ensure_coach_readiness_link(brain, execute=True)
+        rdy_status_msg = f" [readiness={rdy_eval['status']}, TSB={pmc['tsb']:+.1f}]"
+
+    _rebuild_coach_markdown_files(brain, acts, ftp_watts=ftp_w, weight_kg=weight_kg)
     hk.load_index()
     hk.render_calendar_html(hk.load_index(), start_server=False)
-    say(f"coach note: saved feedback for {date_str} -> '{note_str}'")
+    summary_label = note_str or ", ".join(
+        s for s in (
+            f"RHR {rhr} bpm" if rhr is not None else "",
+            f"Sleep {sleep_h}h" if sleep_h is not None else "",
+            f"Sleep quality {clean_sq}" if clean_sq is not None else "",
+            f"Soreness {soreness}/5" if soreness is not None else "",
+        ) if s
+    )
+    say(f"coach note: saved feedback for {eff_date} -> '{summary_label}'{rdy_status_msg}")
 
 
 def _coach_zwo(root, brain, hk, date_str=None, days=14):
@@ -2309,8 +2639,18 @@ def _coach_auth_strava(root, brain, args):
         say(f"strava auth: initial sync note ({exc})")
 
 
-def _coach_context(root, brain, hk, mode="auto", deep_dive=None, open_cal=False, no_sync=False):
-    """Assemble and print the mode-specific 3-Tier Context Package for the Atlas Sport-Coach."""
+def _coach_context(
+    root,
+    brain,
+    hk,
+    mode="auto",
+    deep_dive=None,
+    open_cal=False,
+    no_sync=False,
+    depth_override=None,
+    query_text="",
+):
+    """Assemble and print the Adaptive Simple-to-Pro Context Package for the Atlas Sport-Coach."""
     _coach_init(root, brain, hk, execute=True, quiet=True)
     st = get_state(brain)
     c_state = hk.load_coach_state()
@@ -2329,7 +2669,36 @@ def _coach_context(root, brain, hk, mode="auto", deep_dive=None, open_cal=False,
     macro = hk.parse_macro_plan(cal_items=all_cal)
     eff_mode = mode if mode != "auto" else ("macro" if macro["stale"] else "daily")
 
-    say(f"=== 1. ATLAS SPORT-COACH CONTEXT (mode: {eff_mode}) ===")
+    prof_path = os.path.join(brain, "coach", "profile.md")
+    rdy_path = os.path.join(brain, "coach", "readiness.md")
+    prof_text = read(prof_path) if os.path.isfile(prof_path) else ""
+    rdy_text = read(rdy_path) if os.path.isfile(rdy_path) else ""
+
+    telemetry = coach_engine.build_coach_telemetry(
+        profile_text=prof_text,
+        activities=c_state.get("activities", []),
+        readiness_text=rdy_text,
+        cal_items=all_cal,
+        strava_connected=bool(c_state.get("strava_connected")),
+        explicit_depth=depth_override if depth_override and depth_override != "auto" else None,
+        query_text=query_text or "",
+    )
+    depth = telemetry["depth"]
+
+    # SIMPLE TIER: Calm, 100% jargon-free output (zero CP/W'/FTP/CTL/RHR/.zwo/Strava nagging)
+    if depth == "simple":
+        say(coach_engine.format_simple_context_block(
+            mode=eff_mode,
+            profile_info=telemetry["profile"],
+            activities=c_state.get("activities", []),
+            cal_items=all_cal,
+        ))
+        if open_cal:
+            _open_visual_calendar(hk, idx, open_now=True)
+        return
+
+    # STANDARD & PRO TIERS
+    say(f"=== 1. ATLAS SPORT-COACH CONTEXT (mode: {eff_mode}, depth: {depth}) ===")
     say(f"  Macro Plan: active_phase='{macro['active_phase']}', updated='{macro['updated'] or 'never'}', "
         f"goals_hash='{macro['goals_hash']} -> {macro['current_goals_hash']}', stale={macro['stale']}"
         + (f" ({macro['stale_reason']})" if macro["stale"] else ""))
@@ -2357,10 +2726,12 @@ def _coach_context(root, brain, hk, mode="auto", deep_dive=None, open_cal=False,
             say(f"      - {p.get('date')} '{p.get('name')}' ({p.get('duration_min', 0)}m, NP {p.get('np_w') or '—'}W): "
                 f"Ask 1 concise question how it felt (RPE/legs) and save via `atlas.py coach note --date {p.get('date')} --text \"...\"`")
 
+    if depth == "pro":
+        say("\n" + coach_engine.format_pro_telemetry_block(telemetry))
+
     say("\n=== 2. ATHLETE PROFILE & THRESHOLDS (brain/coach/profile.md) ===")
-    prof_path = os.path.join(brain, "coach", "profile.md")
-    if os.path.isfile(prof_path):
-        say(read(prof_path).strip())
+    if prof_text:
+        say(prof_text.strip())
 
     say("\n=== 3. MACRO PERIODIZATION (brain/coach/macro-plan.md) ===")
     macro_path = os.path.join(brain, "coach", "macro-plan.md")
@@ -2368,14 +2739,12 @@ def _coach_context(root, brain, hk, mode="auto", deep_dive=None, open_cal=False,
         if eff_mode == "macro" or macro["stale"]:
             say(read(macro_path).strip())
         else:
-            # Slice current + next 4 weeks from macro-plan.md
-            cur_kw = dt.date.today().isocalendar()[1]
             say(f"Active Phase: {macro['active_phase']} (updated {macro['updated']})")
             for w in macro.get("weeks", [])[:8]:
                 say(f"  KW {w['kw']} ({w['monday']}): Phase={w['phase']} | Vol={w['hours']} | "
                     f"Cycling={w['cycling']} | Run/Strength={w['running_strength']} | Notes={w['notes']}")
 
-    if eff_mode in ("plan-14d", "macro"):
+    if eff_mode in ("plan-14d", "macro") or depth == "pro":
         say("\n=== 4. 3-EPOCH POWER & PACE CURVE (brain/coach/power-curve.md) ===")
         pc_path = os.path.join(brain, "coach", "power-curve.md")
         if os.path.isfile(pc_path):
@@ -2442,7 +2811,18 @@ def cmd_coach(args):
         _coach_init(root, brain, hk, execute=False, quiet=True)
         c_state = hk.load_coach_state()
         macro = hk.parse_macro_plan()
+        prof_p = os.path.join(brain, "coach", "profile.md")
+        rdy_p = os.path.join(brain, "coach", "readiness.md")
+        tel = coach_engine.build_coach_telemetry(
+            profile_text=read(prof_p) if os.path.isfile(prof_p) else "",
+            activities=c_state.get("activities", []),
+            readiness_text=read(rdy_p) if os.path.isfile(rdy_p) else "",
+            strava_connected=bool(c_state.get("strava_connected")),
+            explicit_depth=getattr(args, "depth", None),
+        )
         say(f"coach status: module={'coach' in get_state(brain).get('modules', [])}, "
+            f"depth={tel['depth']}, readiness={tel['readiness']['status']}, "
+            f"ctl={tel['pmc']['ctl']:.1f}, tsb={tel['pmc']['tsb']:+.1f}, "
             f"strava_connected={c_state['strava_connected']}, "
             f"activities={len(c_state['activities'])}, "
             f"pending_feedback={len(c_state['pending_feedback'])}, "
@@ -2450,16 +2830,40 @@ def cmd_coach(args):
     elif action == "auth-strava":
         _coach_auth_strava(root, brain, args)
     elif action == "sync":
-        _coach_sync(root, brain, hk, days=args.days, mock_file=args.mock_file, execute=args.execute, quiet=False)
+        eff_days = args.days if getattr(args, "days", None) not in (None, 14) else 90
+        _coach_sync(root, brain, hk, days=eff_days, mock_file=args.mock_file, execute=args.execute, quiet=False)
     elif action == "note":
-        if not args.date or not args.text:
-            sys.exit("coach note requires --date YYYY-MM-DD and --text \"...\"")
-        _coach_note(root, brain, hk, args.date, args.text, rpe=args.rpe)
+        has_rdy = any(getattr(args, k, None) is not None for k in ("rhr", "sleep", "sleep_quality", "soreness", "rpe"))
+        if not args.text and not has_rdy:
+            sys.exit("coach note requires --text \"...\" and/or readiness flags (--rhr, --sleep, --sleep-quality, --soreness, --rpe)")
+        if args.text and not args.date and not has_rdy:
+            sys.exit("coach note requires --date YYYY-MM-DD when logging workout text without readiness flags")
+        _coach_note(
+            root,
+            brain,
+            hk,
+            date_str=args.date,
+            text=args.text,
+            rpe=args.rpe,
+            rhr=getattr(args, "rhr", None),
+            sleep_h=getattr(args, "sleep", None),
+            sleep_quality=getattr(args, "sleep_quality", None),
+            soreness=getattr(args, "soreness", None),
+        )
     elif action == "zwo":
         _coach_zwo(root, brain, hk, date_str=args.date, days=args.days)
     else:
-        _coach_context(root, brain, hk, mode=args.mode, deep_dive=args.deep_dive,
-                       open_cal=getattr(args, "open", False), no_sync=getattr(args, "no_sync", False))
+        _coach_context(
+            root,
+            brain,
+            hk,
+            mode=args.mode,
+            deep_dive=args.deep_dive,
+            open_cal=getattr(args, "open", False),
+            no_sync=getattr(args, "no_sync", False),
+            depth_override=getattr(args, "depth", None),
+            query_text=getattr(args, "query", None) or "",
+        )
 
 
 # ================================================================= inventory
@@ -2869,7 +3273,7 @@ def _core_files(base):
     for dp, dns, fns in os.walk(base):
         dns[:] = [d for d in dns if d not in CORE_SKIP_DIRS]
         for fn in fns:
-            if fn.startswith("state.json") or fn == ROUTER_BASE:
+            if fn.startswith("state.json") or fn.startswith("conflicts.json") or fn == ROUTER_BASE or fn.endswith((".pyc", ".pyo")):
                 continue
             full = os.path.join(dp, fn)
             out[fwd(os.path.relpath(full, base))] = sha256_file(full)
@@ -3005,6 +3409,13 @@ def _apply_upgrade(brain, src, values, data, dry):
         if m == "coach":
             if _ensure_coach_index_link(brain, execute=not dry):
                 acts.append("INDEX.md: link `coach/README.md`")
+    readme_coach = os.path.join(brain, "coach", "README.md")
+    rdy_coach = os.path.join(brain, "coach", "readiness.md")
+    if os.path.isfile(readme_coach) and "readiness.md" not in read(readme_coach):
+        if os.path.isfile(rdy_coach) or "coach/readiness.md" in data.get("skeleton_add", []):
+            acts.append("coach/README.md: link `readiness.md`")
+            if not dry:
+                _ensure_coach_readiness_link(brain, execute=True)
     sp = os.path.join(brain, "settings.md")
     for key, val in (data.get("settings_add") or {}).items():
         if os.path.exists(sp):
@@ -3023,7 +3434,10 @@ def _apply_upgrade(brain, src, values, data, dry):
     return acts, list(data.get("notes", []))
 
 
-HARD_CORE_PREFIXES = ("tools/", "hooks/", "skills/", "agents/", "upgrades/", "VERSION", "charter.md", "adapters.md")
+HARD_CORE_PREFIXES = (
+    "tools/", "hooks/", "skills/", "agents/", "upgrades/",
+    "templates/calendar.html", "VERSION", "charter.md", "adapters.md",
+)
 
 
 def _plan_core(brain, root, src, hard=False):
@@ -3112,9 +3526,13 @@ def cmd_core_diff(args, apply=False):
             src_tool = os.path.join(src, "core", "tools", "atlas.py")
             cur_tool = os.path.abspath(__file__)
             if os.path.isfile(src_tool) and sha256_file(src_tool) != sha256_file(cur_tool):
-                chk = subprocess.run([sys.executable, "-I", "-m", "py_compile", src_tool], capture_output=True)
-                if chk.returncode == 0:
-                    cmd = [sys.executable, "-I", src_tool, "--root", root, "core-apply", "--source", src,
+                try:
+                    compile(read(src_tool), src_tool, "exec")
+                    src_ok = True
+                except Exception:
+                    src_ok = False
+                if src_ok:
+                    cmd = [sys.executable, "-I", "-B", src_tool, "--root", root, "core-apply", "--source", src,
                            "--execute", "--bootstrapped"]
                     if getattr(args, "user_home", None):
                         cmd += ["--user-home", args.user_home]
@@ -3231,7 +3649,7 @@ def _core_apply(args, root, brain, src, plan, ups, values):
         result.setdefault("upgrades", []).extend(f"{v}: {a}" for a in acts)
         notes += [f"{v}: {x}" for x in n]
     try:
-        _coach_init(root, brain, hook_module(brain), execute=True, quiet=True)
+        _coach_init(root, brain, hook_module(brain), execute=True, quiet=True, preserve_existing_profile=True)
     except Exception:
         pass
     # The new base is the upstream we just considered; unresolved conflicts keep their old base until accepted.
@@ -3282,7 +3700,7 @@ def _core_apply(args, root, brain, src, plan, ups, values):
         if agent == "antigravity" and scope == "project" and os.path.isfile(os.path.join(root, "GEMINI.md")):
             if "atlas:router:start" in read(os.path.join(root, "GEMINI.md")):
                 rmode = "copy"
-        base_cmd = [sys.executable, "-I", tool, "--root", root]
+        base_cmd = [sys.executable, "-I", "-B", tool, "--root", root]
         r1 = subprocess.run(base_cmd + ["wire", "--agent", agent, "--scope", scope, "--router-mode", rmode, "--execute"] +
                             (["--user-home", args.user_home] if getattr(args, "user_home", None) else []),
                             capture_output=True, text=True, encoding="utf-8", errors="replace")
@@ -3295,7 +3713,7 @@ def _core_apply(args, root, brain, src, plan, ups, values):
         _restore(brain, rdir)
         for key in wired:
             agent, scope = key.split(":")
-            subprocess.run([sys.executable, "-I", tool, "--root", root, "wire", "--agent", agent, "--scope", scope,
+            subprocess.run([sys.executable, "-I", "-B", tool, "--root", root, "wire", "--agent", agent, "--scope", scope,
                             "--execute"] + (["--user-home", args.user_home] if getattr(args, "user_home", None) else []),
                            capture_output=True, text=True)
         say("ROLLED BACK: the new core failed its probe; this Atlas runs on the previous version again.")
@@ -3467,7 +3885,7 @@ def cmd_dev_setup(args):
     if not os.path.exists(page):
         write(page, DEV_PAGE.format(path="code/life-atlas", url=url, date=dt.date.today().isoformat()))
     set_state(brain, dev={"repo": url, "path": "code/life-atlas"})
-    subprocess.run([sys.executable, "-I", os.path.join(brain, "_atlas", "tools", "atlas.py"), "--root", root,
+    subprocess.run([sys.executable, "-I", "-B", os.path.join(brain, "_atlas", "tools", "atlas.py"), "--root", root,
                     "routes", "--execute"], capture_output=True, text=True)
     _git(brain, "add", "-A")
     _git(brain, "commit", "-q", "-m", "atlas: Atlas Dev set up")
@@ -3613,7 +4031,7 @@ def cmd_mail(args, extra_argv=None):
     mail_args = list(extra_argv or [])
     if "--root" not in mail_args and "-h" not in mail_args and "--help" not in mail_args:
         mail_args = ["--root", root] + mail_args
-    res = subprocess.run([sys.executable, "-I", mail_script] + mail_args)
+    res = subprocess.run([sys.executable, "-I", "-B", mail_script] + mail_args)
     sys.exit(res.returncode)
 
 
@@ -3669,6 +4087,34 @@ def main():
     p.add_argument("terms", nargs="+")
     p.add_argument("--limit", type=int, default=12)
     p.add_argument("--no-text", action="store_true", help="frontmatter only, skip the full-text pass")
+
+    p = sub.add_parser("graph", help="inspect a page's outlinks, backlinks, and unlinked mentions")
+    p.add_argument("page", help="page path, stem, title, or alias")
+    p.add_argument("--json", action="store_true", help="output JSON")
+
+    p = sub.add_parser("context", help="assemble a token-budgeted Markdown context dossier")
+    p.add_argument("target", help="page path, Target#Section, or search query")
+    p.add_argument("--hops", type=int, default=1, help="neighbor hops to expand (default: 1)")
+    p.add_argument("--budget", type=int, default=24000, help="character budget for dossier (default: 24000)")
+
+    p = sub.add_parser("link", help="retroactive wiki-linking for existing brains")
+    p.add_argument("--scan", action="store_true", help="scan unlinked entity mentions and journal paths (default)")
+    p.add_argument("--journals", action="store_true", help="link valid literal brain/ file paths in journal/**/*.md")
+    p.add_argument("--related", action="store_true", help="add unambiguous entity mentions to YAML frontmatter related:")
+    p.add_argument("--inline", action="store_true", help="link first unambiguous mention per target in body prose")
+    p.add_argument("--json", action="store_true", help="output JSON")
+    p.add_argument("--execute", action="store_true")
+
+    p = sub.add_parser("conflicts", help="manage unresolved fact contradictions in _atlas/conflicts.json")
+    p.add_argument("action", nargs="?", default="list", choices=("list", "add", "resolve"))
+    p.add_argument("target_id", nargs="?", help="conflict ID for `resolve`")
+    p.add_argument("--id", help="conflict ID for `resolve`")
+    p.add_argument("--pages", nargs="+", help="affected brain page paths for `add`")
+    p.add_argument("--summary", help="contradiction summary for `add`")
+    p.add_argument("--resolution", help="resolution note for `resolve`")
+    p.add_argument("--all", action="store_true", help="include resolved conflicts in `list`")
+    p.add_argument("--json", action="store_true", help="output JSON")
+
     p = sub.add_parser("mark")
     p.add_argument("kind", choices=("maintenance", "update-check"))
     p = sub.add_parser("adopt")
@@ -3684,7 +4130,8 @@ def main():
     p.add_argument("--user-home")
 
     p = sub.add_parser("check")
-    p.add_argument("--fix", action="store_true", help="mechanical repairs: moved-page links, tag synonyms, cache, routes")
+    p.add_argument("--fix", action="store_true",
+                   help="mechanical repairs: [[wikilinks]], moved-page links, tag synonyms, SQLite cache, routes")
 
     p = sub.add_parser("deadlines")
     p.add_argument("--days", type=int, default=30)
@@ -3696,6 +4143,8 @@ def main():
     p.add_argument("--all", action="store_true")
     p.add_argument("--include-done", action="store_true")
     p.add_argument("--for", dest="for_role", choices=("coach",), help="filtered view for a specific role (e.g. coach)")
+    p.add_argument("--view", choices=("all", "coach", "todo", "graph"),
+                   help="initial dashboard tab (`all`, `coach`, `todo`, or `graph`)")
     p.add_argument("--init", action="store_true", help="harvest existing dates, birthdays and open to-dos into calendar/README.md")
     p.add_argument("--open", action="store_true", help="open the zero-token visual HTML calendar in the browser")
     p.add_argument("--ics", help="export calendar timeline to an .ics file")
@@ -3710,10 +4159,17 @@ def main():
     p.add_argument("--init", action="store_true", help="scaffold brain/coach/ and harvest existing athlete thresholds")
     p.add_argument("--mode", choices=("auto", "daily", "checkin", "plan-14d", "macro"), default="auto",
                    help="context slicing mode (default: auto)")
+    p.add_argument("--depth", choices=("auto", "simple", "standard", "pro"), default="auto",
+                   help="coaching depth override (default: auto from coach/profile.md & streams)")
+    p.add_argument("--query", help="optional natural-language user prompt for auto depth escalation")
     p.add_argument("--deep-dive", help="date (YYYY-MM-DD) for full activity stream/lap telemetry")
     p.add_argument("--date", help="target date (YYYY-MM-DD) for `note` or `zwo`")
     p.add_argument("--text", help="athlete feedback note text for `note`")
     p.add_argument("--rpe", type=int, help="optional RPE (1-10) for `note`")
+    p.add_argument("--rhr", type=int, help="morning resting heart rate (bpm) for `note` readiness check-in")
+    p.add_argument("--sleep", type=float, help="sleep duration (hours, e.g. 7.5) for `note` readiness check-in")
+    p.add_argument("--sleep-quality", help="sleep quality (e.g. good, fair, poor, or 1-5) for `note` readiness check-in")
+    p.add_argument("--soreness", type=int, help="muscle soreness (1-5) for `note` readiness check-in")
     p.add_argument("--days", type=int, default=14, help="horizon in days for `sync` (default 90) or `zwo` (default 14)")
     p.add_argument("--all-14d", action="store_true", help="compile all cycling workouts in the next 14 days")
     p.add_argument("--mock-file", help="offline Strava JSON fixture for `sync`")
@@ -3767,7 +4223,8 @@ def main():
 
     args = ap.parse_args()
     handlers = {"init": cmd_init, "routes": cmd_routes, "projects": cmd_projects, "index": cmd_index, "probe": cmd_probe,
-                "find": cmd_find, "mark": cmd_mark, "adopt": cmd_adopt, "code-sync": cmd_code_sync,
+                "find": cmd_find, "graph": cmd_graph, "context": cmd_context, "link": cmd_link, "conflicts": cmd_conflicts,
+                "mark": cmd_mark, "adopt": cmd_adopt, "code-sync": cmd_code_sync,
                 "core-accept": cmd_core_accept, "dev-check": cmd_dev_check, "dev-setup": cmd_dev_setup,
                 "check": cmd_check, "deadlines": cmd_deadlines, "calendar": cmd_calendar, "coach": cmd_coach,
                 "inventory": cmd_inventory, "move": cmd_move, "verify": cmd_verify, "undo": cmd_undo,

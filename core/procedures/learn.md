@@ -12,6 +12,10 @@ one place (`INDEX.md` → *Where things go*), with `summary:` and `tags:`. If no
   page or in `brain/calendar/README.md` under `## Timeline`); appointments, vacations/blocked periods (`[blocked]`),
   race/macro goals (`[goal]`), planned workouts (`[workout]`), and open tasks (`## Open To-Dos` in
   `brain/calendar/README.md`); decisions and their reason; plans and goals; what the user said about themself (`self/`).
+  Cross-link connected pages via relative Markdown links (`[Label](../path.md#section)`), `[[Target#Section|Label]]`
+  wikilinks (compiled to standard relative links by `atlas.py check --fix`), or frontmatter `related: [...]`. On facts
+  that age or come from documents (tariffs, salaries, thresholds, contracts), set optional `verified: YYYY-MM-DD`,
+  `valid_until: YYYY-MM-DD`, and `sources: [...]` in frontmatter.
 - **The user's ways:** preferences, rules ("from now on…", "never…"), corrections of Atlas (the lesson goes to `howto/`,
   the wrong page gets fixed), how they want answers.
 - **Code (project page):** gotchas found while debugging, how to build/test/deploy, decisions and why, what was
