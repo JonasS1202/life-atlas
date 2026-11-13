@@ -321,6 +321,7 @@ def build_brain_graph_payload(brain, idx=None, db_path=None, today=None):
                 "nodes": 0,
                 "edges": 0,
                 "horizontal_edges": 0,
+                "journal_nodes": 0,
                 "isolated": 0,
                 "stale_verified": 0,
                 "broken_links": 0,
@@ -499,6 +500,7 @@ def build_brain_graph_payload(brain, idx=None, db_path=None, today=None):
         })
 
     horiz_edge_cnt = sum(1 for ed in raw_edges if ed["kind"] != "tree")
+    journal_cnt = sum(1 for n in nodes if n["domain"] == "journal")
     iso_cnt = sum(1 for n in nodes if n["isolated"])
 
     return {
@@ -508,6 +510,7 @@ def build_brain_graph_payload(brain, idx=None, db_path=None, today=None):
             "nodes": len(nodes),
             "edges": len(raw_edges),
             "horizontal_edges": horiz_edge_cnt,
+            "journal_nodes": journal_cnt,
             "isolated": iso_cnt,
             "stale_verified": stale_cnt,
             "broken_links": broken_cnt,

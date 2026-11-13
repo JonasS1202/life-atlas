@@ -1871,7 +1871,9 @@ def _mmp_from_watts(watts):
     return coach_engine.mmp_from_watts(watts, durations=COACH_DURATIONS)
 
 
-def _compute_stream_metrics(streams, ftp_watts=275, weight_kg=67.0, sport="cycling", cp_watts=None, w_prime_j=None):
+def _compute_stream_metrics(
+    streams, ftp_watts=275, weight_kg=67.0, sport="cycling", cp_watts=None, w_prime_j=None, device_watts=None
+):
     """Compute full 1Hz physics & physiological stream metrics via coach_engine."""
     return coach_engine.compute_stream_metrics(
         streams,
@@ -1880,6 +1882,7 @@ def _compute_stream_metrics(streams, ftp_watts=275, weight_kg=67.0, sport="cycli
         sport=sport,
         cp_watts=cp_watts,
         w_prime_j=w_prime_j,
+        device_watts=device_watts,
     )
 
 
@@ -2033,7 +2036,8 @@ def _rebuild_coach_markdown_files(brain, activities, ftp_watts=275, weight_kg=67
             b = tier3_buckets.setdefault(ym, {"count": 0, "min": 0, "kj": 0, "names": []})
             b["count"] += 1
             b["min"] += int(a.get("duration_min") or 0)
-            b["kj"] += int(a.get("work_kj") or 0)
+            if coach_engine.is_valid_cycling_power_activity(a):
+                b["kj"] += int(a.get("work_kj") or 0)
             if len(b["names"]) < 3 and a.get("name"):
                 b["names"].append(a["name"])
 
@@ -2054,15 +2058,16 @@ def _rebuild_coach_markdown_files(brain, activities, ftp_watts=275, weight_kg=67
         act_lines.append("*(No activities in the last 21 days.)*")
     for a in tier1:
         sp_ico = "🏃" if a.get("sport") == "running" else ("🏋️" if a.get("sport") == "strength" else "🚴")
+        valid_pwr = coach_engine.is_valid_cycling_power_activity(a)
         dur_m = a.get("duration_min", 0)
         dist_km = a.get("distance_km", 0)
         elev_m = a.get("elevation_m", 0)
-        np_s = f"NP {a['np_w']} W (Avg {a.get('avg_w', '—')} W, IF {a.get('if', '—')}, {a.get('work_kj', 0)} kJ)" if a.get("np_w") else ""
+        np_s = f"NP {a['np_w']} W (Avg {a.get('avg_w', '—')} W, IF {a.get('if', '—')}, {a.get('work_kj', 0)} kJ)" if (valid_pwr and a.get("np_w")) else ""
         hr_s = f"HR {a['avg_hr']}/{a.get('max_hr', '—')} bpm" if a.get("avg_hr") else ""
-        dec_s = f" · Steady Pw:Hr {a['decoupling_pct']}%" if a.get("decoupling_pct") is not None else ""
-        pf = a.get("peaks_fresh") or {}
+        dec_s = f" · Steady Pw:Hr {a['decoupling_pct']}%" if (valid_pwr and a.get("decoupling_pct") is not None) else ""
+        pf = (a.get("peaks_fresh") or {}) if valid_pwr else {}
         p_str = ", ".join(f"{k}: {pf[k]}W" for k in ("5s", "15s", "1m", "5m", "20m") if pf.get(k))
-        pfat = a.get("peaks_fatigued") or {}
+        pfat = (a.get("peaks_fatigued") or {}) if valid_pwr else {}
         pfat_str = ", ".join(f"{k}: {pfat[k]}W" for k in ("5s", "1m", "5m", "20m") if pfat.get(k))
         fb = a.get("feedback") or ""
         fb_disp = "⚠ `[feedback: pending]` — ask athlete 1 check-in question" if fb == "pending" else (fb or "—")
@@ -2077,11 +2082,11 @@ def _rebuild_coach_markdown_files(brain, activities, ftp_watts=275, weight_kg=67
         act_lines.append("- " + " · ".join(meta_parts))
 
         phys_parts = []
-        if a.get("w_bal_min_pct") is not None:
+        if valid_pwr and a.get("w_bal_min_pct") is not None:
             phys_parts.append(f"**W'bal min:** {a['w_bal_min_pct']}% ({a.get('matches_burned', 0)} matches)")
-        if a.get("avg_torque_nm") is not None:
+        if valid_pwr and a.get("avg_torque_nm") is not None:
             phys_parts.append(f"**Torque:** {a['avg_torque_nm']} Nm (peak {a.get('peak_torque_nm', 0)} Nm, F_opt {a.get('f_opt_rpm', 0)} rpm)")
-        if a.get("cho_burn_g") is not None:
+        if valid_pwr and a.get("cho_burn_g") is not None:
             phys_parts.append(f"**Substrate:** ~{a['cho_burn_g']} g CHO / ~{a.get('fat_burn_g', 0)} g Fat (fueling target {a.get('fueling_g_h', 0)} g/h)")
         if a.get("temp_c") is not None:
             phys_parts.append(f"**Temp:** {a['temp_c']} °C" + (" `[thermal drift]`" if a.get("thermal_drift") else ""))
@@ -2093,7 +2098,11 @@ def _rebuild_coach_markdown_files(brain, activities, ftp_watts=275, weight_kg=67
         if p_str:
             act_lines.append(f"- **Peaks (Fresh):** {p_str}" + (f" | **Fatigued (`>1500 kJ`):** {pfat_str}" if pfat_str else ""))
         if a.get("best_paces"):
-            bp_s = ", ".join(f"{k}: {v.get('fmt')}" for k, v in a["best_paces"].items() if isinstance(v, dict))
+            bp_s = ", ".join(
+                f"{k}: {(v.get('fmt') if isinstance(v, dict) else v)}"
+                for k, v in a["best_paces"].items()
+                if (isinstance(v, dict) and v.get("fmt")) or isinstance(v, str)
+            )
             if bp_s:
                 act_lines.append(f"- **Split Paces:** {bp_s}")
         if a.get("laps"):
@@ -2108,7 +2117,8 @@ def _rebuild_coach_markdown_files(brain, activities, ftp_watts=275, weight_kg=67
         "|---|---|---|---|---|---|---|",
     ]
     for a in tier2:
-        ld = f"NP {a['np_w']}W ({a.get('work_kj', 0)}kJ)" if a.get("np_w") else (f"{a.get('distance_km', 0):.1f} km" if a.get("distance_km") else "—")
+        valid_pwr = coach_engine.is_valid_cycling_power_activity(a)
+        ld = f"NP {a['np_w']}W ({a.get('work_kj', 0)}kJ)" if (valid_pwr and a.get("np_w")) else (f"{a.get('distance_km', 0):.1f} km" if a.get("distance_km") else "—")
         hr_c = f"{a['avg_hr']}/{a.get('max_hr', '—')}" if a.get("avg_hr") else "—"
         fb_c = (a.get("feedback") or "—").replace("|", "/").replace("\n", " ")
         act_lines.append(f"| {a['date']} | {a.get('sport', 'cycling')} | {a.get('name', 'Workout')} | {a.get('duration_min', 0)}m | {ld} | {hr_c} | {fb_c} |")
@@ -2276,26 +2286,46 @@ def _coach_sync(root, brain, hk, days=90, mock_file=None, execute=True, quiet=Fa
         elev_m = int(round(float(raw.get("total_elevation_gain") or raw.get("elevation_m") or 0)))
 
         prev = by_id.get(aid, {})
+        if "device_watts" in raw and raw.get("device_watts") is not None:
+            device_watts = bool(raw.get("device_watts"))
+        elif not mock_file:
+            device_watts = bool(raw.get("device_watts", False))
+        else:
+            device_watts = bool(prev.get("device_watts", sport == "cycling"))
+
         entry = dict(prev)
         entry.update({
             "id": aid,
             "date": start_date,
             "name": raw.get("name") or prev.get("name") or "Workout",
             "sport": sport,
+            "device_watts": device_watts,
             "duration_min": dur_min,
             "distance_km": dist_km,
             "elevation_m": elev_m,
         })
-        if raw.get("average_watts") and not entry.get("avg_w"):
-            entry["avg_w"] = int(round(float(raw["average_watts"])))
-        if raw.get("weighted_average_watts") and not entry.get("np_w"):
-            entry["np_w"] = int(round(float(raw["weighted_average_watts"])))
+        valid_cycling_power = coach_engine.is_valid_cycling_power_activity(entry)
+        if valid_cycling_power:
+            if raw.get("average_watts") and not entry.get("avg_w"):
+                entry["avg_w"] = int(round(float(raw["average_watts"])))
+            if raw.get("weighted_average_watts") and not entry.get("np_w"):
+                entry["np_w"] = int(round(float(raw["weighted_average_watts"])))
+            if raw.get("kilojoules") and not entry.get("work_kj"):
+                entry["work_kj"] = int(round(float(raw["kilojoules"])))
+        else:
+            for stale_k in (
+                "avg_w", "np_w", "if", "tss", "work_kj", "work_kj_kg",
+                "peaks_fresh", "peaks_fatigued", "peaks_durability",
+                "w_bal_min_pct", "matches_burned", "kj_above_cp",
+                "decoupling_pct", "steady_decoupling_pct",
+                "avg_cadence", "avg_torque_nm", "peak_torque_nm", "f_opt_rpm", "quadrants",
+                "cho_burn_g", "fat_burn_g", "fueling_g_h",
+            ):
+                entry.pop(stale_k, None)
         if raw.get("average_heartrate") and not entry.get("avg_hr"):
             entry["avg_hr"] = int(round(float(raw["average_heartrate"])))
         if raw.get("max_heartrate") and not entry.get("max_hr"):
             entry["max_hr"] = int(round(float(raw["max_heartrate"])))
-        if raw.get("kilojoules") and not entry.get("work_kj"):
-            entry["work_kj"] = int(round(float(raw["kilojoules"])))
         if raw.get("average_temp") is not None and entry.get("temp_c") is None:
             entry["temp_c"] = round(float(raw["average_temp"]), 1)
             entry["thermal_drift"] = bool(entry["temp_c"] > 25.0)
@@ -2334,7 +2364,7 @@ def _coach_sync(root, brain, hk, days=90, mock_file=None, execute=True, quiet=Fa
             synced_streams_mem[aid] = streams
             m_calc = _compute_stream_metrics(
                 streams, ftp_watts=ftp_w, weight_kg=weight_kg, sport=sport,
-                cp_watts=init_cp, w_prime_j=init_wp_j,
+                cp_watts=init_cp, w_prime_j=init_wp_j, device_watts=device_watts,
             )
             entry.update(m_calc)
 
@@ -2377,7 +2407,7 @@ def _coach_sync(root, brain, hk, days=90, mock_file=None, execute=True, quiet=Fa
     if cp_sol["valid"] and synced_streams_mem:
         for a in all_acts:
             aid = str(a.get("id") or "")
-            if aid in synced_streams_mem and a.get("sport") == "cycling":
+            if aid in synced_streams_mem and coach_engine.is_valid_cycling_power_activity(a):
                 a.update(_compute_stream_metrics(
                     synced_streams_mem[aid],
                     ftp_watts=ftp_w,
@@ -2385,6 +2415,7 @@ def _coach_sync(root, brain, hk, days=90, mock_file=None, execute=True, quiet=Fa
                     sport="cycling",
                     cp_watts=eff_cp_final,
                     w_prime_j=eff_wp_final,
+                    device_watts=a.get("device_watts"),
                 ))
 
     for a in all_acts:
@@ -2723,7 +2754,8 @@ def _coach_context(
     if pend:
         say(f"  [!] PENDING RIDE CHECK-IN ({len(pend)} recent activity/ies without athlete feedback):")
         for p in pend[:3]:
-            say(f"      - {p.get('date')} '{p.get('name')}' ({p.get('duration_min', 0)}m, NP {p.get('np_w') or '—'}W): "
+            p_pwr = f", NP {p.get('np_w')}W" if (coach_engine.is_valid_cycling_power_activity(p) and p.get("np_w")) else ""
+            say(f"      - {p.get('date')} '{p.get('name')}' ({p.get('duration_min', 0)}m{p_pwr}): "
                 f"Ask 1 concise question how it felt (RPE/legs) and save via `atlas.py coach note --date {p.get('date')} --text \"...\"`")
 
     if depth == "pro":
@@ -3649,7 +3681,17 @@ def _core_apply(args, root, brain, src, plan, ups, values):
         result.setdefault("upgrades", []).extend(f"{v}: {a}" for a in acts)
         notes += [f"{v}: {x}" for x in n]
     try:
-        _coach_init(root, brain, hook_module(brain), execute=True, quiet=True, preserve_existing_profile=True)
+        hk_new = hook_module(brain)
+        _coach_init(root, brain, hk_new, execute=True, quiet=True, preserve_existing_profile=True)
+        act_json_p = os.path.join(brain, "coach", "activities.json")
+        if os.path.isfile(act_json_p):
+            raw_acts = load_json(act_json_p, [])
+            acts_list = raw_acts.get("activities", []) if isinstance(raw_acts, dict) else (raw_acts if isinstance(raw_acts, list) else [])
+            if acts_list:
+                ftp_w_u, w_kg_u = _extract_profile_numbers(brain, hk_new)
+                _rebuild_coach_markdown_files(brain, acts_list, ftp_watts=ftp_w_u, weight_kg=w_kg_u)
+        if os.path.isfile(os.path.join(atlas_dir, "cache", "calendar.html")):
+            hk_new.render_calendar_html(hk_new.load_index(), start_server=False)
     except Exception:
         pass
     # The new base is the upstream we just considered; unresolved conflicts keep their old base until accepted.

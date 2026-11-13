@@ -1,4 +1,4 @@
-"""Unit & loopback-HTTP tests for `cal_engine.py` and `core/templates/calendar.html` (`v1.1.0`)."""
+"""Unit & loopback-HTTP tests for `cal_engine.py` and `core/templates/calendar.html` (`v1.1.1`)."""
 import datetime as dt
 import json
 import os
@@ -352,6 +352,67 @@ class UiCalUnit(unittest.TestCase):
         wo_item = next(i for i in d_pro["items"] if i["kind"] == "workout")
         self.assertAlmostEqual(wo_item["w_bal_min_pct"], 18.4, places=1)
         self.assertEqual(wo_item["matches_burned"], 3)
+
+        # Case C (v1.1.1): Pure runner with wrist-watt Run + virtual-watt Ride + morning deadline + window overlap
+        _write_file(
+            os.path.join(self.brain, "calendar", "README.md"),
+            f"---\nsummary: Cal\ntags: [calendar]\n---\n# Cal\n\n## Timeline\n"
+            f"- [ ] {today} 10:00 [deadline] Werkstatt Angebot einholen: Motorölwechsel Touran\n"
+            f"- [ ] {today} 17:15 [event] Projekt-Sync im Trainingsfenster\n",
+        )
+        _write_file(
+            os.path.join(self.brain, "coach", "profile.md"),
+            "---\nsummary: Runner Profile\ntags: [self, sport]\ndepth: auto\n---\n# Profile\n\n"
+            "- **Primary Sport:** Running\n"
+            "- **Weight:** 71 kg\n"
+            "- **Training Window:** 16:00-19:30\n",
+        )
+        _write_file(
+            os.path.join(self.brain, "coach", "activities.json"),
+            json.dumps({
+                "updated": today,
+                "activities": [
+                    {
+                        "id": 1001,
+                        "date": today,
+                        "sport": "running",
+                        "device_watts": True,
+                        "duration_min": 42,
+                        "distance_km": 10.5,
+                        "avg_hr": 165,
+                        "peaks_fresh": {"5s": 602, "3m": 420, "5m": 400, "20m": 380},
+                        "best_paces": {
+                            "5km": {"sec_per_km": 230.0, "pace": "3:50/km"},
+                            "10km": {"sec_per_km": 238.0, "pace": "3:58/km"},
+                        },
+                    },
+                    {
+                        "id": 1002,
+                        "date": today,
+                        "sport": "cycling",
+                        "device_watts": False,
+                        "duration_min": 50,
+                        "peaks_fresh": {"5m": 305, "20m": 265},
+                    },
+                ],
+            }),
+        )
+        hk.render_calendar_html(start_server=False)
+        with open(hk.CAL_HTML, encoding="utf-8") as fh:
+            html_runner = fh.read()
+        self.assertIn("let graphShowJournals = false;", html_runner)
+        self.assertIn("📓 Logs", html_runner)
+        d_runner = json.loads(next(ln for ln in html_runner.splitlines() if ln.startswith("let DATA = "))[11:-1])
+        self.assertEqual(d_runner["coach"]["depth"], "pro")
+        r_tel = d_runner["coach"]["telemetry"]
+        self.assertEqual(r_tel["readiness"]["status"], "GREEN")
+        self.assertEqual(r_tel["readiness"]["reasons"], [])
+        self.assertEqual(len(r_tel["readiness"]["schedule_conflicts"]), 1)
+        self.assertIn("17:15 Projekt-Sync", r_tel["readiness"]["schedule_conflicts"][0])
+        self.assertFalse(r_tel["cp_model"]["valid"])
+        self.assertIsNone(r_tel["metabolic"]["fatmax_watts"])
+        self.assertTrue(r_tel["cs_model"]["valid"])
+        self.assertGreater(r_tel["metabolic"]["vo2max_est"], 50.0)
 
 
 if __name__ == "__main__":

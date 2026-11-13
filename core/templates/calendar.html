@@ -342,10 +342,12 @@ let pcurveTab = "epochs"; // 'epochs' | 'durability'
 
 // Brain Graph state
 let graphDomainFilter = "all"; // 'all'|'people'|'areas'|'projects'|'howto'|'isolated'|'stale'
-let graphShowHubs = false;
+let graphShowHubs = sessionStorage.getItem("atlas_graph_hubs") === "1";
+let graphShowJournals = false;
+if(sessionStorage.getItem("atlas_graph_journals") === "1") graphShowJournals = true;
 let graphSelectedRel = null;
 let graphHoverRel = null;
-let graphSim = { nodes: [], edges: [], byRel: {}, camX: 0, camY: 0, scale: 1, ticks: 0, raf: 0, key: "", dragNode: null, panning: false, lastX: 0, lastY: 0, moved: false };
+let graphSim = { nodes: [], edges: [], byRel: {}, camX: 0, camY: 0, scale: 1, ticks: 0, raf: 0, key: "", dragNode: null, panning: false, lastX: 0, lastY: 0, moved: false, autoFit: true };
 let _toastTimer = null;
 
 function showToast(msg, kind='ok'){
@@ -385,7 +387,7 @@ function coachMode(){
   const d = String(c.depth || 'standard').toLowerCase();
   if(d === 'simple') return 'simple';
   const tel = c.telemetry || {};
-  if(d === 'pro' || (tel.cp_model && tel.cp_model.valid) || (tel.pmc && (tel.pmc.ctl > 0 || tel.pmc.weekly_load_7d > 0))) return 'pro';
+  if(d === 'pro' || (tel.cp_model && tel.cp_model.valid) || (tel.cs_model && tel.cs_model.valid) || (tel.pmc && (tel.pmc.ctl > 0 || tel.pmc.weekly_load_7d > 0))) return 'pro';
   return 'standard';
 }
 function isCoachItem(it){
@@ -730,12 +732,13 @@ function renderCoachRibbon(coach){
   if(csM.valid && csM.cs_pace_fmt){
     proChips += `<div class="phys-chip pro-hi"><span>🏃</span><span class="k">CS / D':</span><strong class="v">${esc(csM.cs_pace_fmt)}${csM.d_prime_m?' · '+csM.d_prime_m+'m':''}</strong></div>`;
   }
-  if(met.vo2max_storer || met.vo2max_uth){
-    const vVal = met.vo2max_storer || met.vo2max_uth;
-    proChips += `<div class="phys-chip"><span>🫁</span><span class="k">VO₂max (est.):</span><strong class="v">${vVal} ml/kg</strong></div>`;
+  const vVal = met.vo2max_est || met.vo2max_storer || met.vo2max_vdot || met.vo2max_uth;
+  if(vVal){
+    proChips += `<div class="phys-chip"><span>🫁</span><span class="k">VO₂max (est.):</span><strong class="v">${esc(vVal)} ml/kg</strong></div>`;
   }
-  if(met.fatmax_watts){
-    proChips += `<div class="phys-chip"><span>🔥</span><span class="k">FatMax / LT1:</span><strong class="v">${met.fatmax_watts} W</strong></div>`;
+  if(met.fatmax_watts && (!Array.isArray(met.fatmax_watts) || met.fatmax_watts.length >= 2)){
+    const fmTxt = Array.isArray(met.fatmax_watts) ? `${met.fatmax_watts[0]}–${met.fatmax_watts[1]} W` : `${met.fatmax_watts} W`;
+    proChips += `<div class="phys-chip"><span>🔥</span><span class="k">FatMax / LT1:</span><strong class="v">${esc(fmTxt)}</strong></div>`;
   }
   if(met.glycolytic_band){
     proChips += `<div class="phys-chip"><span>🧪</span><span class="k">Glykolytisch:</span><strong class="v">${esc(met.glycolytic_band)}</strong></div>`;
@@ -759,8 +762,17 @@ function renderCoachRibbon(coach){
     </div>
   ` : '';
 
+  const rawConflicts = rdy.schedule_conflicts || [];
+  const rawConflictSet = new Set(rawConflicts);
+  const schedConflicts = rawConflicts
+    .map(s => String(s || '').replace(/^🕒\s*(?:Training-window overlap today:\s*|Termin im Trainingsfenster:\s*)?/i, '').trim())
+    .filter(Boolean);
+  const schedConflictHtml = schedConflicts.length
+    ? `<div class="guardrail-bar" style="background:rgba(56,189,248,0.11);border-color:rgba(56,189,248,0.32);color:#bae6fd">🕒 <strong>Termin im Trainingsfenster:</strong> ${esc(schedConflicts.join(' · '))}</div>`
+    : '';
+
   const guards = []
-    .concat(rdy.guardrails || [])
+    .concat((rdy.guardrails || []).filter(g => !rawConflictSet.has(g) && !/^🕒\s*Training-window overlap/i.test(String(g))))
     .concat(pmc.warnings || [])
     .concat(rdy.taper && rdy.taper.recommendation ? [rdy.taper.recommendation] : []);
   const guardHtml = guards.length ? `<div class="guardrail-bar">🛡️ <strong>Coach Guardrail:</strong> ${esc(guards[0])}</div>` : '';
@@ -785,6 +797,7 @@ function renderCoachRibbon(coach){
       </div>
     </div>
     ${pmcHtml}
+    ${schedConflictHtml}
     ${guardHtml}
     <div class="phys-chips">${proChips}${baseChips || (!proChips ? '<div class="phys-chip"><span class="k">Tipp:</span><strong class="v">Leistungsdaten in coach/profile.md hinterlegen</strong></div>' : '')}</div>
   `;
@@ -946,32 +959,86 @@ function renderKPIs(){
 }
 
 /* ---------------- Interactive Brain Graph Engine (Canvas 2D) ---------------- */
+const GRAPH_COOLING_TICKS = 260;
+
 function setGraphDomain(dom){
   graphDomainFilter = dom;
   graphSim.key = '';
+  graphSim.autoFit = true;
   renderGraphMain();
   renderSidebar();
 }
 function toggleGraphHubs(){
   graphShowHubs = !graphShowHubs;
+  try { sessionStorage.setItem("atlas_graph_hubs", graphShowHubs ? "1" : "0"); } catch(_e){}
   graphSim.key = '';
+  graphSim.autoFit = true;
+  renderGraphMain();
+  renderSidebar();
+}
+function toggleGraphJournals(){
+  graphShowJournals = !graphShowJournals;
+  try { sessionStorage.setItem("atlas_graph_journals", graphShowJournals ? "1" : "0"); } catch(_e){}
+  graphSim.key = '';
+  graphSim.autoFit = true;
+  renderKPIs();
   renderGraphMain();
   renderSidebar();
 }
 function zoomGraph(factor){
-  graphSim.scale = Math.min(4.0, Math.max(0.28, graphSim.scale * factor));
+  graphSim.autoFit = false;
+  graphSim.scale = Math.min(4.0, Math.max(0.18, graphSim.scale * factor));
   drawGraphFrame();
 }
+function fitGraphToViewport(padding = 60){
+  const canvas = document.getElementById('graph-canvas');
+  const nodes = graphSim.nodes;
+  if(!canvas || !nodes.length){
+    graphSim.camX = 0;
+    graphSim.camY = 0;
+    graphSim.scale = 1;
+    return;
+  }
+  const rect = canvas.getBoundingClientRect();
+  const w = Math.max(320, rect.width || 900);
+  const h = Math.max(300, rect.height || 640);
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for(const n of nodes){
+    const m = n.r + 18;
+    if(n.x - m < minX) minX = n.x - m;
+    if(n.x + m > maxX) maxX = n.x + m;
+    if(n.y - m < minY) minY = n.y - m;
+    if(n.y + m > maxY) maxY = n.y + m;
+  }
+  const spanX = Math.max(140, maxX - minX);
+  const spanY = Math.max(140, maxY - minY);
+  const availW = Math.max(160, w - padding * 2);
+  const availH = Math.max(160, h - padding * 2 - 36);
+  const fitScale = Math.min(availW / spanX, availH / spanY);
+  graphSim.scale = Math.min(1.6, Math.max(0.18, fitScale));
+  const midX = (minX + maxX) / 2;
+  const midY = (minY + maxY) / 2;
+  graphSim.camX = -midX * graphSim.scale;
+  graphSim.camY = -midY * graphSim.scale + 8;
+}
 function resetGraphCamera(){
-  graphSim.camX = 0;
-  graphSim.camY = 0;
-  graphSim.scale = 1;
-  graphSim.ticks = 0;
-  startGraphLoop();
+  graphSim.autoFit = true;
+  fitGraphToViewport(60);
+  drawGraphFrame();
 }
 function selectGraphNode(rel, center=false){
+  if(rel){
+    const g = DATA.graph || {nodes:[]};
+    const targetNode = g.nodes.find(n => n.rel === rel);
+    if(targetNode && ((targetNode.domain === 'journal' && !graphShowJournals) || (targetNode.is_hub && !graphShowHubs)) && !graphSim.byRel[rel]){
+      graphSelectedRel = rel;
+      graphSim.key = '';
+      rebuildGraphSimulation();
+    }
+  }
   graphSelectedRel = rel;
   if(center && rel && graphSim.byRel[rel]){
+    graphSim.autoFit = false;
     graphSim.camX = -graphSim.byRel[rel].x * graphSim.scale;
     graphSim.camY = -graphSim.byRel[rel].y * graphSim.scale;
   }
@@ -983,6 +1050,7 @@ function filteredGraphData(){
   const g = DATA.graph || {nodes:[], edges:[]};
   const q = query.toLowerCase();
   const nodes = g.nodes.filter(n => {
+    if(!graphShowJournals && n.domain === 'journal' && n.rel !== graphSelectedRel) return false;
     if(!graphShowHubs && n.is_hub && n.rel !== graphSelectedRel){
       if(graphDomainFilter !== 'all' || g.nodes.length > 8) return false;
     }
@@ -998,6 +1066,7 @@ function filteredGraphData(){
   const keep = new Set(nodes.map(n => n.rel));
   const edges = g.edges.filter(e => {
     if(!keep.has(e.src) || !keep.has(e.dst)) return false;
+    if(!graphShowJournals && e.kind === 'journal') return false;
     if(!graphShowHubs && e.kind === 'tree') return false;
     return true;
   });
@@ -1006,23 +1075,38 @@ function filteredGraphData(){
 
 function rebuildGraphSimulation(){
   const {nodes, edges} = filteredGraphData();
-  const sig = `${graphDomainFilter}|${graphShowHubs}|${query}|${nodes.length}|${edges.length}`;
+  const sig = `${graphDomainFilter}|${graphShowHubs}|${graphShowJournals}|${query}|${nodes.length}|${edges.length}`;
   if(graphSim.key === sig && graphSim.nodes.length === nodes.length) return;
   const oldPos = graphSim.byRel || {};
-  const domOrder = ['self','people','areas','projects','howto','coach','calendar','journal','root','other'];
+  const domOrder = ['self','people','areas','projects','howto','coach','calendar','journal','inbox','skills','root','other'];
+  const presentDoms = domOrder.filter(d => nodes.some(n => n.domain === d));
+  if(!presentDoms.length) presentDoms.push('other');
+  const N = Math.max(1, nodes.length);
+  const clusterRadius = presentDoms.length <= 1 ? 0 : Math.max(160, Math.sqrt(N) * 32);
+  const domAnchors = {};
+  presentDoms.forEach((d, i) => {
+    const ang = (i / presentDoms.length) * Math.PI * 2 - Math.PI / 2;
+    domAnchors[d] = {
+      x: Math.cos(ang) * clusterRadius,
+      y: Math.sin(ang) * clusterRadius
+    };
+  });
+
   const simNodes = nodes.map((n, idx) => {
     const prev = oldPos[n.rel];
-    const dIdx = Math.max(0, domOrder.indexOf(n.domain));
-    const baseAngle = (dIdx / domOrder.length) * Math.PI * 2 + (idx * 0.61803398875) % 0.9;
-    const ring = 70 + Math.sqrt(idx + 1) * 34;
+    const anc = domAnchors[n.domain] || {x: 0, y: 0};
+    const localAngle = idx * 2.399963229728653; // golden angle
+    const localSpread = 28 + Math.sqrt(idx + 1) * 26;
     const deg = n.degree || 0;
-    const radius = Math.min(18, Math.max(6.5, 6.5 + Math.log2(deg + 1) * 2.8));
+    const radius = Math.min(14.5, Math.max(5.5, 5.5 + Math.log2(deg + 1) * 2.1));
     return {
       data: n,
       rel: n.rel,
       r: radius,
-      x: prev ? prev.x : Math.cos(baseAngle) * ring,
-      y: prev ? prev.y : Math.sin(baseAngle) * ring,
+      ax: anc.x,
+      ay: anc.y,
+      x: prev ? prev.x : anc.x + Math.cos(localAngle) * localSpread,
+      y: prev ? prev.y : anc.y + Math.sin(localAngle) * localSpread,
       vx: 0, vy: 0
     };
   });
@@ -1040,26 +1124,35 @@ function rebuildGraphSimulation(){
   graphSim.byRel = byRel;
   graphSim.key = sig;
   graphSim.ticks = 0;
+  graphSim.autoFit = true;
+
+  // Pre-warm ~200 cooling ticks synchronously (~3ms) so initial render is immediately airy & untangled
+  const preWarm = Math.min(200, GRAPH_COOLING_TICKS - 60);
+  for(let t = 0; t < preWarm; t++){
+    const alpha = Math.max(0.06, 1 - t / GRAPH_COOLING_TICKS);
+    stepGraphPhysics(alpha);
+    graphSim.ticks++;
+  }
 }
 
-function stepGraphPhysics(){
+function stepGraphPhysics(alpha = 1){
   const nodes = graphSim.nodes;
   const edges = graphSim.edges;
   const N = nodes.length;
   if(N <= 1) return;
 
-  const repulse = N > 120 ? 1500 : 2200;
-  for(let i=0;i<N;i++){
+  const repulse = N > 150 ? 6800 : 8800;
+  for(let i = 0; i < N; i++){
     const a = nodes[i];
-    for(let j=i+1;j<N;j++){
+    for(let j = i + 1; j < N; j++){
       const b = nodes[j];
       let dx = b.x - a.x, dy = b.y - a.y;
-      let d2 = dx*dx + dy*dy;
-      if(d2 < 4) { dx = (i%2?1:-1)*2; dy = (j%2?1:-1)*2; d2 = 8; }
-      if(d2 > 180000) continue;
+      let d2 = dx * dx + dy * dy;
+      if(d2 < 4){ dx = (i % 2 ? 1 : -1) * 2; dy = (j % 2 ? 1 : -1) * 2; d2 = 8; }
+      if(d2 > 520000) continue;
       const d = Math.sqrt(d2);
-      const sameDom = a.data.domain === b.data.domain ? 0.78 : 1.0;
-      const f = (repulse * sameDom) / d2;
+      const sameDom = a.data.domain === b.data.domain ? 0.82 : 1.05;
+      const f = ((repulse * sameDom) / d2) * alpha;
       const fx = (dx / d) * f, fy = (dy / d) * f;
       if(a !== graphSim.dragNode){ a.vx -= fx; a.vy -= fy; }
       if(b !== graphSim.dragNode){ b.vx += fx; b.vy += fy; }
@@ -1069,9 +1162,9 @@ function stepGraphPhysics(){
   for(const e of edges){
     const a = e.src, b = e.dst;
     const dx = b.x - a.x, dy = b.y - a.y;
-    const d = Math.sqrt(dx*dx + dy*dy) || 1;
-    const targetLen = e.kind === 'related' ? 88 : (e.kind === 'body' ? 105 : 130);
-    const k = e.kind === 'related' ? 0.045 : (e.kind === 'body' ? 0.032 : 0.018);
+    const d = Math.sqrt(dx * dx + dy * dy) || 1;
+    const targetLen = e.kind === 'related' ? 145 : (e.kind === 'body' ? 170 : (e.kind === 'journal' ? 195 : 160));
+    const k = (e.kind === 'related' ? 0.038 : (e.kind === 'body' ? 0.026 : 0.016)) * alpha;
     const f = (d - targetLen) * k;
     const fx = (dx / d) * f, fy = (dy / d) * f;
     if(a !== graphSim.dragNode){ a.vx += fx; a.vy += fy; }
@@ -1080,14 +1173,71 @@ function stepGraphPhysics(){
 
   for(const n of nodes){
     if(n === graphSim.dragNode) continue;
-    n.vx -= n.x * 0.0085;
-    n.vy -= n.y * 0.0085;
-    n.vx *= 0.78;
-    n.vy *= 0.78;
-    const stepLim = 14;
+    // Gentle domain-sector ring pull + very soft global centering
+    n.vx += ((n.ax || 0) - n.x) * 0.0065 * alpha;
+    n.vy += ((n.ay || 0) - n.y) * 0.0065 * alpha;
+    n.vx -= n.x * 0.0018 * alpha;
+    n.vy -= n.y * 0.0018 * alpha;
+    n.vx *= 0.76;
+    n.vy *= 0.76;
+    const stepLim = 18;
     n.x += Math.max(-stepLim, Math.min(stepLim, n.vx));
     n.y += Math.max(-stepLim, Math.min(stepLim, n.vy));
   }
+
+  // Hard circle-collision separation pass so nodes NEVER overlap or clump
+  for(let pass = 0; pass < 2; pass++){
+    for(let i = 0; i < N; i++){
+      const a = nodes[i];
+      for(let j = i + 1; j < N; j++){
+        const b = nodes[j];
+        let dx = b.x - a.x, dy = b.y - a.y;
+        let d2 = dx * dx + dy * dy;
+        const minDist = a.r + b.r + 22;
+        if(d2 < minDist * minDist){
+          if(d2 < 0.01){
+            const ang = ((i * 7 + j * 13) % 360) * (Math.PI / 180);
+            dx = Math.cos(ang);
+            dy = Math.sin(ang);
+            d2 = 1;
+          }
+          const d = Math.sqrt(d2);
+          const overlap = (minDist - d) * 0.5;
+          const ux = dx / d, uy = dy / d;
+          if(a === graphSim.dragNode){
+            b.x += ux * overlap * 2;
+            b.y += uy * overlap * 2;
+          } else if(b === graphSim.dragNode){
+            a.x -= ux * overlap * 2;
+            a.y -= uy * overlap * 2;
+          } else {
+            a.x -= ux * overlap;
+            a.y -= uy * overlap;
+          }
+        }
+      }
+    }
+  }
+}
+
+function _rectsIntersect(a, b){
+  return !(a.x2 <= b.x1 || a.x1 >= b.x2 || a.y2 <= b.y1 || a.y1 >= b.y2);
+}
+
+function _fillRoundedPill(ctx, x, y, w, h, r){
+  const rad = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + rad, y);
+  ctx.lineTo(x + w - rad, y);
+  ctx.quadraticCurveTo(x + w, y, x + w, y + rad);
+  ctx.lineTo(x + w, y + h - rad);
+  ctx.quadraticCurveTo(x + w, y + h, x + w - rad, y + h);
+  ctx.lineTo(x + rad, y + h);
+  ctx.quadraticCurveTo(x, y + h, x, y + h - rad);
+  ctx.lineTo(x, y + rad);
+  ctx.quadraticCurveTo(x, y, x + rad, y);
+  ctx.closePath();
+  ctx.fill();
 }
 
 function drawGraphFrame(){
@@ -1108,8 +1258,11 @@ function drawGraphFrame(){
 
   const cx = w / 2 + graphSim.camX;
   const cy = h / 2 + graphSim.camY;
+  const scale = graphSim.scale;
+
+  ctx.save();
   ctx.translate(cx, cy);
-  ctx.scale(graphSim.scale, graphSim.scale);
+  ctx.scale(scale, scale);
 
   const focusRel = graphHoverRel || graphSelectedRel;
   const focusNeighbors = new Set();
@@ -1121,7 +1274,7 @@ function drawGraphFrame(){
     }
   }
 
-  // Draw edges
+  // 1. Draw edges (world space)
   for(const e of graphSim.edges){
     const active = focusRel && (e.src.rel === focusRel || e.dst.rel === focusRel);
     const dim = focusRel && !active;
@@ -1129,17 +1282,17 @@ function drawGraphFrame(){
     if(e.kind === 'journal') ctx.setLineDash([4, 4]);
     else if(e.kind === 'tree') ctx.setLineDash([2, 4]);
     else ctx.setLineDash([]);
-    ctx.lineWidth = active ? 2.0 : (e.kind === 'related' ? 1.45 : 1.0);
+    ctx.lineWidth = (active ? 2.0 : (e.kind === 'related' ? 1.35 : 0.95)) / Math.pow(scale, 0.35);
     ctx.strokeStyle = active
       ? 'rgba(56,189,248,0.88)'
-      : (dim ? 'rgba(148,163,184,0.08)' : (e.kind === 'related' ? 'rgba(56,189,248,0.38)' : 'rgba(148,163,184,0.24)'));
+      : (dim ? 'rgba(148,163,184,0.06)' : (e.kind === 'related' ? 'rgba(56,189,248,0.32)' : 'rgba(148,163,184,0.20)'));
     ctx.moveTo(e.src.x, e.src.y);
     ctx.lineTo(e.dst.x, e.dst.y);
     ctx.stroke();
   }
   ctx.setLineDash([]);
 
-  // Draw nodes
+  // 2. Draw node circles & warning rings (world space)
   for(const n of graphSim.nodes){
     const d = n.data;
     const isSel = n.rel === graphSelectedRel;
@@ -1151,14 +1304,14 @@ function drawGraphFrame(){
     if(d.broken_links && d.broken_links.length){
       ctx.beginPath();
       ctx.arc(n.x, n.y, n.r + 4.5, 0, Math.PI*2);
-      ctx.strokeStyle = dim ? 'rgba(244,63,94,0.3)' : '#f43f5e';
+      ctx.strokeStyle = dim ? 'rgba(244,63,94,0.25)' : '#f43f5e';
       ctx.lineWidth = 2;
       ctx.stroke();
     } else if(d.stale_verified || d.expired_valid_until){
       ctx.beginPath();
       ctx.setLineDash([3.5, 2.5]);
       ctx.arc(n.x, n.y, n.r + 4.2, 0, Math.PI*2);
-      ctx.strokeStyle = dim ? 'rgba(245,158,11,0.3)' : '#f59e0b';
+      ctx.strokeStyle = dim ? 'rgba(245,158,11,0.25)' : '#f59e0b';
       ctx.lineWidth = 1.8;
       ctx.stroke();
       ctx.setLineDash([]);
@@ -1166,7 +1319,7 @@ function drawGraphFrame(){
       ctx.beginPath();
       ctx.setLineDash([2, 3]);
       ctx.arc(n.x, n.y, n.r + 3.8, 0, Math.PI*2);
-      ctx.strokeStyle = dim ? 'rgba(56,189,248,0.2)' : 'rgba(56,189,248,0.65)';
+      ctx.strokeStyle = dim ? 'rgba(56,189,248,0.18)' : 'rgba(56,189,248,0.65)';
       ctx.lineWidth = 1.3;
       ctx.stroke();
       ctx.setLineDash([]);
@@ -1175,28 +1328,110 @@ function drawGraphFrame(){
     if(isSel || isHov){
       ctx.beginPath();
       ctx.arc(n.x, n.y, n.r + 7, 0, Math.PI*2);
-      ctx.fillStyle = 'rgba(56,189,248,0.22)';
+      ctx.fillStyle = 'rgba(56,189,248,0.24)';
       ctx.fill();
     }
 
     ctx.beginPath();
     ctx.arc(n.x, n.y, n.r, 0, Math.PI*2);
     ctx.fillStyle = col;
-    ctx.globalAlpha = dim ? 0.22 : 0.94;
+    ctx.globalAlpha = dim ? 0.20 : 0.94;
     ctx.fill();
     ctx.lineWidth = isSel ? 2.4 : 1.2;
     ctx.strokeStyle = isSel ? '#ffffff' : 'rgba(15,23,42,0.9)';
     ctx.stroke();
     ctx.globalAlpha = 1;
-
-    if(graphSim.scale >= 0.62 || isSel || isHov || n.r >= 10.5){
-      ctx.font = `${isSel||isHov?'700':'500'} ${Math.max(9.5, 11 / Math.pow(graphSim.scale, 0.25)).toFixed(1)}px Inter, sans-serif`;
-      ctx.textAlign = 'center';
-      ctx.fillStyle = dim ? 'rgba(203,213,225,0.22)' : (isSel ? '#ffffff' : '#dbeafe');
-      const lbl = d.title.length > 26 ? d.title.slice(0, 24) + '…' : d.title;
-      ctx.fillText(lbl, n.x, n.y + n.r + 12);
-    }
   }
+  ctx.restore(); // back to screen CSS-pixel space
+
+  // 3. Priority Bounding-Box Anti-Overlap Label Culling (screen space)
+  const placedRects = [];
+  const labelCandidates = [];
+
+  for(const n of graphSim.nodes){
+    const isSel = n.rel === graphSelectedRel;
+    const isHov = n.rel === graphHoverRel;
+    const dim = focusRel && !focusNeighbors.has(n.rel);
+    const sx = cx + n.x * scale;
+    const sy = cy + n.y * scale;
+    const sr = Math.max(3, n.r * scale);
+
+    // Seed placedRects with visible bright circles so labels never sit on top of other circles
+    if(!dim && sx >= -sr && sx <= w + sr && sy >= -sr && sy <= h + sr){
+      placedRects.push({
+        x1: sx - sr - 2,
+        y1: sy - sr - 2,
+        x2: sx + sr + 2,
+        y2: sy + sr + 2,
+        circleOwner: n.rel
+      });
+    }
+
+    if(dim && !isSel && !isHov) continue;
+    if(!isSel && !isHov && (sx < -60 || sx > w + 60 || sy < -30 || sy > h + 30)) continue;
+
+    const isFocusNbr = Boolean(focusRel && focusNeighbors.has(n.rel) && !isSel && !isHov);
+    const prio = (isSel || isHov) ? 0 : (isFocusNbr ? 1 : 2);
+    labelCandidates.push({ n, sx, sy, sr, isSel, isHov, isFocusNbr, prio });
+  }
+
+  labelCandidates.sort((a, b) =>
+    (a.prio - b.prio) ||
+    ((b.n.data.degree || 0) - (a.n.data.degree || 0)) ||
+    ((b.n.data.in_degree || 0) - (a.n.data.in_degree || 0)) ||
+    a.n.rel.localeCompare(b.n.rel)
+  );
+
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  const padX = 8, padY = 4;
+
+  for(const cand of labelCandidates){
+    const { n, sx, sy, sr, isSel, isHov, isFocusNbr } = cand;
+    const d = n.data;
+    const maxChars = (isSel || isHov) ? 38 : 26;
+    const lbl = d.title.length > maxChars ? d.title.slice(0, maxChars - 1) + '…' : d.title;
+    const fontPx = (isSel || isHov) ? 11.5 : (isFocusNbr ? 10.8 : 10.2);
+    ctx.font = `${(isSel || isHov) ? '700' : (isFocusNbr ? '600' : '500')} ${fontPx}px Inter, -apple-system, sans-serif`;
+    const tw = ctx.measureText(lbl).width;
+
+    const pillW = tw + 11;
+    const pillH = fontPx + 6;
+    const pillX = sx - pillW / 2;
+    const pillY = sy + sr + 4;
+
+    const box = {
+      x1: sx - tw / 2 - padX,
+      y1: pillY - padY + 2,
+      x2: sx + tw / 2 + padX,
+      y2: pillY + pillH + padY - 2
+    };
+
+    if(!isSel && !isHov){
+      let collides = false;
+      for(let i = 0; i < placedRects.length; i++){
+        const pr = placedRects[i];
+        if(pr.circleOwner === n.rel) continue;
+        if(_rectsIntersect(box, pr)){
+          collides = true;
+          break;
+        }
+      }
+      if(collides) continue;
+    }
+
+    placedRects.push(box);
+    ctx.fillStyle = (isSel || isHov) ? 'rgba(15,23,42,0.92)' : 'rgba(15,23,42,0.82)';
+    _fillRoundedPill(ctx, pillX, pillY, pillW, pillH, 5);
+    if(isSel || isHov){
+      ctx.strokeStyle = 'rgba(56,189,248,0.55)';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+    ctx.fillStyle = (isSel || isHov) ? '#ffffff' : (isFocusNbr ? '#f1f5f9' : '#dbeafe');
+    ctx.fillText(lbl, sx, pillY + pillH / 2 + 0.5);
+  }
+
   ctx.restore();
 }
 
@@ -1204,12 +1439,20 @@ function startGraphLoop(){
   if(graphSim.raf) cancelAnimationFrame(graphSim.raf);
   const tick = () => {
     if(filter !== 'graph') return;
-    if(graphSim.ticks < 145 || graphSim.dragNode){
-      stepGraphPhysics();
+    if(graphSim.ticks < GRAPH_COOLING_TICKS || graphSim.dragNode){
+      const alpha = graphSim.dragNode ? 0.28 : Math.max(0.06, 1 - graphSim.ticks / GRAPH_COOLING_TICKS);
+      stepGraphPhysics(alpha);
       graphSim.ticks++;
+      if(graphSim.autoFit && !graphSim.dragNode && !graphSim.panning && (graphSim.ticks % 20 === 0 || graphSim.ticks === GRAPH_COOLING_TICKS)){
+        fitGraphToViewport(60);
+      }
       drawGraphFrame();
       graphSim.raf = requestAnimationFrame(tick);
     } else {
+      if(graphSim.autoFit && !graphSim.dragNode && !graphSim.panning){
+        fitGraphToViewport(60);
+        graphSim.autoFit = false;
+      }
       drawGraphFrame();
       graphSim.raf = 0;
     }
@@ -1244,6 +1487,7 @@ function bindGraphEvents(){
     graphSim.lastX = e.clientX;
     graphSim.lastY = e.clientY;
     graphSim.moved = false;
+    graphSim.autoFit = false;
     if(hit){
       graphSim.dragNode = hit;
       startGraphLoop();
@@ -1264,7 +1508,7 @@ function bindGraphEvents(){
     if(graphSim.dragNode){
       graphSim.dragNode.x += dx / graphSim.scale;
       graphSim.dragNode.y += dy / graphSim.scale;
-      graphSim.ticks = Math.min(graphSim.ticks, 110);
+      graphSim.ticks = Math.min(graphSim.ticks, GRAPH_COOLING_TICKS - 45);
       drawGraphFrame();
       return;
     }
@@ -1317,11 +1561,12 @@ function bindGraphEvents(){
 
   canvas.onwheel = e => {
     e.preventDefault();
+    graphSim.autoFit = false;
     const rect = canvas.getBoundingClientRect();
     const mx = e.clientX - rect.left - rect.width / 2;
     const my = e.clientY - rect.top - rect.height / 2;
     const factor = e.deltaY < 0 ? 1.13 : 0.88;
-    const nextScale = Math.min(4.0, Math.max(0.28, graphSim.scale * factor));
+    const nextScale = Math.min(4.0, Math.max(0.18, graphSim.scale * factor));
     const ratio = nextScale / graphSim.scale;
     graphSim.camX = mx - (mx - graphSim.camX) * ratio;
     graphSim.camY = my - (my - graphSim.camY) * ratio;
@@ -1342,7 +1587,8 @@ function renderGraphMain(){
       <div class="graph-overlay-top">
         <div class="graph-pills">
           ${pills.map(([k,lbl])=>`<button class="g-pill ${graphDomainFilter===k?'active':''}" onclick="setGraphDomain('${k}')">${lbl}</button>`).join('')}
-          <button class="g-pill ${graphShowHubs?'active':''}" onclick="toggleGraphHubs()" title="Ordner-READMEs &amp; Baumkanten einblenden">📁 Hubs</button>
+          <button class="g-pill ${graphShowHubs?'active':''}" onclick="toggleGraphHubs()" title="Ordner-READMEs &amp; Baumkanten einblenden">🧭 Hubs</button>
+          <button class="g-pill ${graphShowJournals?'active':''}" onclick="toggleGraphJournals()" title="Tages-Logs (journal/) ein-/ausblenden">📓 Logs</button>
         </div>
         <div class="graph-zoom">
           <button class="g-pill" onclick="zoomGraph(1.2)" title="Vergrößern">+</button>
@@ -1363,6 +1609,7 @@ function renderGraphMain(){
       </div>
     </div>
   `;
+  if(graphSim.autoFit) fitGraphToViewport(60);
   bindGraphEvents();
   startGraphLoop();
 }
@@ -1548,7 +1795,7 @@ function renderGraphSidebar(){
       </div>
     `).join('');
 
-    s2T.textContent = '🏝️ Orphans &amp; Faktencheck-Radar';
+    s2T.textContent = '🏝️ Orphans & Faktencheck-Radar';
     s2C.textContent = attention.length;
     s2L.innerHTML = attention.length ? attention.map(n => {
       const badge = (n.broken_links&&n.broken_links.length) ? `<span class="tag high">Broken (${n.broken_links.length})</span>`
@@ -1606,7 +1853,7 @@ function renderGraphSidebar(){
   // Card 2: Backlinks & Outlinks
   const backs = node.backlinks || [];
   const outs = node.outlinks || [];
-  s2T.textContent = '⇄ Backlinks &amp; Outlinks';
+  s2T.textContent = '⇄ Backlinks & Outlinks';
   s2C.textContent = `${backs.length}↙ · ${outs.length}↗`;
   let linksHtml = '';
   if(backs.length){
@@ -1664,7 +1911,7 @@ function renderSidebar(){
     const mode = coachMode();
     const datedGoals = DATA.items.map((it,idx)=>({it,idx})).filter(x => x.it.kind==='goal' && x.it.delta>=0 && x.it.status==='open');
     const macros = coach.macro_goals || [];
-    s1T.textContent = mode==='simple' ? '🎯 Ziele &amp; Bewegungsvorsätze' : '🏆 Saisonziele &amp; Athletik-Fokus';
+    s1T.textContent = mode==='simple' ? '🎯 Ziele & Bewegungsvorsätze' : '🏆 Saisonziele & Athletik-Fokus';
     s1C.textContent = datedGoals.length + macros.length;
     let gHtml = datedGoals.map(({it,idx}) => `
       <div class="row" onclick="showItemModal(${idx})">
@@ -1773,7 +2020,7 @@ function renderSidebar(){
     `).join('') : `<div class="empty-box">Keine offenen Backlog-To-Dos.</div>`;
 
     const d90 = DATA.items.map((it,idx)=>({it,idx})).filter(x => isTodoItem(x.it) && x.it.delta>=-7 && x.it.delta<=90 && x.it.status==='open');
-    s2T.textContent = '⏳ Fristen &amp; Stichtage (90 Tage)';
+    s2T.textContent = '⏳ Fristen & Stichtage (90 Tage)';
     s2C.textContent = d90.length;
     s2L.innerHTML = d90.length ? d90.map(({it,idx}) => `
       <div class="row" onclick="showItemModal(${idx})">
@@ -1787,7 +2034,7 @@ function renderSidebar(){
     `).join('') : `<div class="empty-box">Keine Fristen in den nächsten 90 Tagen.</div>`;
 
     const dLong = DATA.items.map((it,idx)=>({it,idx})).filter(x => isTodoItem(x.it) && x.it.delta>90 && x.it.status==='open');
-    s3T.textContent = '📆 Langfristige Stichtage (&gt; 90d)';
+    s3T.textContent = '📆 Langfristige Stichtage (> 90d)';
     s3C.textContent = dLong.length;
     s3L.innerHTML = dLong.length ? dLong.map(({it,idx}) => `
       <div class="row" onclick="showItemModal(${idx})">
@@ -1813,7 +2060,7 @@ function renderSidebar(){
       </div>
     `).join('') : `<div class="empty-box">Keine Einträge in den nächsten 30 Tagen.</div>`;
 
-    s2T.textContent = '☑️ Offene To-Dos &amp; Checklisten';
+    s2T.textContent = '☑️ Offene To-Dos & Checklisten';
     s2C.textContent = DATA.todos.length;
     s2L.innerHTML = DATA.todos.length ? DATA.todos.map((t, tIdx) => `
       <div class="row ${t.status==='done'?'is-done':''}" onclick="${t.can_toggle ? `toggleUndatedTodo(${tIdx}, event)` : ''}">
@@ -1827,7 +2074,7 @@ function renderSidebar(){
     `).join('') : `<div class="empty-box">Keine offenen To-Dos.</div>`;
 
     const hi = DATA.items.map((it,idx)=>({it,idx})).filter(x => x.it.delta>=0 && x.it.status==='open' && (x.it.kind==='goal' || x.it.kind==='birthday' || x.it.delta>30));
-    s3T.textContent = '🏆 Ziele, Geburtstage &amp; Ausblick';
+    s3T.textContent = '🏆 Ziele, Geburtstage & Ausblick';
     s3C.textContent = hi.length;
     s3L.innerHTML = hi.length ? hi.map(({it,idx}) => `
       <div class="row" onclick="showItemModal(${idx})">

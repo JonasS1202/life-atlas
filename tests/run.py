@@ -1237,13 +1237,83 @@ class UiReleaseV11(AtlasCase):
         diff_out = self.atlas("core-diff", "--source", REPO).stdout
         self.assertIn("update (upstream changed, yours untouched): _atlas/templates/calendar.html", diff_out)
         self.assertIn("kept: changed only in this Atlas: _atlas/templates/person.md", diff_out)
-        self.assertIn("1.1.0", diff_out)
+        self.assertIn("1.1.1", diff_out)
 
         self.atlas("core-apply", "--source", REPO, "--execute")
         self.assertIn("🕸️ Brain Graph", self.read(inst_tpl))
         self.assertIn("## Custom Local Section", self.read(person_tpl))
-        self.assertEqual(self.read(os.path.join(self.brain, "_atlas", "VERSION")).strip(), "1.1.0")
+        self.assertEqual(self.read(os.path.join(self.brain, "_atlas", "VERSION")).strip(), "1.1.1")
         self.assertIn("ok", self.atlas("check").stdout.lower())
+
+        # 4. v1.1.1 Coach Sync & Readiness Regression:
+        #    390W Garmin wrist-watt Run (`device_watts: true`) + virtual-watt Ride (`device_watts: false`)
+        #    + morning Touran deadline MUST NOT pollute cycling power curve or turn Readiness AMBER!
+        import datetime as dt
+        today_iso = dt.date.today().isoformat()
+        self.page(
+            "coach/profile.md",
+            "---\nsummary: Runner Profile\ntags: [self, sport]\ndepth: pro\n---\n# Profile\n\n"
+            "- **Primary Sport:** Running\n- **Weight:** 71 kg\n- **Training Window:** 16:00-19:30\n",
+        )
+        self.page(
+            "calendar/README.md",
+            f"---\nsummary: Calendar\ntags: [calendar]\n---\n# Calendar\n\n## Timeline\n"
+            f"- [ ] {today_iso} 10:00 [deadline] Werkstatt Angebot einholen: Motorölwechsel Touran\n"
+            f"- [ ] {today_iso} 17:30 [event] Vereinssitzung\n",
+        )
+        mock_v111 = [
+            {
+                "id": "9101",
+                "start_date_local": f"{today_iso}T07:30:00Z",
+                "name": "Garmin Wrist Power 10k Run",
+                "sport_type": "Run",
+                "device_watts": True,
+                "moving_time": 2400,
+                "distance": 10200.0,
+                "total_elevation_gain": 45,
+                "streams": {
+                    "watts": [395] * 2400,
+                    "velocity_smooth": [4.35] * 1200 + [4.15] * 1200,
+                    "heartrate": [165] * 2400,
+                },
+            },
+            {
+                "id": "9102",
+                "start_date_local": f"{today_iso}T12:00:00Z",
+                "name": "Commute Ride Virtual Watts",
+                "sport_type": "Ride",
+                "device_watts": False,
+                "moving_time": 1800,
+                "distance": 13500.0,
+                "total_elevation_gain": 90,
+                "streams": {"watts": [250] * 1800, "heartrate": [136] * 1800},
+            },
+        ]
+        mock_v111_path = os.path.join(self.tmp, "strava_v111.json")
+        with open(mock_v111_path, "w", encoding="utf-8") as fh:
+            json.dump(mock_v111, fh)
+        self.atlas("coach", "sync", "--mock-file", mock_v111_path, "--execute")
+
+        acts_raw = json.loads(self.read(os.path.join(self.brain, "coach", "activities.json")))
+        acts_saved = acts_raw if isinstance(acts_raw, list) else acts_raw["activities"]
+        by_id = {str(a["id"]): a for a in acts_saved}
+        self.assertTrue(by_id["9101"]["device_watts"])
+        self.assertFalse(by_id["9102"]["device_watts"])
+        self.assertNotIn("peaks_fresh", by_id["9101"])
+        self.assertNotIn("peaks_fresh", by_id["9102"])
+        self.assertIn("best_paces", by_id["9101"])
+
+        pc_v111 = self.read(os.path.join(self.brain, "coach", "power-curve.md"))
+        self.assertNotIn("395 W", pc_v111)
+        self.assertNotIn("250 W", pc_v111)
+        self.assertIn("/km", pc_v111)
+
+        ctx_v111 = self.atlas("coach", "context", "--mode", "plan-14d", "--no-sync").stdout
+        self.assertIn("Readiness: GREEN", ctx_v111)
+        self.assertIn("Daniels VDOT", ctx_v111)
+        self.assertIn("Training-window overlap today: 17:30 Vereinssitzung", ctx_v111)
+        self.assertNotIn("FatMax", ctx_v111)
+        self.assertNotIn("Storer", ctx_v111)
 
 
 if __name__ == "__main__":

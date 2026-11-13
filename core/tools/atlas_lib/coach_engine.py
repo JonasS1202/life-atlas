@@ -78,6 +78,35 @@ def parse_pace_to_spk(text: str) -> float | None:
     return float(spk) if 120 <= spk <= 900 else None
 
 
+def _extract_pace_spk(pinfo: Any) -> tuple[float | None, str | None]:
+    """Extract `(sec_per_km, formatted_pace)` from dict, string (`M:SS/km`), or numeric seconds/km."""
+    if isinstance(pinfo, dict):
+        raw_spk = pinfo.get("sec_per_km")
+        spk = float(raw_spk) if raw_spk else parse_pace_to_spk(str(pinfo.get("fmt") or ""))
+        if spk and spk > 0:
+            return spk, (str(pinfo["fmt"]) if pinfo.get("fmt") else format_pace(spk))
+        return None, None
+    if isinstance(pinfo, (int, float)) and not isinstance(pinfo, bool):
+        spk = float(pinfo)
+        return (spk, format_pace(spk)) if spk > 0 else (None, None)
+    if isinstance(pinfo, str):
+        spk = parse_pace_to_spk(pinfo)
+        return (spk, format_pace(spk)) if spk and spk > 0 else (None, None)
+    return None, None
+
+
+def is_valid_cycling_power_activity(a: dict[str, Any] | None) -> bool:
+    """Return True ONLY when `sport == 'cycling'` AND `device_watts is not False`.
+
+    Preserves backward compatibility with cached cycling entries that omitted `device_watts`,
+    while strictly excluding all running wrist watts (`sport == 'running'`), strength sessions,
+    and Strava virtual/estimated non-powermeter rides (`device_watts == False`).
+    """
+    if not isinstance(a, dict):
+        return False
+    return str(a.get("sport") or "cycling").strip().lower() == "cycling" and (a.get("device_watts") is not False)
+
+
 # ---------------------------------------------------------------------------
 # 1. Profile Parsing & Adaptive Depth Tiering (`auto | simple | standard | pro`)
 # ---------------------------------------------------------------------------
@@ -163,10 +192,27 @@ def parse_athlete_profile(profile_text: str, fallback_ftp: int | None = None, fa
         if in_rules and line.startswith(("- ", "* ")) and "<!--" not in line:
             info["bio_rules"].append(line[2:].strip())
 
-        if "weekday window" in low or "mo–fr" in low or "mo-fr" in low or "werktags" in low:
-            m_sch = re.search(r"(\d{1,2}:\d{2}\s*[–-]\s*\d{1,2}:\d{2})", line)
-            if m_sch and not info["schedule"]:
-                info["schedule"] = m_sch.group(1)
+        if not any(sw in low for sw in ("schlaf", "sleep")):
+            if any(
+                kw in low
+                for kw in (
+                    "weekday window",
+                    "training window",
+                    "primary window",
+                    "window",
+                    "schedule",
+                    "trainingsfenster",
+                    "zeitfenster",
+                    "mo–fr",
+                    "mo-fr",
+                    "mon–fri",
+                    "mon-fri",
+                    "werktags",
+                )
+            ):
+                m_sch = re.search(r"(\d{1,2}:\d{2}\s*[–—-]\s*\d{1,2}:\d{2})", line)
+                if m_sch and not info["schedule"]:
+                    info["schedule"] = m_sch.group(1)
 
         if "|" not in line:
             # Also detect casual free-text sport cues when user wrote prose instead of a table
@@ -258,6 +304,13 @@ def parse_athlete_profile(profile_text: str, fallback_ftp: int | None = None, fa
             if m_f:
                 info["fueling_g_h"] = int(m_f.group(1))
 
+        elif any(w in k_low for w in ("window", "schedule", "trainingsfenster", "zeitfenster")) and "schlaf" not in k_low and "sleep" not in k_low:
+            m_sch = re.search(r"(\d{1,2}:\d{2}\s*[–—-]\s*\d{1,2}:\d{2})", v_raw)
+            if m_sch:
+                info["schedule"] = m_sch.group(1)
+            elif not info["schedule"]:
+                info["schedule"] = re.sub(r"[`*]", "", v_raw).strip()
+
     if info["weight_kg"] is None:
         info["weight_kg"] = 67.0
     return info
@@ -285,7 +338,8 @@ def resolve_coach_depth(
 
     acts = activities or []
     has_power_streams = any(
-        isinstance(a, dict) and (a.get("peaks_fresh") or a.get("np_w") or a.get("w_bal_min_pct") is not None)
+        is_valid_cycling_power_activity(a)
+        and bool(a.get("peaks_fresh") or a.get("np_w") or a.get("w_bal_min_pct") is not None)
         for a in acts
     )
     has_pace_streams = sum(1 for a in acts if isinstance(a, dict) and a.get("best_paces")) >= 1
@@ -297,7 +351,7 @@ def resolve_coach_depth(
         return "pro"
     if prof.get("has_casual_intent") and not prof.get("has_explicit_ftp") and not prof.get("lt2_pace_spk"):
         return "simple"
-    if has_pace_streams and (prof.get("lt2_pace_spk") or prof.get("hr_max") or len(acts) >= 4):
+    if has_pace_streams:
         return "pro"
 
     # Check if user has structured thresholds/Strava basics or untouched coach module onboarding -> `standard`
@@ -426,20 +480,14 @@ def solve_cs_d_prime(best_paces: dict[str, Any]) -> dict[str, Any]:
         dist_m = dist_map.get(lbl)
         if not dist_m:
             continue
-        spk = None
-        if isinstance(val, dict) and val.get("sec_per_km"):
-            spk = float(val["sec_per_km"])
-        elif isinstance(val, (int, float)):
-            spk = float(val)
-        elif isinstance(val, str):
-            spk = parse_pace_to_spk(val)
+        spk, _fmt = _extract_pace_spk(val)
         if spk and spk > 0:
             t_sec = spk * (dist_m / 1000.0)
-            if 130.0 <= t_sec <= 3000.0:
+            if 130.0 <= t_sec <= 3600.0:
                 points.append((t_sec, dist_m, lbl))
 
     points.sort(key=lambda x: x[0])
-    # Prefer anchors in 2.5m..35m (1km, 3km, 5km; include 10km only if <3 points or <=2400s)
+    # Prefer anchors in 2.5m..30m (1km, 3km, 5km); include 10km when needed for >=2 anchors (e.g. 5km + 10km)
     core_pts = [p for p in points if p[0] <= 1800.0]
     if len(core_pts) >= 2:
         points = core_pts
@@ -453,11 +501,12 @@ def solve_cs_d_prime(best_paces: dict[str, Any]) -> dict[str, Any]:
             "d_prime_m": None,
             "r2": 0.0,
             "anchors": [p[2] for p in points],
-            "quality_flag": "need >=2 running split anchors (e.g. 1km/3km + 5km/10km)",
+            "quality_flag": "need >=2 running split anchors (e.g. 1km/3km + 5km, or 5km + 10km)",
         }
 
-    has_short = any(t < 600.0 for t, _, _ in points)
+    has_short = any(t <= 1650.0 for t, _, _ in points)
     has_long = any(t >= 720.0 for t, _, _ in points)
+    has_spread = points[-1][0] >= points[0][0] * 1.45
     ts = [p[0] for p in points]
     ds = [p[1] for p in points]
     cs_mps, d_prime_m, r2 = _ols_linear(ts, ds)
@@ -466,9 +515,11 @@ def solve_cs_d_prime(best_paces: dict[str, Any]) -> dict[str, Any]:
     v_long = points[-1][1] / points[-1][0]
     reasons: list[str] = []
     if not has_short:
-        reasons.append("missing short <10m running anchor (1km/3km)")
+        reasons.append("missing short running anchor (1km/3km/5km)")
     if not has_long:
         reasons.append("missing >=12m running anchor (5km/10km)")
+    if not has_spread:
+        reasons.append("insufficient duration spread across running splits")
     if r2 < 0.98:
         reasons.append(f"R^2={r2:.3f} < 0.98")
     if cs_mps <= 1.5 or d_prime_m < 20.0 or v_short <= v_long * 1.02:
@@ -707,15 +758,13 @@ def compute_metabolic_profile(
     rhr: int | None = None,
     best_paces: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Lab-free VO2max (Storer 1990 + Uth 2004 + Daniels VDOT), Honest Glycolytic Index, and FatMax window."""
+    """Lab-free VO2max (Storer 1990 + Daniels VDOT + Uth 2004), Honest Glycolytic Index, and cycling FatMax window."""
     bw = weight_kg if weight_kg and weight_kg > 25.0 else 70.0
     eff_age = age if age and 14 <= age <= 90 else 35
 
+    # Strictly require real cycling 5m power for Storer cycling VO2max and cycling FatMax watts
     map_5m = float((mmp_dict or {}).get("5m") or 0.0)
     map_estimated = False
-    if map_5m <= 0 and cp_watts and cp_watts > 0:
-        map_5m = cp_watts / 0.83
-        map_estimated = True
 
     vo2_storer = None
     if map_5m > 0:
@@ -735,24 +784,23 @@ def compute_metabolic_profile(
     vdot = None
     for d_lbl, dist_m in (("5km", 5000.0), ("10km", 10000.0), ("3km", 3000.0)):
         pinfo = (best_paces or {}).get(d_lbl)
-        spk = None
-        if isinstance(pinfo, dict) and pinfo.get("sec_per_km"):
-            spk = float(pinfo["sec_per_km"])
-        elif isinstance(pinfo, str):
-            spk = parse_pace_to_spk(pinfo)
+        spk, _fmt = _extract_pace_spk(pinfo)
         if spk and spk > 0:
             cand = compute_daniels_vdot(dist_m, spk * (dist_m / 1000.0))
             if cand and (vdot is None or cand > vdot):
                 vdot = cand
 
-    # Honest Glycolytic Index (never fabricate mmol/L/s VLamax without blood lactate)
-    wp_kj_kg = round((w_prime_j / 1000.0) / bw, 2) if w_prime_j and w_prime_j > 0 else None
+    vo2_est = vo2_storer or vdot or vo2_uth
+    vo2_source = "storer" if vo2_storer else ("vdot" if vdot else ("uth" if vo2_uth else None))
+
+    # Honest Glycolytic Index (cycling power curve only; never fabricate mmol/L/s VLamax)
+    wp_kj_kg = round((w_prime_j / 1000.0) / bw, 2) if (map_5m > 0 and w_prime_j and w_prime_j > 0) else None
     p15 = float((mmp_dict or {}).get("15s") or 0.0)
-    p5m_raw = float((mmp_dict or {}).get("5m") or 0.0)
+    p5m_raw = map_5m
     p15s_p5m = round(p15 / p5m_raw, 2) if p15 > 0 and p5m_raw > 0 else None
     cp_map = round(float(cp_watts) / p5m_raw, 2) if cp_watts and cp_watts > 0 and p5m_raw > 0 else None
 
-    gly_band = "Unknown"
+    gly_band: str | None = None
     if cp_map is not None or wp_kj_kg is not None or p15s_p5m is not None:
         high_g = 0
         low_g = 0
@@ -783,9 +831,12 @@ def compute_metabolic_profile(
         fatmax_w = (int(round(0.55 * map_5m)), int(round(0.72 * map_5m)))
 
     return {
+        "vo2max_est": vo2_est,
+        "vo2max_source": vo2_source,
         "vo2max_storer": vo2_storer,
         "vo2max_map_estimated": map_estimated,
         "vo2max_uth": vo2_uth,
+        "vo2max_vdot": vdot,
         "running_vdot": vdot,
         "w_prime_kj_kg": wp_kj_kg,
         "p15s_p5m": p15s_p5m,
@@ -1004,8 +1055,14 @@ def compute_stream_metrics(
     sport: str = "cycling",
     cp_watts: float | None = None,
     w_prime_j: float | None = None,
+    device_watts: bool | None = None,
 ) -> dict[str, Any]:
-    """Full 0-token 1Hz stream analyzer for cycling & running."""
+    """Full 0-token 1Hz stream analyzer for cycling & running.
+
+    Cycling power metrics (`peaks_fresh`, `peaks_fatigued`, `peaks_durability`, `np_w`, `if`,
+    `tss`, `w_bal`, `torque`, steady `Pw:Hr`, CHO/Fat watts fueling) are ONLY computed when
+    `sport == 'cycling'` and `device_watts is not False`.
+    """
     watts = [float(x or 0.0) for x in (streams.get("watts") or [])]
     hr = [float(x or 0.0) for x in (streams.get("heartrate") or [])]
     cad = [float(x or 0.0) for x in (streams.get("cadence") or [])]
@@ -1013,11 +1070,14 @@ def compute_stream_metrics(
     alt = streams.get("altitude") or []
     tmp = streams.get("temp") or []
 
+    norm_sport = str(sport or "cycling").strip().lower()
+    valid_cycling_watts = (norm_sport == "cycling") and (device_watts is not False)
+
     eff_cp = float(cp_watts or ftp_watts or 275)
     eff_wp = float(w_prime_j or 20000.0)
     out: dict[str, Any] = {}
 
-    if watts:
+    if watts and valid_cycling_watts:
         n = len(watts)
         joules = sum(max(0.0, w) for w in watts)
         out["work_kj"] = int(round(joules / 1000.0))
@@ -1092,10 +1152,10 @@ def compute_stream_metrics(
             out["avg_hr"] = int(round(sum(valid_hr) / len(valid_hr)))
             out["max_hr"] = int(round(max(valid_hr)))
 
-    env = compute_environment_adjustments(alt, tmp, cp_watts=eff_cp)
+    env = compute_environment_adjustments(alt, tmp, cp_watts=eff_cp if valid_cycling_watts else None)
     out.update(env)
 
-    if sport == "running" and vel:
+    if norm_sport == "running" and vel:
         n_v = len(vel)
         pref_d = [0.0] * (n_v + 1)
         for i, v in enumerate(vel):
@@ -1188,14 +1248,15 @@ def compute_activity_load(
     dur_h = dur_min / 60.0
     sport = str(act.get("sport") or "cycling").lower()
 
-    # 1. Power-based Coggan TSS
-    if act.get("tss") is not None and float(act["tss"]) > 0:
-        return round(float(act["tss"]), 1), "power_tss"
-    np_w = float(act.get("np_w") or act.get("avg_w") or 0.0)
-    thresh_w = float(cp_watts or prof.get("cp_w") or prof.get("ftp_w") or 275.0)
-    if np_w > 0 and thresh_w > 0 and sport == "cycling":
-        if_v = np_w / thresh_w
-        return round(dur_h * (if_v ** 2) * 100.0, 1), "power_tss"
+    # 1. Power-based Coggan TSS (ONLY for valid cycling power activities; never wrist running watts or virtual watts)
+    if is_valid_cycling_power_activity(act):
+        if act.get("tss") is not None and float(act["tss"]) > 0:
+            return round(float(act["tss"]), 1), "power_tss"
+        np_w = float(act.get("np_w") or act.get("avg_w") or 0.0)
+        thresh_w = float(cp_watts or prof.get("cp_w") or prof.get("ftp_w") or 275.0)
+        if np_w > 0 and thresh_w > 0:
+            if_v = np_w / thresh_w
+            return round(dur_h * (if_v ** 2) * 100.0, 1), "power_tss"
 
     # 2. Running Pace-based rTSS (with elevation grade equivalent)
     dist_km = float(act.get("distance_km") or 0.0)
@@ -1442,6 +1503,37 @@ def render_readiness_markdown(
     return updated_txt.rstrip() + "\n\n## Daily Readiness & PMC State\n\n" + "\n".join(table_lines) + "\n"
 
 
+def _parse_time_window(sched_str: str) -> tuple[float, float] | None:
+    """Parse an explicit `HH:MM–HH:MM` / `HH:MM - HH:MM` training window into `(start_h, end_h)`."""
+    m = re.search(r"(\d{1,2}):(\d{2})\s*[–—-]\s*(\d{1,2}):(\d{2})", str(sched_str or ""))
+    if not m:
+        return None
+    s_h = int(m.group(1)) + int(m.group(2)) / 60.0
+    e_h = int(m.group(3)) + int(m.group(4)) / 60.0
+    if 0.0 <= s_h < 24.0 and 0.0 < e_h <= 24.0 and e_h > s_h:
+        return s_h, e_h
+    return None
+
+
+def _time_overlaps_window(time_str: str, win: tuple[float, float]) -> bool:
+    """Return True if an explicit `HH:MM` or `HH:MM-HH:MM` time overlaps `(win_start_h, win_end_h)`."""
+    raw_t = str(time_str or "").strip()
+    if not raw_t:
+        return False
+    w_s, w_e = win
+    m_rng = re.match(r"^(\d{1,2}):(\d{2})\s*[–—-]\s*(\d{1,2}):(\d{2})", raw_t)
+    if m_rng:
+        t1 = int(m_rng.group(1)) + int(m_rng.group(2)) / 60.0
+        t2 = int(m_rng.group(3)) + int(m_rng.group(4)) / 60.0
+        if t2 > t1:
+            return t1 < w_e and t2 > w_s
+    m_pt = re.match(r"^(\d{1,2}):(\d{2})", raw_t)
+    if m_pt:
+        t0 = int(m_pt.group(1)) + int(m_pt.group(2)) / 60.0
+        return w_s <= t0 < w_e
+    return False
+
+
 def evaluate_readiness_and_guardrails(
     readiness_rows: list[dict[str, Any]],
     profile: dict[str, Any],
@@ -1450,7 +1542,7 @@ def evaluate_readiness_and_guardrails(
     cal_items: list[dict[str, Any]] | None = None,
     today: dt.date | None = None,
 ) -> dict[str, Any]:
-    """Compute `GREEN | AMBER | RED` readiness, `AMPK/mTORC1` interference flags, and Bosquet taper status."""
+    """Compute `GREEN | AMBER | RED` physiological readiness, training-window overlaps, `AMPK/mTORC1` flags, and Bosquet taper."""
     ref_today = today or dt.date.today()
     today_iso = ref_today.isoformat()
     cutoff_30d = (ref_today - dt.timedelta(days=30)).isoformat()
@@ -1500,13 +1592,22 @@ def evaluate_readiness_and_guardrails(
     elif tsb < -20.0:
         amber_reasons.append(f"Accumulated load TSB {tsb:.1f}")
 
-    # Calendar [blocked], deadlines, AMPK/mTORC1 interference & Bosquet taper
+    acwr_val = pmc.get("acwr")
+    ctl_val = float(pmc.get("ctl") or 0.0)
+    if acwr_val is not None and ctl_val >= 15.0:
+        if float(acwr_val) >= 1.75:
+            red_reasons.append(f"Extreme ACWR {float(acwr_val):.2f} (>=1.75)")
+        elif float(acwr_val) > 1.50:
+            amber_reasons.append(f"Elevated ACWR {float(acwr_val):.2f} (>1.50)")
+
+    # Calendar [blocked], training-window overlaps (never readiness reasons!), AMPK/mTORC1 interference & Bosquet taper
     items = cal_items or []
     blocked_today: list[str] = []
     blocked_soon: list[str] = []
-    deadlines_soon: list[str] = []
+    schedule_conflicts: list[str] = []
     goal_a_Nearest: dict[str, Any] | None = None
     planned_workouts: list[dict[str, Any]] = []
+    train_win = _parse_time_window(str((profile or {}).get("schedule") or ""))
 
     for it in items:
         if it.get("status") not in (None, "open", "done"):
@@ -1516,16 +1617,19 @@ def evaluate_readiness_and_guardrails(
         if not isinstance(st_d, dt.date):
             continue
         delta = (st_d - ref_today).days
+        is_today = st_d <= ref_today <= end_d
         kind = it.get("kind")
         what = str(it.get("what") or "").strip()
 
         if kind == "blocked" and it.get("status", "open") == "open":
-            if st_d <= ref_today <= end_d:
+            if is_today:
                 blocked_today.append(what)
             elif 0 < delta <= 5:
                 blocked_soon.append(f"{st_d.isoformat()} {what}")
-        elif kind == "deadline" and it.get("status", "open") == "open" and 0 <= delta <= 2:
-            deadlines_soon.append(f"{st_d.isoformat()} {what}")
+        elif kind in ("event", "deadline") and it.get("status", "open") == "open" and is_today:
+            t_explicit = str(it.get("time") or "").strip()
+            if train_win is not None and t_explicit and _time_overlaps_window(t_explicit, train_win):
+                schedule_conflicts.append(f"🕒 Training-window overlap today: {t_explicit} {what}")
         elif kind == "goal" and it.get("status", "open") == "open" and (it.get("subkind") or "A").upper() == "A" and delta >= 0:
             if goal_a_Nearest is None or delta < goal_a_Nearest["days"]:
                 goal_a_Nearest = {"date": st_d.isoformat(), "days": delta, "what": what}
@@ -1536,8 +1640,6 @@ def evaluate_readiness_and_guardrails(
         red_reasons.append(f"Calendar [blocked] today ({blocked_today[0]})")
     elif blocked_soon:
         amber_reasons.append(f"Upcoming [blocked]: {blocked_soon[0]}")
-    if deadlines_soon and not blocked_today:
-        amber_reasons.append(f"High cognitive/work deadline: {deadlines_soon[0]}")
 
     if red_reasons or len(amber_reasons) >= 3:
         status = "RED"
@@ -1547,7 +1649,7 @@ def evaluate_readiness_and_guardrails(
         status = "GREEN"
 
     # Concurrent Training Interference (AMPK <-> mTORC1 & eccentric lag)
-    guardrails: list[str] = []
+    guardrails: list[str] = list(schedule_conflicts)
     by_day_planned: dict[dt.date, list[dict[str, Any]]] = {}
     for w in planned_workouts:
         by_day_planned.setdefault(w["start"], []).append(w)
@@ -1637,9 +1739,13 @@ def evaluate_readiness_and_guardrails(
         "reasons": reasons,
         "baseline_rhr": round(base_rhr, 1) if base_rhr is not None else None,
         "latest": recent_row,
+        "schedule_conflicts": schedule_conflicts,
         "guardrails": guardrails,
         "taper": taper,
     }
+
+
+compute_readiness_and_guardrails = evaluate_readiness_and_guardrails
 
 
 # ---------------------------------------------------------------------------
@@ -1672,40 +1778,41 @@ def aggregate_epoch_curves(
         if age < 0 or age > 365:
             continue
 
-        pf = a.get("peaks_fresh") or {}
-        p_fat = a.get("peaks_fatigued") or {}
-        p_dur = a.get("peaks_durability") or {}
+        if is_valid_cycling_power_activity(a):
+            pf = a.get("peaks_fresh") or {}
+            p_fat = a.get("peaks_fatigued") or {}
+            p_dur = a.get("peaks_durability") or {}
 
-        for dur_lbl, _sec in COACH_DURATIONS:
-            val = pf.get(dur_lbl)
-            if val:
-                for ep_name, ep_days in epochs:
-                    if age <= ep_days and int(val) > fresh_ep[dur_lbl].get(ep_name, 0):
-                        fresh_ep[dur_lbl][ep_name] = int(val)
-            fval = p_fat.get(dur_lbl)
-            if fval:
-                for ep_name, ep_days in epochs:
-                    if age <= ep_days and int(fval) > fatig_ep[dur_lbl].get(ep_name, 0):
-                        fatig_ep[dur_lbl][ep_name] = int(fval)
-
-        for tier_k in dur_ep:
-            t_peaks = p_dur.get(tier_k) or {}
-            for dur_lbl in dur_ep[tier_k]:
-                t_val = t_peaks.get(dur_lbl)
-                if t_val:
+            for dur_lbl, _sec in COACH_DURATIONS:
+                val = pf.get(dur_lbl)
+                if val:
                     for ep_name, ep_days in epochs:
-                        if age <= ep_days and int(t_val) > dur_ep[tier_k][dur_lbl].get(ep_name, 0):
-                            dur_ep[tier_k][dur_lbl][ep_name] = int(t_val)
+                        if age <= ep_days and int(val) > fresh_ep[dur_lbl].get(ep_name, 0):
+                            fresh_ep[dur_lbl][ep_name] = int(val)
+                fval = p_fat.get(dur_lbl)
+                if fval:
+                    for ep_name, ep_days in epochs:
+                        if age <= ep_days and int(fval) > fatig_ep[dur_lbl].get(ep_name, 0):
+                            fatig_ep[dur_lbl][ep_name] = int(fval)
+
+            for tier_k in dur_ep:
+                t_peaks = p_dur.get(tier_k) or {}
+                for dur_lbl in dur_ep[tier_k]:
+                    t_val = t_peaks.get(dur_lbl)
+                    if t_val:
+                        for ep_name, ep_days in epochs:
+                            if age <= ep_days and int(t_val) > dur_ep[tier_k][dur_lbl].get(ep_name, 0):
+                                dur_ep[tier_k][dur_lbl][ep_name] = int(t_val)
 
         bp = a.get("best_paces") or {}
         for d_lbl, _dist in RUN_SPLIT_DISTANCES:
             pinfo = bp.get(d_lbl)
-            if isinstance(pinfo, dict) and pinfo.get("sec_per_km"):
-                spk = float(pinfo["sec_per_km"])
+            spk, fmt_s = _extract_pace_spk(pinfo)
+            if spk and spk > 0:
                 for ep_name, ep_days in epochs:
                     cur_best = run_ep[d_lbl].get(ep_name)
                     if age <= ep_days and (cur_best is None or spk < cur_best[0]):
-                        run_ep[d_lbl][ep_name] = (spk, pinfo.get("fmt") or format_pace(spk))
+                        run_ep[d_lbl][ep_name] = (spk, fmt_s or format_pace(spk))
 
     return {
         "fresh": fresh_ep,
@@ -1751,15 +1858,16 @@ def build_coach_telemetry(
     cp_model = solve_cp_w_prime(mmp_90d)
     cs_model = solve_cs_d_prime(run_90d)
 
+    has_cycling_anchor = bool(cp_model["valid"] or prof.get("cp_w") or prof.get("has_explicit_ftp") or mmp_90d)
     eff_cp = (
         cp_model["cp_w"]
         if cp_model["valid"] and cp_model["cp_w"]
-        else (prof.get("cp_w") or prof.get("ftp_w") or 275)
+        else ((prof.get("cp_w") or prof.get("ftp_w") or 275) if has_cycling_anchor else None)
     )
     eff_wp_j = (
         cp_model["w_prime_j"]
         if cp_model["valid"] and cp_model["w_prime_j"]
-        else ((prof["w_prime_kj"] * 1000.0) if prof.get("w_prime_kj") else None)
+        else ((prof["w_prime_kj"] * 1000.0) if (has_cycling_anchor and prof.get("w_prime_kj")) else None)
     )
     eff_cs = (
         cs_model["cs_mps"]
@@ -1767,10 +1875,10 @@ def build_coach_telemetry(
         else prof.get("cs_mps")
     )
 
-    typology = estimate_fiber_typology(mmp_90d, cp_watts=float(eff_cp))
+    typology = estimate_fiber_typology(mmp_90d, cp_watts=float(eff_cp) if eff_cp else 0.0)
     metabolic = compute_metabolic_profile(
         mmp_90d,
-        cp_watts=float(eff_cp) if (cp_model["valid"] or prof.get("cp_w") or prof.get("ftp_w")) else None,
+        cp_watts=float(eff_cp) if (eff_cp and (cp_model["valid"] or prof.get("cp_w") or prof.get("has_explicit_ftp"))) else None,
         w_prime_j=eff_wp_j,
         weight_kg=float(prof.get("weight_kg") or 70.0),
         age=prof.get("age"),
@@ -1779,7 +1887,9 @@ def build_coach_telemetry(
         rhr=prof.get("rhr"),
         best_paces=run_90d,
     )
-    pmc = compute_pmc_metrics(activities, profile=prof, cs_mps=eff_cs, cp_watts=float(eff_cp), today=ref_today)
+    pmc = compute_pmc_metrics(
+        activities, profile=prof, cs_mps=eff_cs, cp_watts=float(eff_cp) if eff_cp else None, today=ref_today
+    )
     readiness = evaluate_readiness_and_guardrails(
         readiness_rows, prof, pmc, activities, cal_items=cal_items, today=ref_today
     )
@@ -1845,9 +1955,11 @@ def format_pro_telemetry_block(telemetry: dict[str, Any]) -> str:
     if cp_m["valid"] and cp_m["cp_w"]:
         wp_kg = (cp_m["w_prime_kj"] / bw) if cp_m["w_prime_kj"] and bw > 0 else 0.0
         model_parts.append(f"CP {cp_m['cp_w']} W | W' {cp_m['w_prime_kj']} kJ ({wp_kg:.2f} kJ/kg, R²={cp_m['r2']:.3f})")
-    else:
+    elif telemetry.get("effective_cp_w"):
         eff_cp = telemetry.get("effective_cp_w")
         model_parts.append(f"Anchor {eff_cp} W (CP/W' quality gate: {cp_m['quality_flag']})")
+    elif not (cs_m["valid"] and cs_m["cs_mps"]):
+        model_parts.append(f"Cycling CP/W': uncalibrated ({cp_m['quality_flag']})")
     if cs_m["valid"] and cs_m["cs_mps"]:
         model_parts.append(f"CS {cs_m['cs_pace_fmt']} ({cs_m['cs_mps']:.2f} m/s) | D' {cs_m['d_prime_m']} m")
     if typ.get("typology") and typ["typology"] != "Unknown":
@@ -1857,17 +1969,25 @@ def format_pro_telemetry_block(telemetry: dict[str, Any]) -> str:
         if typ.get("pdc_b") is not None:
             t_bits.append(f"b={typ['pdc_b']}")
         model_parts.append("Typology: " + " (".join([t_bits[0], ", ".join(t_bits[1:]) + ")"]) if len(t_bits) > 1 else f"Typology: {t_bits[0]}")
-    lines.append("Model (90d): " + " | ".join(model_parts))
+    if model_parts:
+        lines.append("Model (90d): " + " | ".join(model_parts))
 
     # Metabolic & Durability line
     met_parts: list[str] = []
     if met.get("vo2max_storer"):
         est_tag = " est" if met.get("vo2max_map_estimated") else ""
         met_parts.append(f"VO2max ~{met['vo2max_storer']} ml/kg/min (Storer{est_tag})")
-    if met.get("vo2max_uth"):
-        met_parts.append(f"Uth HR ~{met['vo2max_uth']}")
-    if met.get("running_vdot"):
-        met_parts.append(f"VDOT {met['running_vdot']}")
+        if met.get("vo2max_uth"):
+            met_parts.append(f"Uth HR ~{met['vo2max_uth']}")
+        if met.get("running_vdot"):
+            met_parts.append(f"VDOT {met['running_vdot']}")
+    elif met.get("vo2max_vdot"):
+        met_parts.append(f"VO2max (est.) ~{met['vo2max_vdot']} ml/kg/min (Daniels VDOT)")
+        if met.get("vo2max_uth"):
+            met_parts.append(f"Uth HR ~{met['vo2max_uth']}")
+    elif met.get("vo2max_uth"):
+        met_parts.append(f"VO2max (est.) ~{met['vo2max_uth']} ml/kg/min (Uth HR)")
+
     if met.get("glycolytic_band") and met["glycolytic_band"] != "Unknown":
         g_sub = []
         if met.get("cp_map_ratio"):
@@ -1887,18 +2007,20 @@ def format_pro_telemetry_block(telemetry: dict[str, Any]) -> str:
     # Last Activity telemetry
     la = telemetry.get("last_activity")
     if la:
+        la_valid_power = is_valid_cycling_power_activity(la)
         tss_v, tss_m = compute_activity_load(
             la, profile=telemetry["profile"],
-            cs_mps=telemetry.get("effective_cs_mps"), cp_watts=float(telemetry.get("effective_cp_w") or 275),
+            cs_mps=telemetry.get("effective_cs_mps"),
+            cp_watts=float(telemetry["effective_cp_w"]) if telemetry.get("effective_cp_w") else None,
         )
         la_bits = [f"{la.get('date')} '{la.get('name', 'Session')}'", f"{la.get('duration_min', 0)}m", f"{tss_v:.0f} TSS ({tss_m})"]
-        if la.get("w_bal_min_pct") is not None:
+        if la_valid_power and la.get("w_bal_min_pct") is not None:
             la_bits.append(f"W'bal min {la['w_bal_min_pct']}% ({la.get('matches_burned', 0)} matches)")
-        if la.get("cho_burn_g") is not None:
+        if la_valid_power and la.get("cho_burn_g") is not None:
             la_bits.append(f"CHO ~{la['cho_burn_g']}g (target {la.get('fueling_g_h', 0)}g/h)")
-        if la.get("avg_torque_nm") is not None:
+        if la_valid_power and la.get("avg_torque_nm") is not None:
             la_bits.append(f"Torque {la['avg_torque_nm']} Nm (peak {la.get('peak_torque_nm', 0)} Nm, F_opt {la.get('f_opt_rpm', 0)} rpm)")
-        if la.get("decoupling_pct") is not None:
+        if la_valid_power and la.get("decoupling_pct") is not None:
             t_note = f" @ {la['temp_c']}C" + (" [HEAT DRIFT]" if la.get("thermal_drift") else "") if la.get("temp_c") is not None else ""
             la_bits.append(f"Steady Pw:Hr {la['decoupling_pct']:+.1f}%{t_note}")
         elif la.get("thermal_drift"):

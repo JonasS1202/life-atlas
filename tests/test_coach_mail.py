@@ -239,6 +239,181 @@ class CoachMailUnit(unittest.TestCase):
         # Non-ASCII falls back safely to None (client-side Unicode filter)
         self.assertIsNone(am._build_server_uid_search_criteria("Rückfrage Gebühren"))
 
+    def test_readiness_deadline_separation_and_training_window_overlap(self):
+        today = dt.date(2026, 11, 13)
+        prof_md = (
+            "---\nsummary: Runner Profile\ntags: [self, sport]\ndepth: pro\n---\n# Profile\n\n"
+            "- **Primary Sport:** Running\n"
+            "- **Training Window:** 16:00–19:30\n"
+        )
+        prof = ce.parse_athlete_profile(prof_md)
+        self.assertIn("16:00", prof["schedule"])
+
+        r_rows = [
+            {"date": today.isoformat(), "rhr": 48, "sleep_h": 7.8, "sleep_quality": "good", "soreness": 1},
+            {"date": (today - dt.timedelta(days=2)).isoformat(), "rhr": 48, "sleep_h": 7.7, "soreness": 1},
+            {"date": (today - dt.timedelta(days=4)).isoformat(), "rhr": 49, "sleep_h": 7.6, "soreness": 2},
+        ]
+        pmc_ok = {"ctl": 42.0, "atl": 44.0, "tsb": -2.0, "acwr": 1.05}
+
+        # 1. Morning deadline ("10:00 Werkstatt Angebot einholen: Motorölwechsel Touran") + untimed deadline
+        #    MUST keep Readiness GREEN with zero reasons and zero schedule conflicts!
+        cal_morning = [
+            {
+                "kind": "deadline", "status": "open",
+                "start": today, "end": today, "time": "10:00",
+                "what": "Werkstatt Angebot einholen: Motorölwechsel Touran",
+            },
+            {
+                "kind": "deadline", "status": "open",
+                "start": today + dt.timedelta(days=1), "end": today + dt.timedelta(days=1), "time": "",
+                "what": "Steuerunterlagen sortieren",
+            },
+        ]
+        rdy_morning = ce.compute_readiness_and_guardrails(r_rows, prof, pmc_ok, [], cal_items=cal_morning, today=today)
+        self.assertEqual(rdy_morning["status"], "GREEN")
+        self.assertEqual(rdy_morning["reasons"], [])
+        self.assertEqual(rdy_morning["schedule_conflicts"], [])
+        self.assertFalse(any("Touran" in g for g in rdy_morning["guardrails"]))
+
+        # 2. Timed event inside 16:00–19:30 training window today adds `schedule_conflicts` WITHOUT turning AMBER!
+        cal_overlap = cal_morning + [
+            {
+                "kind": "event", "status": "open",
+                "start": today, "end": today, "time": "17:00-18:00",
+                "what": "Elternabend Schule",
+            },
+        ]
+        rdy_overlap = ce.evaluate_readiness_and_guardrails(r_rows, prof, pmc_ok, [], cal_items=cal_overlap, today=today)
+        self.assertEqual(rdy_overlap["status"], "GREEN")
+        self.assertEqual(rdy_overlap["reasons"], [])
+        self.assertEqual(len(rdy_overlap["schedule_conflicts"]), 1)
+        self.assertIn("🕒 Training-window overlap today: 17:00-18:00 Elternabend Schule", rdy_overlap["schedule_conflicts"][0])
+        self.assertIn(rdy_overlap["schedule_conflicts"][0], rdy_overlap["guardrails"])
+
+        # 3. True `[blocked]` days still drive RED (today) and AMBER (within 3d)
+        rdy_blk_soon = ce.evaluate_readiness_and_guardrails(
+            r_rows, prof, pmc_ok, [],
+            cal_items=[{"kind": "blocked", "status": "open", "start": today + dt.timedelta(days=2), "end": today + dt.timedelta(days=2), "time": "", "what": "Dienstreise"}],
+            today=today,
+        )
+        self.assertEqual(rdy_blk_soon["status"], "AMBER")
+        rdy_blk_today = ce.evaluate_readiness_and_guardrails(
+            r_rows, prof, pmc_ok, [],
+            cal_items=[{"kind": "blocked", "status": "open", "start": today, "end": today, "time": "", "what": "Krank"}],
+            today=today,
+        )
+        self.assertEqual(rdy_blk_today["status"], "RED")
+
+    def test_sport_and_power_sensor_separation_runner_wrist_watts_and_virtual_ride(self):
+        today = dt.date(2026, 11, 13)
+        # 1. Helper truth table (backward-compatible for legacy cached cycling without device_watts)
+        self.assertFalse(ce.is_valid_cycling_power_activity({"sport": "running", "device_watts": True}))
+        self.assertFalse(ce.is_valid_cycling_power_activity({"sport": "strength", "device_watts": True}))
+        self.assertFalse(ce.is_valid_cycling_power_activity({"sport": "cycling", "device_watts": False}))
+        self.assertTrue(ce.is_valid_cycling_power_activity({"sport": "cycling", "device_watts": True}))
+        self.assertTrue(ce.is_valid_cycling_power_activity({"sport": "cycling"}))
+
+        # 2. Stream metrics on 390W Garmin wrist-watt Run + virtual-watt Ride (`device_watts=False`)
+        run_metrics = ce.compute_stream_metrics(
+            {"watts": [390.0] * 1500, "heartrate": [164.0] * 1500, "velocity_smooth": [4.35] * 1500},
+            ftp_watts=300,
+            weight_kg=72.0,
+            sport="running",
+            cp_watts=300.0,
+            w_prime_j=20000.0,
+            device_watts=True,
+        )
+        for forbidden_key in ("peaks_fresh", "peaks_fatigued", "peaks_durability", "np_w", "tss", "w_bal_min_pct", "cho_burn_g"):
+            self.assertNotIn(forbidden_key, run_metrics)
+        self.assertIn("best_paces", run_metrics)
+        self.assertIn("5km", run_metrics["best_paces"])
+
+        virt_ride_metrics = ce.compute_stream_metrics(
+            {"watts": [255.0] * 2400, "heartrate": [148.0] * 2400},
+            ftp_watts=300,
+            weight_kg=72.0,
+            sport="cycling",
+            cp_watts=300.0,
+            w_prime_j=20000.0,
+            device_watts=False,
+        )
+        for forbidden_key in ("peaks_fresh", "peaks_fatigued", "peaks_durability", "np_w", "tss", "w_bal_min_pct", "cho_burn_g"):
+            self.assertNotIn(forbidden_key, virt_ride_metrics)
+
+        # 3. Cached `activities.json` with pre-existing wrist-watt pollution on runs + virtual ride + fallback_ftp=300:
+        #    MUST produce ZERO cycling CP/W'/FatMax/Storer pollution while computing CS/D' & Daniels VDOT VO2max!
+        polluted_cached_acts = [
+            {
+                "id": 101,
+                "date": (today - dt.timedelta(days=4)).isoformat(),
+                "sport": "running",
+                "duration_min": 42,
+                "distance_km": 10.5,
+                "avg_hr": 166,
+                "np_w": 392,
+                "tss": 114.0,
+                "peaks_fresh": {"5s": 602, "15s": 540, "1m": 455, "3m": 420, "5m": 402, "10m": 388, "20m": 380},
+                "best_paces": {
+                    "5km": {"sec_per_km": 230.0, "pace": "3:50/km"},
+                    "10km": {"sec_per_km": 238.0, "pace": "3:58/km"},
+                },
+            },
+            {
+                "id": 102,
+                "date": (today - dt.timedelta(days=2)).isoformat(),
+                "sport": "cycling",
+                "device_watts": False,
+                "duration_min": 60,
+                "distance_km": 28.0,
+                "avg_hr": 138,
+                "np_w": 240,
+                "peaks_fresh": {"5s": 480, "3m": 320, "5m": 295, "10m": 275, "20m": 260},
+            },
+        ]
+        runner_prof_md = (
+            "---\nsummary: Pure Runner\ntags: [self, sport]\ndepth: pro\n---\n# Profile\n\n"
+            "- **Primary Sport:** Running\n"
+            "- **Weight:** 72 kg\n"
+            "- **Training Window:** 16:00-19:30\n"
+        )
+        r_md = ce.render_readiness_markdown(
+            "",
+            [{"date": today.isoformat(), "rhr": 47, "sleep_h": 8.0, "soreness": 1, "status": "GREEN"}],
+            today.isoformat(),
+        )
+        tel = ce.build_coach_telemetry(
+            runner_prof_md,
+            polluted_cached_acts,
+            readiness_text=r_md,
+            cal_items=[{
+                "kind": "deadline", "status": "open",
+                "start": today, "end": today, "time": "10:00",
+                "what": "Werkstatt Angebot einholen: Motorölwechsel Touran",
+            }],
+            fallback_ftp=300,
+            today=today,
+        )
+        self.assertFalse(tel["cp_model"]["valid"])
+        self.assertEqual(tel["curves"]["fresh"]["5m"], {})
+        self.assertEqual(tel["curves"]["fresh"]["20m"], {})
+        self.assertIsNone(tel["metabolic"]["vo2max_storer"])
+        self.assertIsNone(tel["metabolic"]["fatmax_watts"])
+        self.assertTrue(tel["cs_model"]["valid"], tel["cs_model"])
+        self.assertIsNotNone(tel["metabolic"]["vo2max_vdot"])
+        self.assertGreater(tel["metabolic"]["vo2max_vdot"], 50.0)
+        self.assertEqual(tel["metabolic"]["vo2max_est"], tel["metabolic"]["vo2max_vdot"])
+        self.assertEqual(tel["readiness"]["status"], "GREEN")
+
+        pro_blk = ce.format_pro_telemetry_block(tel)
+        self.assertIn("Readiness: GREEN", pro_blk)
+        self.assertIn("CS ", pro_blk)
+        self.assertIn("Daniels VDOT", pro_blk)
+        self.assertIn("VO2max (est.)", pro_blk)
+        self.assertNotIn("FatMax", pro_blk)
+        self.assertNotIn("Storer", pro_blk)
+        self.assertNotIn("Touran", pro_blk)
+
 
 if __name__ == "__main__":
     unittest.main()

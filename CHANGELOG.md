@@ -2,6 +2,18 @@
 
 Written for users: `/atlas-update` shows the sections between the installed and the new version.
 
+## [1.1.1] - 2026-11-13
+
+- **Strict Physiological Readiness vs. Calendar Deadlines (`coach_engine.py`, `calendar.html`):**
+  - **Physiology-Only `GREEN | AMBER | RED` Readiness:** `evaluate_readiness_and_guardrails()` now derives daily Readiness status and reasons strictly from physiological and systemic load signals (`RHR`, `sleep_h`, `sleep_quality`, `soreness`, `TSB`, `ACWR`) plus true `[blocked]` days. Normal `[deadline]` and `[event]` items (e.g. morning errands) never degrade Athlete Readiness to `AMBER` or `RED`.
+  - **Training-Window Overlap Detection (`schedule_conflicts`):** Parses the athlete's primary training window from `coach/profile.md` (e.g. `16:00–19:30`) and surfaces an informational guardrail (`🕒 Training-window overlap today: <time> <what>`) only when a timed `event` or `deadline` today overlaps that training window, keeping physiological Readiness `GREEN`.
+- **Strict Sport & Power-Sensor Separation — Zero Running Wrist-Watt or Virtual-Watt Pollution (`coach_engine.py`, `atlas.py`):**
+  - **`is_valid_cycling_power_activity` Gate (`sport == "cycling"` & `device_watts is not False`):** Excludes Garmin/Coros/Apple Watch running wrist power (`sport == "running"`) and Strava estimated virtual watts (`device_watts == False`) from `compute_stream_metrics()`, `aggregate_epoch_curves()`, `compute_activity_load()`, `resolve_coach_depth()`, and `build_coach_telemetry()`—including already-cached `activities.json` entries without requiring a re-sync.
+  - **Runner-Clean Metabolic & `VO₂max` Profiling (`Daniels VDOT`):** Athletes without valid cycling `5m` power no longer receive fabricated cycling `CP / W'`, `Typology`, Storer cycling `VO₂max`, or cycling `FatMax` watts; instead, `compute_metabolic_profile()` estimates `VO₂max` cleanly from **Daniels `VDOT`** (`3km`/`5km`/`10km` best paces -> `vo2max_vdot` / `vo2max_est`) or Uth HR ratio alongside running `CS / D'`.
+- **Airy `🕸️ Brain Graph` Physics & Coach Dashboard Polish (`calendar.html`):**
+  - **Journal Logs Off by Default (`📓 Logs` Toggle) & Domain-Sector Physics:** Hides daily `journal/` log nodes by default with a 1-click `📓 Logs` toggle pill, replaces center-crushing gravity with wide domain-sector anchors, stronger charge repulsion, hard circle-collision separation, cooling `alpha` settlement, and automatic `fitGraphToViewport` framing.
+  - **Priority Bounding-Box Anti-Overlap Label Culling & UI Fixes:** Eliminates overlapping graph labels via screen-space bounding-box culling sorted by selection/focus/degree, formats `FatMax / LT1` ranges with en-dashes (`227–297 W`), and fixes literal HTML-entity rendering in `.textContent` assignments.
+
 ## [1.1.0] - 2026-11-13
 
 - **Interactive `🕸️ Brain Graph` Explorer (`calendar.html?view=graph`, `atlas.py calendar --view graph`):**
