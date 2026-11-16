@@ -81,14 +81,17 @@ SIGNAL_DO_NOT_STORE = re.compile(
     r"do\s+not\s+(?:store|save|keep|log|record)|don'?t\s+(?:store|save|keep|log|record))\b"
 )
 SIGNAL_EXPLICIT = re.compile(
-    r"(?i)\b(merk dir|merke dir|merk es dir|speicher(?:e)? (?:das|dir|bitte)|notier(?:e)? (?:das|dir)|vergiss nicht|"
+    r"(?i)\b(merk(?:e)?\s+(?:dir|mir|es|das)|speicher(?:e)?(?:\s+(?:mir|dir|das|es|bitte|mal)){1,3}(?:\s+ab)?|"
+    r"speicher(?:e)?\s+ab|notier(?:e)?(?:\s+(?:mir|dir|das|es|bitte))?|trag(?:e)?(?:\s+\w+){0,3}\s+ein|vergiss\s+nicht|"
     r"ab jetzt|ab sofort|von nun an|in zukunft|künftig|kuenftig|nie wieder|immer wenn|remember (?:that|this)|"
+    r"save (?:this|that)|note (?:that|this)|add (?:this )?to (?:my )?calendar|"
     r"don'?t forget|from now on|going forward|never again)\b")
 SIGNAL_CORRECTION = re.compile(
     r"(?i)(^\s*(nein|nee|falsch|no|wrong)\b[\s,.!]|\b(stimmt nicht|ist falsch|war falsch|nicht so|falsch verstanden|"
     r"korrigier|that'?s wrong|not like that|you misunderstood)\b)")
 SIGNAL_FACT = re.compile(
-    r"(?i)(?:\b\d{1,2}\.\d{1,2}\.20\d{2}\b|\b20\d{2}-\d{2}-\d{2}\b|"
+    r"(?i)(?:\b\d{1,2}\.\d{1,2}\.20\d{2}\b|\b20\d{2}-\d{2}-\d{2}\b|\b\d{1,2}:\d{2}\s*uhr\b|"
+    r"\b(?:diesen|n[aä]chste[n]?|kommenden)\s+(?:montag|dienstag|mittwoch|donnerstag|freitag|samstag|sonntag)\b|"
     r"\b\d+(?:[.,]\d+)?\s*(?:€|eur|euro|usd|\$)\b|"
     r"\b(?:hab(?:e)?\s+(?:heute|gerade|eben)|wir\s+haben\s+(?:heute|gerade|jetzt)|"
     r"termin\s+ist\s+am|kostet\s+jetzt|zahlen\s+jetzt|"
@@ -101,14 +104,14 @@ LEARN_HINTS = {
     "fact": "capture-first: if this message states a new/updated fact, date, amount, contact, decision, or task status, file it now (`atlas.py where <topic>`) with Stand/verified date and end with `Atlas: <what changed where>`",
 }
 MAIL_RX = re.compile(
-    r"(?i)(?:^|\s)/atlas-mail\b|\b(?:atlas_mail|postf[aä]ch\w*|imap\b|ungelesen\w*\s+e?-?mails?|"
-    r"check\w*\s+(?:mal\s+)?(?:meine\s+)?e?-?mails?|hast\s+du\s+eine\s+e?-?mail|"
-    r"(?:eingegangen\w*|gesendet\w*|neue[n]?)\s+e?-?mails?|e?-?mails?\s+(?:von|an|aus|check\w*|such\w*|lesen|pr[uü]f\w*))\b"
+    r"(?i)(?:^|\s)/atlas-mail\b|\b(?:atlas_mail|postf[aä]ch\w*|posteingang\w*|inbox\b|imap\b|"
+    r"e?-?mails?(?!-?adresse\w*))\b"
 )
 TODO_RX = re.compile(
     r"(?i)(?:^|\s)/atlas-(?:calendar|brief)\b|\b(?:offene[n]?\s+(?:aufgaben|to-?dos?|tasks?|punkte)|"
-    r"meine\s+(?:aufgaben|to-?dos?|termine)|[oö]ffne\s+(?:meinen\s+)?kalender|"
-    r"(?:aufgabe|to-?do|task)\w*\s+(?:abhaken|verschieben|erledigt|anlegen))\b"
+    r"meine\s+(?:aufgaben|to-?dos?|termine)|[oö]ffne\s+(?:meinen\s+)?kalender|in\s+den\s+kalender|"
+    r"\b(?:to-?dos?|termine?|appointments?)\b|"
+    r"(?:aufgabe|to-?do|task|termin)\w*\s+(?:abhaken|verschieben|erledigt|anlegen|eintragen|speichern))\b"
 )
 
 
@@ -2098,9 +2101,17 @@ def prompt_text(prompt, cwd, session):
         where = ", ".join((os.path.relpath(x, root).replace("\\", "/") if _norm_path(x).startswith(_norm_path(root) + "/")
                            and cwd and _norm_path(cwd).startswith(_norm_path(root)) else x.replace("\\", "/"))
                           for x in p["resolved"]) or "no folder"
+        proj_neighbors = [
+            _show(n_rel, cwd)
+            for n_rel, _sc, _via, _k in graph_engine.expand_1hop_neighbors(
+                BRAIN, [p["page"]], skip_pages={p["page"]}, max_neighbors=2, db_path=CACHE
+            )
+            if not n_rel.startswith(("journal/", "_")) and not graph_engine.is_folder_hub(n_rel)
+        ][:2]
+        linked_ctx = f" Linked brain context (open only if needed): {', '.join(proj_neighbors)}." if proj_neighbors else ""
         lines.append(f"Atlas route -> project '{p['title']}' ({why}). Read {_show(p['page'], cwd)} first, then the "
                      f"repository's own agent files in {where} (CLAUDE.md, AGENTS.md, GEMINI.md, .claude/rules, "
-                     ".agents/rules) once; after that work there like a normal coding agent.")
+                     f".agents/rules) once; after that work there like a normal coding agent.{linked_ctx}")
         sess.setdefault("routed", []).append(p["slug"])
         sess["project"] = p["slug"]
 
@@ -2138,7 +2149,7 @@ def prompt_text(prompt, cwd, session):
             )
         if not c_mode and TODO_RX.search(prompt):
             lines.append(
-                f"Atlas tasks/calendar -> Use `{py} -I {tools_py} todo` (`list|done|move|skip|add`) or `{py} -I {tools_py} calendar`."
+                f"Atlas tasks/calendar -> Use `{py} -I {tools_py} todo` (`list|done|move|skip|add \"<text>\" [--to YYYY-MM-DD] [--time HH:MM] [--kind event|todo|deadline|blocked|goal]`) or `{py} -I {tools_py} calendar`."
             )
         for ext_name, ext_rel, ext_cmd in _detect_user_extensions(prompt)[:2]:
             cli_bit = f"; CLI: `{py} -I {tools_py} {ext_cmd} ...`" if ext_cmd else ""
@@ -2170,7 +2181,7 @@ def prompt_text(prompt, cwd, session):
         else:
             found = []
         if found:
-            lines.append(f"Atlas entity leads (use `{py} -I {tools_py} find <words>` if you need broader search):")
+            lines.append(f"Atlas entity leads (read matched leads directly; run `{py} -I {tools_py} find <words>` only if a lead is missing):")
             for rel, summary, terms in found:
                 lines.append(f"- {_show(rel, cwd)}" + (f" — {summary}" if summary else "") + f" [{', '.join(terms)}]")
     _save_state(st)

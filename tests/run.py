@@ -1829,6 +1829,87 @@ class UiReleaseV11(AtlasCase):
         st = json.loads(self.read(os.path.join(self.brain, "_atlas", "state.json")))
         self.assertTrue(bool(st.get("last_update_check")))
 
+    def test_v132_mail_todo_rx_event_add_batch_mail_and_project_linked_context(self):
+        # 1. `MAIL_RX` matches natural plural "5 neusten mails zusammen", ignores "E-Mail-Adresse"
+        h_mail = self.hook("antigravity", "prompt", {
+            "conversationId": "v132-mail",
+            "invocationNum": 0,
+            "lastUserInput": "Fasse mir meine 5 neusten mails zusammen von privat und geschäftlich",
+            "workspacePaths": [fwd(self.root)],
+        })
+        self.assertIn("Atlas mail ->", h_mail)
+
+        h_addr = self.hook("antigravity", "prompt", {
+            "conversationId": "v132-addr",
+            "invocationNum": 0,
+            "lastUserInput": "Wie lautet die E-Mail-Adresse vom Support?",
+            "workspacePaths": [fwd(self.root)],
+        })
+        self.assertNotIn("Atlas mail ->", h_addr)
+
+        # 2. `TODO_RX` + `SIGNAL_EXPLICIT` on "Speicher mir ab ... Zahnarzt Termin" + `todo add --to --time --kind event`
+        h_sched = self.hook("antigravity", "prompt", {
+            "conversationId": "v132-sched",
+            "invocationNum": 0,
+            "lastUserInput": "Speicher mir ab dass ich nächste Woche Mittwoch 10:15 Uhr einen Zahnarzt Termin habe",
+            "workspacePaths": [fwd(self.root)],
+        })
+        self.assertIn("Atlas tasks/calendar ->", h_sched)
+        self.assertIn("--kind event", h_sched)
+        self.assertIn("Atlas learning signal (explicit)", h_sched)
+
+        add_ev = self.atlas("todo", "add", "Dentist checkup", "--to", "2026-11-25", "--time", "10:15", "--kind", "event").stdout
+        self.assertIn("2026-11-25 10:15 [event] Dentist checkup", add_ev)
+        cal_txt = self.read(os.path.join(self.brain, "calendar", "README.md"))
+        self.assertIn("- [ ] 2026-11-25 10:15 [event] Dentist checkup", cal_txt)
+
+        # 3. `Atlas route` surfaces 1-hop linked brain context on Turn 1 and stays silent on Turn 2
+        os.makedirs(os.path.join(self.root, "code", "game-mod"), exist_ok=True)
+        self.page("areas/tech/workstation-drives.md", (
+            "---\nsummary: Steam library paths and GPU setup\ntags: [project]\n---\n# Workstation Drives\nSteam at /mnt/d/SteamLibrary.\n"
+        ))
+        self.page("projects/game-mod/README.md", (
+            "---\nsummary: Game mod repo\ntags: [project]\npath: code/game-mod\nrelated: [areas/tech/workstation-drives.md]\n---\n"
+            "# Project: Game Mod\n\nSee [Workstation Drives](../../areas/tech/workstation-drives.md).\n"
+        ))
+        self.atlas("index")
+        h_proj1 = self.hook("antigravity", "prompt", {
+            "conversationId": "v132-proj",
+            "invocationNum": 0,
+            "lastUserInput": "Baue in Game Mod ein kleines Menü-Banner ein",
+            "workspacePaths": [fwd(self.root)],
+        })
+        self.assertIn("Atlas route -> project 'Game Mod'", h_proj1)
+        self.assertIn("areas/tech/workstation-drives.md", h_proj1)
+        self.assertNotIn("Atlas mail ->", h_proj1)
+        h_proj2 = self.hook("antigravity", "prompt", {
+            "conversationId": "v132-proj",
+            "invocationNum": 0,
+            "lastUserInput": "Schreib noch einen Termin-Kommentar für mails ins Skript",
+            "workspacePaths": [fwd(self.root)],
+        })
+        # Inside active code project: zero mail/todo/entity noise on Turn 2!
+        self.assertEqual(h_proj2, "")
+
+        # 4. `atlas_mail.py` strips invisible preheader padding & parses multi-UID `read` + `--body-chars`
+        sys.path.insert(0, os.path.join(REPO, "core", "tools"))
+        import atlas_mail
+        raw_mime = (
+            b"From: Promo <hello@example.com>\r\n"
+            b"To: user@example.com\r\n"
+            b"Subject: Deal\r\n"
+            b"Content-Type: text/plain; charset=utf-8\r\n\r\n"
+            + ("Sale starts soon! " + "\u034f\u200c\xad " * 120 + "Real content after padding.").encode("utf-8")
+        )
+        parsed_m = atlas_mail.parse_message_bytes("42", "INBOX", raw_mime)
+        self.assertIn("Real content after padding.", parsed_m["snippet"])
+        self.assertNotIn("\u034f", parsed_m["snippet"])
+        p_mail = atlas_mail.build_parser()
+        ns_rd = p_mail.parse_args(["read", "101", "102", "103", "-a", "WORK"])
+        self.assertEqual(ns_rd.uid, ["101", "102", "103"])
+        ns_ls = p_mail.parse_args(["list", "-a", "WORK", "--body-chars", "900"])
+        self.assertEqual(ns_ls.body_chars, 900)
+
 
 if __name__ == "__main__":
     os.makedirs(BASE_DIR, exist_ok=True)

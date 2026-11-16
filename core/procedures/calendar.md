@@ -53,9 +53,10 @@ python -I <ROOT>/brain/_atlas/tools/atlas.py todo skip 2
 python -I <ROOT>/brain/_atlas/tools/atlas.py todo move 2 --to 2026-11-20
 python -I <ROOT>/brain/_atlas/tools/atlas.py todo move "Tax return" --to +3d
 
-# Add a new dated `[todo]` or undated `[high|med|low]` Open To-Do:
-python -I <ROOT>/brain/_atlas/tools/atlas.py todo add "Call dentist" --to tomorrow
-python -I <ROOT>/brain/_atlas/tools/atlas.py todo add "Review backup disk" --prio high
+# Add a new dated `[todo]`, `[event]`, `[deadline]`, `[blocked]`, or `[goal]` (with optional `--time`) or undated Open To-Do:
+python3 -I <ROOT>/brain/_atlas/tools/atlas.py todo add "Call dentist" --to tomorrow
+python3 -I <ROOT>/brain/_atlas/tools/atlas.py todo add "Dentist appointment" --to 2026-11-25 --time 10:15 --kind event
+python3 -I <ROOT>/brain/_atlas/tools/atlas.py todo add "Review backup disk" --prio high
 ```
 
 For multi-line edits or events/workouts/goals/blockers in `brain/calendar/README.md`:

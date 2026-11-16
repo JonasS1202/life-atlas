@@ -32,17 +32,17 @@ You can invoke the mail engine either via `atlas.py mail ...` or directly via `a
    ```bash
    python -I "<ROOT>/brain/_atlas/tools/atlas.py" mail folders -a <account>
    ```
-3. **List messages in a folder (fast header-only `BODY.PEEK[HEADER.FIELDS (...)]` by default; pass `--with-body` for snippets):**
+3. **List messages in a folder (fast header-only `BODY.PEEK[HEADER.FIELDS (...)]` by default; pass `--with-body` or `--body-chars 1000` for clean body excerpts in a single IMAP call):**
    ```bash
-   python -I "<ROOT>/brain/_atlas/tools/atlas.py" mail list -a <account> -f INBOX -n 50 [--unread] [--flagged] [--since YYYY-MM-DD] [--with-body]
+   python3 -I "<ROOT>/brain/_atlas/tools/atlas.py" mail list -a <account> -f INBOX -n 50 [--unread] [--flagged] [--since YYYY-MM-DD] [--with-body] [--body-chars 800]
    ```
 4. **Search messages (server-side `UID SEARCH` first with automatic client-side fallback for labels/filenames/UTF-8):**
    ```bash
-   python -I "<ROOT>/brain/_atlas/tools/atlas.py" mail search "<query>" -a <account> -f INBOX [--since YYYY-MM-DD]
+   python3 -I "<ROOT>/brain/_atlas/tools/atlas.py" mail search "<query>" -a <account> -f INBOX [--since YYYY-MM-DD]
    ```
-5. **Read a single message in full (including `FLAGS`, `LABELS` & optional attachment extraction):**
+5. **Read one or multiple messages in full over a single IMAP session (including `FLAGS`, `LABELS` & optional attachment extraction):**
    ```bash
-   python -I "<ROOT>/brain/_atlas/tools/atlas.py" mail read <UID> -a <account> -f INBOX [--save-attachments "<dir>"]
+   python3 -I "<ROOT>/brain/_atlas/tools/atlas.py" mail read <UID> [<UID2> ...] -a <account> -f INBOX [--save-attachments "<dir>"]
    ```
 6. **Full deduplicated mailbox audit (All Mail or INBOX + Sent + Archive):**
    ```bash

@@ -617,7 +617,8 @@ def parse_message_bytes(
 
     iso_date = parsed_dt.isoformat() if parsed_dt else date_hdr
     body, attachments = extract_body_and_attachments(msg, save_dir=save_dir)
-    snippet = re.sub(r"\s+", " ", body)[:280]
+    clean_body = re.sub(r"[\u034f\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff\xad]+", " ", body)
+    snippet = re.sub(r"\s+", " ", clean_body).strip()[:500]
 
     return {
         "uid": uid,
@@ -1133,6 +1134,8 @@ def cmd_list(args: argparse.Namespace) -> int:
     acc = resolve_account(accounts, args.account)
     conn = connect_imap(acc)
     try:
+        body_chars = max(80, int(getattr(args, "body_chars", 500) or 500))
+        with_body = bool(getattr(args, "with_body", False) or getattr(args, "body_chars", None) is not None)
         msgs = fetch_messages_in_folder(
             conn,
             folder=args.folder,
@@ -1140,8 +1143,13 @@ def cmd_list(args: argparse.Namespace) -> int:
             since=args.since,
             unread_only=args.unread,
             flagged_only=getattr(args, "flagged", False),
-            headers_only=not getattr(args, "with_body", False),
+            headers_only=not with_body,
         )
+        if with_body:
+            for m in msgs:
+                if m.get("body"):
+                    cb = re.sub(r"[\u034f\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff\xad]+", " ", m["body"])
+                    m["snippet"] = re.sub(r"\s+", " ", cb).strip()[:body_chars]
         if args.json:
             for m in msgs:
                 m.pop("body", None)
@@ -1183,43 +1191,53 @@ def cmd_read(args: argparse.Namespace) -> int:
         if typ != "OK":
             raise RuntimeError(f"Ordner '{disp_folder}' konnte nicht geöffnet werden.")
         fetch_spec = "(FLAGS X-GM-LABELS BODY.PEEK[])" if "X-GM-EXT-1" in caps else "(FLAGS BODY.PEEK[])"
-        typ, msg_data = conn.uid("fetch", str(args.uid), fetch_spec)
-        if typ != "OK" or not msg_data:
-            raise RuntimeError(f"Nachricht UID {args.uid} nicht gefunden.")
         save_dir = Path(args.save_attachments) if args.save_attachments else None
-        raw_bytes, flags, labels = _extract_fetch_parts(msg_data)
-        if raw_bytes is not None:
-            parsed = parse_message_bytes(
-                str(args.uid),
-                raw_folder,
-                raw_bytes,
-                save_dir=save_dir,
-                flags=flags,
-                labels=labels,
+        raw_uids = args.uid if isinstance(args.uid, list) else [args.uid]
+        uids = [str(u).strip() for part in raw_uids for u in str(part).split(",") if str(u).strip()]
+        parsed_items: list[dict[str, Any]] = []
+        for u_str in uids:
+            typ, msg_data = conn.uid("fetch", u_str, fetch_spec)
+            if typ != "OK" or not msg_data:
+                raise RuntimeError(f"Nachricht UID {u_str} nicht gefunden.")
+            raw_bytes, flags, labels = _extract_fetch_parts(msg_data)
+            if raw_bytes is None:
+                raise RuntimeError(f"Keine RFC822-Daten für UID {u_str} erhalten.")
+            parsed_items.append(
+                parse_message_bytes(
+                    u_str,
+                    raw_folder,
+                    raw_bytes,
+                    save_dir=save_dir,
+                    flags=flags,
+                    labels=labels,
+                )
             )
-            if args.json:
-                print(json.dumps(parsed, ensure_ascii=False, indent=2))
-            else:
-                print(f"UID:        {parsed['uid']} ({parsed['folder']})")
-                print(f"Message-ID: {parsed['message_id']}")
-                print(f"Datum:      {parsed['date']}")
-                print(f"Von:        {parsed['from']}")
-                print(f"An:         {parsed['to']}")
-                if parsed["cc"]:
-                    print(f"Cc:         {parsed['cc']}")
-                print(f"Betreff:    {parsed['subject']}")
-                print(f"FLAGS:      {' '.join(parsed['flags']) if parsed['flags'] else '(keine)'}")
-                if parsed["labels"]:
-                    print(f"LABELS:     {', '.join(parsed['labels'])}")
-                if parsed["attachments"]:
-                    print("Anhänge:")
-                    for a in parsed["attachments"]:
-                        saved_note = f" -> gespeichert unter {a['saved_to']}" if a.get("saved_to") else ""
-                        print(f"  - {a['filename']} ({a['content_type']}, {a['size_bytes']} Bytes){saved_note}")
-                print("-" * 72)
-                print(parsed["body"])
+        if args.json:
+            out_obj: Any = parsed_items[0] if len(parsed_items) == 1 else parsed_items
+            print(json.dumps(out_obj, ensure_ascii=False, indent=2))
             return 0
-        raise RuntimeError(f"Keine RFC822-Daten für UID {args.uid} erhalten.")
+        for idx_i, parsed in enumerate(parsed_items):
+            if idx_i > 0:
+                print("\n" + "=" * 72)
+            print(f"UID:        {parsed['uid']} ({parsed['folder']})")
+            print(f"Message-ID: {parsed['message_id']}")
+            print(f"Datum:      {parsed['date']}")
+            print(f"Von:        {parsed['from']}")
+            print(f"An:         {parsed['to']}")
+            if parsed["cc"]:
+                print(f"Cc:         {parsed['cc']}")
+            print(f"Betreff:    {parsed['subject']}")
+            print(f"FLAGS:      {' '.join(parsed['flags']) if parsed['flags'] else '(keine)'}")
+            if parsed["labels"]:
+                print(f"LABELS:     {', '.join(parsed['labels'])}")
+            if parsed["attachments"]:
+                print("Anhänge:")
+                for a in parsed["attachments"]:
+                    saved_note = f" -> gespeichert unter {a['saved_to']}" if a.get("saved_to") else ""
+                    print(f"  - {a['filename']} ({a['content_type']}, {a['size_bytes']} Bytes){saved_note}")
+            print("-" * 72)
+            print(parsed["body"])
+        return 0
     finally:
         conn.logout()
 
@@ -2249,11 +2267,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_lst.add_argument("--unread", action="store_true", help="Nur ungelesene Nachrichten (UNSEEN)")
     p_lst.add_argument("--flagged", action="store_true", help="Nur markierte Nachrichten (\\Flagged)")
     p_lst.add_argument("--with-body", action="store_true", help="Volltext-Snippets laden statt schnellem HEADER.PEEK")
+    p_lst.add_argument("--body-chars", type=int, help="Snippet-Länge in Zeichen (impliziert --with-body; Default: 500)")
     p_lst.add_argument("--json", action="store_true", help="Ausgabe als JSON")
     p_lst.set_defaults(func=cmd_list)
 
-    p_rd = sub.add_parser("read", help="Einzelne E-Mail inkl. Volltext, FLAGS, LABELS & Anhängen lesen (Read-Only)")
-    p_rd.add_argument("uid", help="Nachrichten-UID")
+    p_rd = sub.add_parser("read", help="Eine oder mehrere E-Mails inkl. Volltext, FLAGS, LABELS & Anhängen in einer IMAP-Session lesen (Read-Only)")
+    p_rd.add_argument("uid", nargs="+", help="Eine oder mehrere Nachrichten-UIDs (z. B. `read 285 284 283`)")
     p_rd.add_argument("-a", "--account", help="Account-ID oder E-Mail-Adresse")
     p_rd.add_argument("-f", "--folder", default="INBOX", help="IMAP-Ordner (Default: INBOX)")
     p_rd.add_argument("--save-attachments", help="Zielordner zum Speichern von Anhängen")

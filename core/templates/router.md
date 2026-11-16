@@ -27,7 +27,7 @@ If a project name is ambiguous, ask which one.
 
 ## Keep what lasts (Capture-First)
 
-- **Default-keep with timestamps:** File every new lasting fact, number, date, contact, decision, preference, or task update **now** — unless the user explicitly says not to store it. Before creating a new page, run `atlas.py where <topic>` so you extend an existing page or place it in the canonical `areas/<group>/` folder (`brain/INDEX.md`), with `summary:`, `tags:` (`brain/tags.md`), and `verified: YYYY-MM-DD` / `(Stand: YYYY-MM-DD)`. Project knowledge goes on the project page. Details: `brain/_atlas/procedures/learn.md`.
+- **Default-keep with timestamps:** File every new lasting fact, number, date, contact, decision, preference, or task update **now** — unless the user explicitly says not to store it. Before creating a new page, run `atlas.py where <topic>` so you extend an existing page or place it in the canonical `areas/<group>/` folder (`brain/INDEX.md`), with `summary:`, `tags:` (`brain/tags.md`), and `verified: YYYY-MM-DD` / `(Stand: YYYY-MM-DD)`. Project setup, active branches, and host paths go on the project page. Details: `brain/_atlas/procedures/learn.md`.
 - After a unit of work that changed or learned something, end with one line: `Atlas: <what changed where>` (or `Atlas: nothing new`); the stop hook logs it with `HH:MM` into `journal/` and auto-compiles `[[wikilinks]]`, tags, and `related:` links.
 - Dates, events, workouts, blocked days & to-dos: `brain/calendar/README.md` (`atlas.py todo`, or `due: - YYYY-MM-DD what` in frontmatter). **Atlas First:** "my calendar" (`öffne meinen Kalender`) is ALWAYS the native Atlas calendar via `/atlas-calendar` (`atlas.py calendar --open` → `http://127.0.0.1:8765/calendar.html`), NEVER Google/Apple Calendar web URLs and NEVER `file://` HTML links.
 - Privacy & opt-out: Never store what the user says not to (record standing exclusions in `brain/howto/`). Credentials go only into `brain/_secrets/` (`chmod 600`; the page notes where).
@@ -36,7 +36,7 @@ If a project name is ambiguous, ask which one.
 ## Guard
 
 - Grow and restructure the grown part of `brain/` freely when it gets cleaner or cheaper in tokens; say in one line
-  what moved. Do not change `brain/_atlas/` or this core block; propose instead. Git records everything.
+  what moved. Do not change `brain/_atlas/` or this core block; propose instead. `brain/` is the Git repo (`ROOT` is not).
 - Files outside Atlas move only by written plan with the user's go (`brain/_atlas/procedures/move.md`). Never delete.
   Never open credential stores (browser passwords, keychains, private keys) on your own.
 - Write content in {{LANGUAGE}}; core folder names stay English.

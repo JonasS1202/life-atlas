@@ -1656,8 +1656,11 @@ def cmd_todo(args):
     if action == "add":
         text = query or (args.text or "").strip()
         if not text:
-            sys.exit("todo add: provide task text (e.g. `atlas.py todo add \"Tax return\" --to +3d`).")
-        res = cal_engine.add_todo_in_brain(brain, text, target_date_spec=args.to, prio=args.prio or "med")
+            sys.exit("todo add: provide item text (e.g. `atlas.py todo add \"Dentist\" --to 2026-11-25 --time 10:15 --kind event`).")
+        res = cal_engine.add_todo_in_brain(
+            brain, text, target_date_spec=args.to, prio=args.prio or "med",
+            kind=getattr(args, "kind", None) or "todo", time_spec=getattr(args, "time", None),
+        )
         if not res.get("ok"):
             sys.exit(f"todo add failed: {res.get('error')}")
         idx = hk.load_index()
@@ -4548,6 +4551,8 @@ def main():
                    help="task action (default: list)")
     p.add_argument("target", nargs="*", help="task `#number` from briefing/list, task substring, or text for `add`")
     p.add_argument("--to", "--date", dest="to", help="target date (`YYYY-MM-DD`, `+3d`, `+1w`, `today`, `tomorrow`) for `move` or `add`")
+    p.add_argument("--time", help="optional time (`HH:MM` or `HH:MM-HH:MM`) for dated `add`")
+    p.add_argument("--kind", default="todo", help="timeline kind (`todo`, `event`, `deadline`, `blocked`, `goal`) for dated `add` (default: todo)")
     p.add_argument("--prio", choices=("high", "med", "low"), default="med", help="priority for undated `add` (default: med)")
     p.add_argument("--file", help="brain-relative `.md` path (optional when matching by `#number` or text)")
     p.add_argument("--line", type=int, help="1-based line number (`0` for frontmatter `due:`)")

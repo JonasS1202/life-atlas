@@ -2,6 +2,17 @@
 
 Written for users: `/atlas-update` shows the sections between the installed and the new version.
 
+## [1.3.2] - 2026-11-16
+
+- **Zero-Friction Domain & Project-Mode Switching (`atlas_hook.py`, `router.md`):**
+  - **Broadened `MAIL_RX`, `TODO_RX` & `SIGNAL_EXPLICIT`:** Recognizes plural and natural-language mail/calendar/save phrasings (`"neusten mails"`, `"inbox"`, `"Zahnarzt Termin"`, `"10:15 Uhr"`, `"speicher mir ab"`, `"trag ein"`, `"add to calendar"`) while ignoring mere `"E-Mail-Adresse"` mentions and staying strictly silent inside routed code projects (`Charter §1.5`).
+  - **1-Hop Linked Brain Context on `Atlas route`:** When routing into a code project on Turn 1, surfaces up to 2 directly linked non-hub `brain/` pages (`Linked brain context (open only if needed): ...`) so host/environment specs are reachable in zero hops without filesystem scans; clarifies in `ROUTER.md` that `brain/` (not `ROOT`) is the Git repository and that project branches/paths belong on the project page.
+  - **Direct Lead Read Guidance:** Prompt entity leads now instruct reading matched leads directly and calling `atlas.py find` only when a lead is missing, saving redundant search roundtrips.
+- **Atomic Event & Time Scheduling in `atlas.py todo add` (`atlas.py`, `cal_engine.py`, `calendar.md`):**
+  - **`--kind` & `--time` Flags:** `atlas.py todo add "<text>" --to YYYY-MM-DD [--time HH:MM[-HH:MM]] [--kind event|todo|deadline|blocked|goal]` inserts timed events, deadlines, and tasks chronologically into `calendar/README.md` and refreshes `calendar.html` in a single command.
+- **Single-Connection Batch `mail read` & Clean Excerpts (`atlas_mail.py`, `mail.md`):**
+  - **Multi-UID `mail read <UID1> [UID2 ...]` & `--body-chars N`:** Fetches multiple full messages over a single read-only IMAP connection (`BODY.PEEK[]`), strips invisible marketing preheader padding (`U+034F`, `U+200C`, soft hyphens) from snippets, and raises default `--with-body` excerpt length to 500 chars (configurable via `--body-chars`).
+
 ## [1.3.1] - 2026-11-16
 
 - **Zero-Turn-Waste Python Command & Anti-Cache-Grep Guard (`atlas_hook.py`, `router.md`, `atlas-search.md`, `atlas.py`):**

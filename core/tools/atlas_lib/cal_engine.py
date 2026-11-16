@@ -565,18 +565,27 @@ def reschedule_task_in_brain(brain, rel, target_date_spec, line_no=None, what=""
     return {"ok": False, "error": "matching task not found", "code": 404}
 
 
-def add_todo_in_brain(brain, text, target_date_spec=None, prio="med", kind="todo", today=None):
-    """Add a dated `[todo]` under `## Timeline` or an undated `[prio]` task under `## Open To-Dos` in `calendar/README.md`."""
+def add_todo_in_brain(brain, text, target_date_spec=None, prio="med", kind="todo", time_spec=None, today=None):
+    """Add a dated `[kind]` item under `## Timeline` or an undated `[prio]` task under `## Open To-Dos` in `calendar/README.md`."""
     clean = str(text or "").strip()
     if len(clean) < 2:
         return {"ok": False, "error": "task text is empty", "code": 400}
+    eff_kind = str(kind or "todo").strip().lower()
+    if not re.match(r"^[a-z]+(?::[a-zA-Z0-9_-]+)?$", eff_kind):
+        return {"ok": False, "error": f"invalid item kind: {kind!r}", "code": 400}
+    t_str = ""
+    if time_spec:
+        ts = str(time_spec).strip()
+        if not re.match(r"^\d{1,2}:\d{2}(?:-\d{1,2}:\d{2})?$", ts):
+            return {"ok": False, "error": f"invalid --time {time_spec!r} (expected HH:MM or HH:MM-HH:MM)", "code": 400}
+        t_str = f" {ts}"
     cal_path, lines, had_nl = _ensure_calendar_readme_lines(brain)
     if target_date_spec:
         try:
             target_iso = parse_target_date(target_date_spec, today=today)
         except ValueError as exc:
             return {"ok": False, "error": str(exc), "code": 400}
-        entry = f"- [ ] {target_iso} [{kind}] {clean}"
+        entry = f"- [ ] {target_iso}{t_str} [{eff_kind}] {clean}"
         ln = _insert_into_timeline_lines(lines, entry, target_iso)
         w_err = _atomic_write_text(cal_path, "\n".join(lines) + ("\n" if had_nl else "\n"))
         if w_err:
