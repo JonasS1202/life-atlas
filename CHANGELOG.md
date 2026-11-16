@@ -2,6 +2,14 @@
 
 Written for users: `/atlas-update` shows the sections between the installed and the new version.
 
+## [1.2.2] - 2026-11-16
+
+- **Clean Antigravity `Stop` JSONL Parsing & Read-Only Turn Silence (`atlas_hook.py`):**
+  - **Structured JSONL Turn Parser (`_parse_antigravity_turn`):** Replaces raw-byte substring scanning in `stop()` with proper JSONL parsing from the last `USER_INPUT` step onward. Only `PLANNER_RESPONSE.content` is inspected for `Atlas:` daily-log entries (preventing model `thinking` or tool outputs from leaking into `journal/`), and pure read-only lookups (`read_file`, `grep_search`, `ls`, `git status`, `atlas.py find/calendar/check`) no longer trigger false `Stop hook blocked termination` nudges.
+- **Hidden Follow-Up `PreInvocation` Hints & Zero Pronoun/Meta-Word Hint Noise (`atlas_hook.py`, `graph_engine.py`, `skeleton/tags.md`):**
+  - **Hidden `ephemeralMessage` After Session Bootstrap:** Turn 1 of each conversation/day uses persistent `systemMessage` for `Atlas · ok` + daily briefing, while subsequent turns emit `ephemeralMessage` so routine prompt hints stay invisible in the Thinking Path UI and never accumulate across turns.
+  - **Eliminate `#self` Pronoun & Conversational Filler Noise:** Filtered pronouns and meta-chat words (`ich`, `selbst`, `moin`, `atlas`, `antwort`, `nachricht`, `prompt`, `screenshot`, etc.) out of tag-synonym and FTS5 prompt-hint matching, restricted 1-hop graph neighbor expansion to strong/entity-anchored matches, and let bare greetings (`"moin"`) surface overdue items concisely even in later chats of the day.
+
 ## [1.2.1] - 2026-11-16
 
 - **Critical Hook Performance Fix — Eliminate Catastrophic Regex Backtracking (`graph_engine.py`, `atlas_hook.py`, `atlas.py`):**

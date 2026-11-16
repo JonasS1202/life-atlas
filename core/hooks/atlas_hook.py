@@ -328,14 +328,16 @@ def load_index(budget=None):
 
 # ---------------------------------------------------------------- output per agent
 
-def emit_context(agent, event, text):
+def emit_context(agent, event, text, persistent=None):
     if not text:
         return
     if agent == "claude":
         name = "SessionStart" if event == "session" else "UserPromptSubmit"
         out = {"hookSpecificOutput": {"hookEventName": name, "additionalContext": text}}
-    else:
+    elif persistent if persistent is not None else (event == "session"):
         out = {"injectSteps": [{"systemMessage": {"systemMessage": text}}]}
+    else:
+        out = {"injectSteps": [{"ephemeralMessage": text}]}
     sys.stdout.write(json.dumps(out))
 
 
@@ -1718,7 +1720,7 @@ def session_text(cwd, session, skip_pull=False):
                 _log_hook_error("session.render_calendar", exc)
         urgent = [d for d in due if d[1] <= 0]
         if urgent:
-            lines.append("Due today/overdue (mention only if relevant or due today): " + "; ".join(
+            lines.append("Due today/overdue (mention if due today, relevant, or when the user only sends a bare greeting like 'moin'): " + "; ".join(
                 f"{w.isoformat()} {what} [{_show(rel, cwd)}]" for w, _d, what, rel in urgent[:5]))
     hour = dt.datetime.now().hour
     if s.get("questions") == "evening-3" and hour >= _int(s.get("evening_hour"), 18) and st.get("last_evening") != today:
@@ -2145,24 +2147,127 @@ def _calendar_needs_render():
     return False
 
 
+READONLY_AG_TOOLS = {
+    "read_file", "view_file", "view_file_outline", "view_code_item", "grep_search", "find_by_name",
+    "list_dir", "list_resources", "read_resource", "read_url", "read_url_content", "search_web",
+    "ask_question", "list_plugin_accounts", "search_marketplace", "manage_task", "manage_subagents",
+}
+_MUTATING_SHELL_RX = re.compile(
+    r"(?i)(?:>>?|(?<!-)--(?:execute|fix)\b|\btodo\s+(?:done|move|skip|reopen|add)\b|"
+    r"\bcoach\s+(?:note|sync|zwo|auth-strava)\b|\bstate\s+--set\b|"
+    r"\bgit\s+(?:commit|push|add|tag|checkout|switch|merge|rebase|reset|stash|clean|rm|mv)\b|"
+    r"\b(?:rm|mv|cp|mkdir|rmdir|touch|chmod|chown|ln|tee|install|dd|truncate)\b|\bsed\s+-i\b|\bpython3?\s+(?:-[A-Za-z]+\s+)*-c\b)"
+)
+_READONLY_CMD_HEAD_RX = re.compile(
+    r"^(?:ls|cat|head|tail|grep|egrep|fgrep|rg|find|wc|stat|file|pwd|whoami|id|uname|date|echo|ps|which|type|true|"
+    r"diff|sort|uniq|cut|tr|git\s+(?:-C\s+\S+\s+)?(?:status|log|diff|show|branch|rev-parse|ls-remote|remote)|"
+    r"(?:/usr/bin/)?python3?(?:\s+-[IB]+)*\s+\S*atlas(?:_mail)?\.py)\b"
+)
+
+
+def _is_readonly_shell_cmd(cmd_raw):
+    cmd = str(cmd_raw or "").strip()
+    if not cmd:
+        return True
+    if _MUTATING_SHELL_RX.search(cmd):
+        return False
+    parts = [p.strip() for p in re.split(r"\|\||&&|[;|]", cmd) if p.strip()]
+    if not parts:
+        return True
+    for seg in parts:
+        seg_clean = re.sub(r"^\d+>&\d+\s*|\s*\d+>/dev/null\s*$", "", seg).strip()
+        if not seg_clean:
+            continue
+        if not _READONLY_CMD_HEAD_RX.match(seg_clean):
+            return False
+    return True
+
+
+def _parse_antigravity_turn(transcript_path):
+    """Parse Antigravity `transcript.jsonl` from the last `USER_INPUT` onward.
+
+    Returns `(assistant_content_only, did_mutating_work)` so model `thinking` and tool outputs
+    never leak into `daily_log`, and pure read-only lookups (`read_file`, `ls`, `atlas.py find`)
+    never trigger false `Stop hook blocked termination` nudges.
+    """
+    if not transcript_path or not os.path.isfile(transcript_path):
+        return "", False
+    try:
+        size = os.path.getsize(transcript_path)
+        offset = max(0, size - 600_000)
+        with open(transcript_path, "rb") as fh:
+            fh.seek(offset)
+            tail = fh.read().decode("utf-8", errors="replace")
+    except OSError:
+        return "", False
+
+    raw_lines = tail.splitlines()
+    if offset > 0 and raw_lines:
+        raw_lines = raw_lines[1:]
+
+    rows = []
+    for ln in raw_lines:
+        ln_s = ln.strip()
+        if not ln_s:
+            continue
+        try:
+            obj = json.loads(ln_s)
+            if isinstance(obj, dict):
+                rows.append(obj)
+        except ValueError:
+            continue
+
+    if not rows:
+        return tail[-60_000:], bool(AG_WORK.search(tail[-60_000:]))
+
+    last_user_idx = -1
+    for i, r in enumerate(rows):
+        if r.get("type") == "USER_INPUT":
+            last_user_idx = i
+    turn_rows = rows[last_user_idx + 1:] if last_user_idx >= 0 else rows
+
+    contents = []
+    did_work = False
+    for r in turn_rows:
+        if r.get("type") != "PLANNER_RESPONSE":
+            continue
+        c = r.get("content")
+        if isinstance(c, str) and c.strip():
+            contents.append(c)
+        for tc in (r.get("tool_calls") or []):
+            if not isinstance(tc, dict):
+                continue
+            tname = str(tc.get("name") or "").strip()
+            tlow = tname.lower()
+            if not tlow or IGNORED_TOOLS.search(tlow) or tlow in READONLY_AG_TOOLS:
+                continue
+            if tlow == "run_command":
+                args_obj = tc.get("args") or {}
+                raw_cmd = args_obj.get("CommandLine", "") if isinstance(args_obj, dict) else ""
+                if isinstance(raw_cmd, str) and raw_cmd.startswith('"') and raw_cmd.endswith('"'):
+                    try:
+                        raw_cmd = json.loads(raw_cmd)
+                    except ValueError:
+                        pass
+                if _is_readonly_shell_cmd(raw_cmd):
+                    continue
+            did_work = True
+
+    return "\n\n".join(contents), did_work
+
+
 def stop(agent, data):
     if PROBE:
         return
     st = _state()
     s = settings()
+    ag_did_work = False
     if agent == "claude":
         session = str(data.get("session_id") or "")
         last = data.get("last_assistant_message") or ""
     else:
         session = str(data.get("conversationId") or "")
-        last = ""
-        tp, user = data.get("transcriptPath"), (data.get("lastUserInput") or "")
-        if tp and os.path.isfile(tp):
-            with open(tp, "rb") as fh:
-                fh.seek(max(0, os.path.getsize(tp) - 400_000))
-                tail = fh.read().decode("utf-8", errors="replace")
-            anchor = json.dumps(user[:80])[1:-1] if user else ""
-            last = (tail[tail.rfind(anchor):] if anchor and anchor in tail else tail[-60_000:]).replace("\\n", "\n")
+        last, ag_did_work = _parse_antigravity_turn(data.get("transcriptPath"))
     context = st.get("sessions", {}).get(session, {}).get("project") or "—"
     if s.get("daily_log", "on") != "off":
         try:
@@ -2196,7 +2301,7 @@ def stop(agent, data):
     key = hashlib.sha256((session + (data.get("lastUserInput") or "")).encode("utf-8")).hexdigest()[:16]
     if _state().get("antigravity_last_nudge") == key:
         return
-    reason = _decide(session, marker, bool(AG_WORK.search(last)))
+    reason = _decide(session, marker, ag_did_work)
     if reason:
         st = _state()
         st["antigravity_last_nudge"] = key
@@ -2243,7 +2348,7 @@ def main():
                 # and never collides with a concurrent `SessionStart` on `.git/index.lock`.
                 s_out = session_text(cwd, session, skip_pull=True)
             p_out = prompt_text(prompt, cwd, session)
-            emit_context(agent, event, "\n".join(x for x in (s_out, p_out) if x))
+            emit_context(agent, event, "\n".join(x for x in (s_out, p_out) if x), persistent=need_session)
             return
         emit_context(agent, event, prompt_text(prompt, cwd, session))
     else:

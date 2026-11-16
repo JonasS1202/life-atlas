@@ -52,40 +52,57 @@ LINK_STOPWORDS = {
 }
 
 PROMPT_STOPWORDS = {
-    # German function words & common prompt verbs
-    "aber", "alle", "allem", "allen", "aller", "alles", "also", "andere", "anderen", "anderer", "anderes",
-    "auch", "auf", "aus", "bei", "beim", "bin", "bis", "bitte", "bzw", "da", "dabei", "dadurch", "dafuer",
-    "dafür", "daher", "damit", "ach", "dann", "daran", "darauf", "daraus", "darin", "darum", "darunter",
-    "das", "dass", "davon", "dazu", "dein", "deine", "deinem", "deinen", "deiner", "dem", "den", "denn",
-    "der", "des", "dessen", "dich", "die", "dies", "diese", "diesem", "diesen", "dieser", "dieses", "dir",
-    "doch", "dort", "du", "durch", "ein", "eine", "einem", "einen", "einer", "eines", "einige", "er",
-    "erklaer", "erkläre", "erklaere", "erklär", "erst", "es", "etwa", "etwas", "euch", "euer", "eure",
-    "falls", "fast", "finde", "folgende", "fuer", "für", "ganz", "gegen", "gehen", "geht", "gern", "gerne",
-    "gib", "gibt", "gut", "hab", "habe", "haben", "hat", "hatte", "hier", "hin", "hinter", "ich", "ihm",
-    "ihn", "ihnen", "ihr", "ihre", "ihrem", "ihren", "ihrer", "immer", "in", "indem", "ins", "ist", "ja",
-    "jede", "jedem", "jeden", "jeder", "jedes", "jetzt", "kann", "kannst", "kein", "keine", "keinem",
-    "keinen", "keiner", "koennen", "können", "könnte", "koennte", "lass", "mach", "mache", "machen", "mal",
-    "man", "mehr", "mein", "meine", "meinem", "meinen", "meiner", "meines", "mich", "mir", "mit", "moechte",
-    "möchte", "muss", "müssen", "muessen", "nach", "nein", "nicht", "nichts", "noch", "nun", "nur", "ob",
-    "oder", "ohne", "sag", "sage", "schau", "schon", "sehr", "sei", "sein", "seine", "seinem", "seinen",
-    "seiner", "seit", "selbst", "sich", "sie", "sind", "so", "soll", "sollte", "sondern", "sonst", "sowie",
-    "steh", "steht", "ueber", "über", "um", "und", "uns", "unser", "unsere", "unter", "viel", "viele",
-    "vom", "von", "vor", "wann", "war", "waren", "warum", "was", "weg", "weil", "weiter", "welche",
-    "welchem", "welchen", "welcher", "welches", "wenn", "wer", "werde", "werden", "wie", "wieder", "will",
-    "wir", "wird", "wo", "woher", "wohin", "wohl", "wollen", "wurde", "wurden", "zeig", "zeige", "zu",
-    "zum", "zur", "zwar", "zwischen",
-    # English function words & common prompt verbs
-    "about", "after", "again", "all", "also", "always", "and", "any", "are", "ask", "been", "before",
-    "being", "between", "both", "but", "can", "check", "could", "did", "does", "doing", "done", "each",
-    "else", "even", "every", "explain", "find", "first", "for", "from", "get", "give", "going", "good",
-    "had", "has", "have", "having", "here", "her", "hers", "him", "his", "how", "into", "its", "just",
-    "keep", "know", "let", "like", "look", "make", "many", "may", "more", "most", "much", "must", "need",
-    "never", "new", "next", "not", "now", "off", "only", "other", "our", "out", "over", "own", "please",
-    "put", "same", "say", "see", "should", "show", "some", "still", "such", "take", "tell", "than", "that",
-    "the", "their", "them", "then", "there", "these", "they", "thing", "think", "this", "those", "through",
-    "time", "too", "under", "until", "use", "using", "very", "want", "was", "way", "well", "were", "what",
-    "when", "where", "which", "while", "who", "whom", "why", "will", "with", "within", "without", "would",
-    "you", "your", "yours",
+    # German function words, pronouns, auxiliaries & common conversational / meta-chat words
+    "aber", "ach", "aktuell", "alle", "allem", "allen", "aller", "alles", "also", "andere", "anderen", "anderer",
+    "anderes", "anfang", "angeschaut", "anschauen", "antwort", "antworten", "auch", "auf", "aufgefallen",
+    "aus", "ausgefuehrt", "ausgeführt", "besser", "benutzt", "benutzen", "bei", "beim", "bin", "bis", "bitte",
+    "bzw", "chat", "chats", "da", "dabei", "dadurch", "dafuer", "dafür", "daher", "damit", "ach", "danke", "dann",
+    "daran", "darauf", "daraus", "darin", "darum", "darunter", "das", "dass", "davon", "dazu", "dein", "deine",
+    "deinem", "deinen", "deiner", "dem", "den", "denke", "denken", "denn", "der", "des", "dessen", "dich", "die",
+    "dies", "diese", "diesem", "diesen", "dieser", "dieses", "dinge", "dir", "doch", "dort", "du", "durch",
+    "eben", "eigentlich", "ein", "eine", "einem", "einen", "einer", "eines", "einfach", "einige", "einmal", "er",
+    "erklaer", "erkläre", "erklaere", "erklär", "erklaeren", "erklären", "erst", "es", "etwa", "etwas", "euch",
+    "euer", "eure", "falls", "fast", "fehlt", "fehlen", "fehlgeschlagen", "fertig", "finde", "finden", "folgende",
+    "frage", "fragen", "fuer", "für", "ganz", "ganze", "gar", "gebaut", "geaendert", "geändert", "gefragt",
+    "gegen", "gehen", "geht", "geladen", "geloescht", "gelöscht", "gemacht", "genau", "geoeffnet", "geöffnet",
+    "gerade", "gern", "gerne", "gesagt", "geschickt", "geschrieben", "gesehen", "gesendet", "gewollt", "gezeigt",
+    "gib", "gibt", "ging", "gleich", "gleiche", "gleichen", "gleicher", "gleiches", "gut", "gute", "hochgeladen",
+    "angepasst", "erstellt",
+    "hab", "habe", "haben", "hallo", "hat", "hatte", "hatten", "heisst", "heißt", "heute", "hier", "hin",
+    "hinter", "ich", "ihm", "ihn", "ihnen", "ihr", "ihre", "ihrem", "ihren", "ihrer", "immer", "in", "indem",
+    "info", "infos", "ins", "irgendwann", "irgendwas", "irgendwie", "irgendwo", "ist", "ja", "jede", "jedem",
+    "jeden", "jeder", "jedes", "jetzt", "kann", "kannst", "kein", "keine", "keinem", "keinen", "keiner", "klar",
+    "koennen", "können", "könnte", "koennte", "komisch", "komische", "komischen", "korrigieren", "kurz", "kurze",
+    "laeuft", "läuft", "lange", "laenger", "länger", "lass", "lassen", "letzte", "letzten", "liegt", "los",
+    "mach", "mache", "machen", "macht", "mal", "man", "mehr", "mein", "meine", "meinem", "meinen", "meiner",
+    "meines", "mich", "mir", "mit", "moechte", "möchte", "moin", "morgen", "muss", "müssen", "muessen", "nach",
+    "nachricht", "nachrichten", "neben", "nein", "neue", "neuen", "neuer", "neues", "nicht", "nichts", "noch",
+    "nochmal", "nun", "nur", "ob", "oben", "oder", "oeffnen", "öffnen", "oft", "ohne", "ok", "okay", "passt",
+    "pfad", "ploetzlich", "plötzlich", "problem", "prompt", "prompts", "pruefen", "prüfen", "punkt", "punkte",
+    "recht", "richtig", "sag", "sage", "sagen", "schau", "schauen", "schon", "screenshot", "screenshots", "sehe",
+    "sehen", "sehr", "sei", "sein", "seine", "seinem", "seinen", "seiner", "seit", "seite", "seiten", "selbst",
+    "sich", "sie", "siehst", "sieht", "sind", "so", "sofort", "soll", "sollte", "sondern", "sonst", "sowie",
+    "steh", "steht", "stimmt", "teil", "text", "thema", "thinking", "tiefer", "trotzdem", "tun", "ueber", "über",
+    "ueberhaupt", "überhaupt", "um", "und", "uns", "unser", "unsere", "unten", "unter", "update", "updates",
+    "viel", "viele", "vielleicht", "vom", "von", "vor", "vorher", "wann", "war", "waren", "warum", "was", "weg",
+    "weil", "weiter", "weitere", "welche", "welchem", "welchen", "welcher", "welches", "wenig", "wenn", "wer",
+    "werde", "werden", "wichtig", "wie", "wieder", "wieso", "will", "wir", "wird", "wirklich", "wo", "woher",
+    "wohin", "wohl", "wollen", "woran", "wurde", "wurden", "zeig", "zeige", "zeigen", "zeit", "zu", "zuerst",
+    "zum", "zur", "zusammen", "zwar", "zwischen", "atlas",
+    # English function words & common conversational / meta-chat words
+    "about", "actually", "after", "again", "all", "already", "also", "always", "and", "answer", "any", "are",
+    "ask", "asked", "been", "before", "being", "better", "between", "both", "but", "can", "chat", "check",
+    "could", "did", "does", "doing", "done", "each", "else", "even", "every", "explain", "find", "first", "fix",
+    "for", "from", "get", "give", "going", "good", "had", "has", "have", "having", "hello", "here", "her", "hers",
+    "him", "his", "how", "into", "its", "just", "keep", "know", "let", "like", "look", "looks", "made", "make",
+    "many", "may", "mean", "message", "more", "most", "much", "must", "need", "never", "new", "next", "not",
+    "now", "off", "only", "other", "our", "out", "over", "own", "path", "please", "prompt", "put", "question",
+    "really", "right", "same", "say", "screen", "see", "seem", "seems", "should", "show", "some", "something",
+    "still", "strange", "such", "suddenly", "sure", "take", "tell", "than", "that", "the", "their", "them",
+    "then", "there", "these", "they", "thing", "things", "think", "this", "those", "through", "time", "too",
+    "under", "until", "update", "use", "used", "using", "very", "want", "was", "way", "weird", "well", "were",
+    "what", "when", "where", "which", "while", "who", "whom", "why", "will", "with", "within", "without",
+    "work", "works", "would", "wrong", "you", "your", "yours",
 }
 
 
@@ -1143,10 +1160,10 @@ def compute_prompt_hints(brain, prompt, idx, tag_vocab_map, vocab_terms, skip_pa
     comp = re.sub(r"[^a-z0-9]", "", low)
     cands = {}
 
-    # 1. Known vocabulary entities (titles, aliases, glossary terms)
+    # 1. Known vocabulary entities (titles, aliases, glossary terms; skip addressing Atlas itself by bare name)
     for t in vocab_terms:
-        tl = norm_text(t)
-        if not tl:
+        tl = norm_text(t).strip()
+        if not tl or tl in ("atlas",):
             continue
         if re.search(r"(?<![\w-])" + re.escape(tl) + r"(?![\w-])", low):
             cands[t] = True
@@ -1159,12 +1176,18 @@ def compute_prompt_hints(brain, prompt, idx, tag_vocab_map, vocab_terms, skip_pa
         if not re.match(r"^\d{1,2}$", tok):
             cands.setdefault(tok, False)
 
-    # 3. Tag & tag-synonym hits
+    # 3. Tag & tag-synonym hits (never trigger on pronouns/stopwords like `ich`, `selbst`, `atlas`, `system`)
+    tag_ignore = {"atlas", "system", "self", "log", "learned", "project", "preference"}
     canon = {s.lower(): t.lower() for t, syns in (tag_vocab_map or {}).items() for s in syns}
     tag_pages = {}
     for tag, syns in (tag_vocab_map or {}).items():
+        if tag.lower() in tag_ignore:
+            continue
         for word in [tag] + list(syns):
-            if len(word) >= 3 and re.search(r"(?<![\w-])" + re.escape(norm_text(word)) + r"(?![\w-])", low):
+            nw = norm_text(word).strip()
+            if len(nw) < 3 or nw in PROMPT_STOPWORDS or word.lower() in PROMPT_STOPWORDS or nw in tag_ignore:
+                continue
+            if re.search(r"(?<![\w-])" + re.escape(nw) + r"(?![\w-])", low):
                 tag_pages[tag] = [
                     r for r, e in idx.items()
                     if r not in skip and not r.startswith("_")
@@ -1219,7 +1242,7 @@ def compute_prompt_hints(brain, prompt, idx, tag_vocab_map, vocab_terms, skip_pa
             matched = {
                 p: s for p, s in matched.items()
                 if p in idx and p not in skip and not p.startswith("_")
-                and not (is_free and is_folder_hub(p))
+                and not (is_free and (is_folder_hub(p) or p.startswith(("journal/", "skills/"))))
             }
             if not matched or len(matched) > max_df_share * n:
                 continue
@@ -1236,9 +1259,14 @@ def compute_prompt_hints(brain, prompt, idx, tag_vocab_map, vocab_terms, skip_pa
 
     ranked = sorted(scores, key=lambda r: (-scores[r], r))[:max_hints]
     direct = [(rel, idx.get(rel, {}).get("summary", ""), sorted(hits[rel], key=str.lower)[:4]) for rel in ranked]
+    # Only expand 1-hop graph neighbors from strong/entity-anchored seeds (never from weak single free-token coincidences)
+    strong_seeds = [
+        r for r in ranked[:3]
+        if any(h.startswith("#") or h not in free_tokens or len(h) >= 8 for h in hits.get(r, ())) or len(hits.get(r, ())) >= 2
+    ]
     exp = expand_1hop_neighbors(
-        brain, ranked[:3], skip_pages=skip | set(ranked), max_neighbors=3, include_daily_logs=False, db_path=db_path
-    )
+        brain, strong_seeds, skip_pages=skip | set(ranked), max_neighbors=3, include_daily_logs=False, db_path=db_path
+    ) if strong_seeds else []
     neighbors = [(n_rel, idx.get(n_rel, {}).get("summary", ""), via_rel, kind) for n_rel, _sc, via_rel, kind in exp]
     return direct, neighbors
 

@@ -1381,14 +1381,30 @@ class UiReleaseV11(AtlasCase):
         self.assertIn("4. [OPEN · high] Backup-Konzept testen", c1_text)
         self.assertIn("Quartalsplanung", c1_text)
 
-        # 3. Turn 2 in the SAME conversation `c1` (`invocationNum=0`) does NOT repeat `Atlas · ok` or briefing
+        # 3. Turn 2 in the SAME conversation `c1` (`invocationNum=0`) does NOT repeat `Atlas · ok` or briefing,
+        #    ignores pronoun/greeting filler (`Ich`, `moin`, `atlas`), and uses hidden `ephemeralMessage` for real hints
         c1_turn2 = self.hook("antigravity", "prompt", {
             "conversationId": "c1",
             "invocationNum": 0,
-            "lastUserInput": "erklär mir Rekursion",
+            "lastUserInput": "Ich habe moin atlas gesagt, erklär mir das bitte kurz",
             "workspacePaths": [fwd(self.root)],
         })
         self.assertEqual(c1_turn2, "")
+
+        res_c1_turn3 = subprocess.run(
+            [sys.executable, "-I", "-B", self.hookf, "antigravity", "prompt"],
+            input=json.dumps({
+                "conversationId": "c1",
+                "invocationNum": 0,
+                "lastUserInput": "was steht im Stromvertrag?",
+                "workspacePaths": [fwd(self.root)],
+            }),
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+        c1_t3_json = json.loads(res_c1_turn3.stdout.strip())
+        self.assertIn("ephemeralMessage", c1_t3_json["injectSteps"][0])
+        self.assertNotIn("systemMessage", c1_t3_json["injectSteps"][0])
+        self.assertIn("strom.md", c1_t3_json["injectSteps"][0]["ephemeralMessage"])
 
         # 4. Turn 1 in a SECOND conversation `c2` on the same day gets `Atlas · ok` + `Due today/overdue`, NOT briefing
         c2_turn1 = self.hook("antigravity", "prompt", {
@@ -1402,7 +1418,55 @@ class UiReleaseV11(AtlasCase):
         self.assertNotIn("Atlas briefing", c2_turn1)
         self.assertNotIn("Task check-in", c2_turn1)
 
-        # 5. Antigravity `Stop` handles `terminationReason == "NO_TOOL_CALL"` and respects `continuationActive`
+        # 5. Antigravity `Stop` JSONL parser:
+        #    - Read-only `read_file` + `ls -la` + `Atlas:` inside `thinking` NEVER nudges and NEVER leaks `thinking` to daily log
+        tp_ro = os.path.join(self.tmp, "ag_readonly.jsonl")
+        with open(tp_ro, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"type": "USER_INPUT", "content": "moin atlas"}) + "\n")
+            fh.write(json.dumps({
+                "type": "PLANNER_RESPONSE",
+                "thinking": "Maybe write\nAtlas: leaked thinking should never enter journal\n",
+                "content": "",
+                "tool_calls": [
+                    {"name": "read_file", "args": {"Path": "brain/settings.md"}},
+                    {"name": "run_command", "args": {"CommandLine": "\"ls -la brain/inbox/\""}},
+                ],
+            }) + "\n")
+            fh.write(json.dumps({"type": "PLANNER_RESPONSE", "content": "Moin! Was steht an?"}) + "\n")
+        stop_ro = self.hook("antigravity", "stop", {
+            "conversationId": "c-readonly",
+            "terminationReason": "NO_TOOL_CALL",
+            "continuationActive": False,
+            "fullyIdle": True,
+            "lastUserInput": "moin atlas",
+            "transcriptPath": fwd(tp_ro),
+        })
+        self.assertEqual(stop_ro, "")
+        j_dir = os.path.join(self.brain, "journal")
+        j_files = [os.path.join(dp, f) for dp, _d, fs in os.walk(j_dir) for f in fs if f.endswith(".md")] if os.path.isdir(j_dir) else []
+        for jf in j_files:
+            self.assertNotIn("leaked thinking", self.read(jf))
+
+        #    - Mutating `write_file` without `Atlas:` DOES trigger reminder; `continuationActive` blocks loops
+        tp_mut = os.path.join(self.tmp, "ag_mutating.jsonl")
+        with open(tp_mut, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"type": "USER_INPUT", "content": "leg eine notiz an"}) + "\n")
+            fh.write(json.dumps({
+                "type": "PLANNER_RESPONSE",
+                "content": "Habe die Datei angelegt.",
+                "tool_calls": [{"name": "write_file", "args": {"Path": "brain/areas/x.md"}}],
+            }) + "\n")
+        stop_mut = self.hook("antigravity", "stop", {
+            "conversationId": "c-mut",
+            "terminationReason": "NO_TOOL_CALL",
+            "continuationActive": False,
+            "fullyIdle": True,
+            "lastUserInput": "leg eine notiz an",
+            "transcriptPath": fwd(tp_mut),
+        })
+        self.assertIn("work was done without an `Atlas:` line", stop_mut)
+
+        #    - Learning signal on `c2` triggers nudge once and respects `continuationActive`
         tp_ag = os.path.join(self.tmp, "ag_transcript.jsonl")
         with open(tp_ag, "w", encoding="utf-8") as fh:
             fh.write(json.dumps({"type": "USER_INPUT", "content": "Nein, merk dir ab jetzt immer UTF-8"}) + "\n")
