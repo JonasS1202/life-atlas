@@ -2,6 +2,18 @@
 
 Written for users: `/atlas-update` shows the sections between the installed and the new version.
 
+## [1.3.0] - 2026-11-16
+
+- **Surgical Push + Agentic Pull Architecture (`atlas_hook.py`, `graph_engine.py`, `router.md`, Core Skills):**
+  - **Zero Speculative Prompt Noise:** Removed speculative full-text (`free_tokens` FTS5) and blind 1-hop graph expansion from `PreInvocation` / `UserPromptSubmit`. The prompt hook now emits only deterministic signals: session bootstrap (`Atlas · ok` + once-daily briefing/task check-in), project routing (strictly silent once inside an active code project per Charter §1.5), domain pointers (`coach`, `mail`, `todo`), custom user extension triggers, capture/opt-out signals, and up to 3 exact named-entity / alias / contract-ID / concrete-domain-tag leads. Deep FTS5 + trigram + 1-hop graph traversal stays strictly on-demand via `atlas.py find` and `atlas.py context`.
+  - **Core Skill Token-Budget Trim:** Condensed core `SKILL.md` descriptions (~700 chars saved per chat, comfortably inside the `< 2400` char budget).
+- **Capture-First Memory, `atlas.py where` Placement Advisor & Zero-Token `Stop` Auto-Heal (`atlas_hook.py`, `atlas.py`, `graph_engine.py`, `learn.md`):**
+  - **Capture-First ("Default-Keep with Timestamps"):** Atlas defaults to filing every new lasting fact, number, tariff, date, contact, decision, preference, or task update immediately with `verified: YYYY-MM-DD` / `(Stand: YYYY-MM-DD)` and `HH:MM` journal logs — unless the user explicitly opts out (`"nicht speichern"`, `"off the record"` -> `do_not_store` suppresses storage and daily logging).
+  - **`atlas.py where <topic>` Placement & Grouping Advisor:** One-command lookup before creating a page that surfaces matching existing pages (extend before creating!) alongside the user's canonical `areas/<group>/` folders and hub `README.md` targets.
+  - **Zero-Token Background Integrity on `Stop` (`auto_heal_pages`):** Before `autocommit_and_push()`, `stop()` inspects `git status` for newly created/modified `brain/` pages and automatically compiles `[[Wikilinks]]`, normalizes tag synonyms against `tags.md`, adds unambiguous `related:` frontmatter edges, and syncs `index.sqlite` with zero LLM overhead.
+- **Update-Safe User Individualization (`atlas.py ext`, `atlas.py <custom_cmd>`, Recursive Skill Bundling):**
+  - **Custom CLI Commands & Skills Survive `/atlas-update`:** Users can build custom integrations in the grown brain (`brain/skills/<name>/SKILL.md` with `triggers:`/`aliases:` and recursive `scripts/`/`references/` subdirectories, `brain/howto/scripts/<cmd>.py`, `brain/_secrets/<service>.env`, plus `brain/skills/atlas-<core>/SKILL.md` overlays). `atlas.py wire` bundles skill subdirectories binary-safely into both Claude Code and Antigravity, `atlas.py <cmd>` (and `atlas.py ext` / `atlas.py run`) executes custom commands directly with `ATLAS_BRAIN` set, and `core-apply` never touches them.
+
 ## [1.2.2] - 2026-11-16
 
 - **Clean Antigravity `Stop` JSONL Parsing & Read-Only Turn Silence (`atlas_hook.py`):**

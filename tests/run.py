@@ -1073,14 +1073,19 @@ class WikiGraph(AtlasCase):
         self.assertIn("[Bankberater](../../people/max-mustermann.md#konditionen-kontakt)", nb_txt)
         self.assertIn("`[[Max Mustermann]]`", nb_txt)
 
-        # 4. `atlas.py find` + 1-hop `↳ linked:` expansion + prompt hook 1-hop hints
+        # 4. `atlas.py find` (Agentic Pull: FTS5 + 1-hop `↳ linked:`) vs. surgical prompt hook (entity leads only)
         f_out = self.atlas("find", "rückgewinnung").stdout
         self.assertIn("areas/finanzen/nordbank.md", f_out)
         self.assertIn("↳ linked: people/max-mustermann.md", f_out)
-        p_hint = self.hook("claude", "prompt", {"prompt": "was war bei der Kundenrückgewinnung?", "session_id": "wg1"})
-        self.assertIn("areas/finanzen/nordbank.md", p_hint)
-        self.assertIn("↳ linked:", p_hint)
-        self.assertIn("people/max-mustermann.md", p_hint)
+        p_body_only = self.hook("claude", "prompt", {"prompt": "was war bei der Kundenrückgewinnung?", "session_id": "wg1"})
+        self.assertEqual(p_body_only, "")
+        p_entity = self.hook("claude", "prompt", {
+            "prompt": "wie erreiche ich Max Mustermann bei der Nordbank?",
+            "session_id": "wg1",
+        })
+        self.assertIn("people/max-mustermann.md", p_entity)
+        self.assertIn("areas/finanzen/nordbank.md", p_entity)
+        self.assertNotIn("↳ linked:", p_entity)
 
         # 5. `atlas.py graph` shows outlinks, backlinks, and unlinked mentions (before `link` runs)
         g_json = json.loads(self.atlas("graph", "Max Mustermann", "--json").stdout)
@@ -1526,6 +1531,219 @@ class UiReleaseV11(AtlasCase):
 
         todo_with_upcoming = self.atlas("todo", "list", "--all").stdout
         self.assertIn(f"[in 4 d · {d_plus4}] Backup-Konzept testen", todo_with_upcoming)
+
+    def test_v130_surgical_hook_capture_first_where_autoheal_and_extensions(self):
+        # Set up entities, tags, and an active code project
+        self.page(
+            "tags.md",
+            "---\nsummary: Tag list\ntags: [atlas]\n---\n# Tags\n\n"
+            "| Tag | Meaning | Synonyms |\n"
+            "|---|---|---|\n"
+            "| **atlas** | About Atlas | |\n"
+            "| **contract** | Contracts | vertrag |\n"
+            "| **auto** | Vehicle | fahrzeug, kfz |\n"
+            "| **person** | Contacts | kontakt |\n"
+            "| **project** | Projects | projekt |\n",
+        )
+        self.page(
+            "people/max-mustermann.md",
+            "---\nsummary: Steuerberater Max Mustermann\ntags: [person]\naliases: [Mustermann]\n---\n"
+            "# Max Mustermann\n\nKontakt für Mandanten.\n",
+        )
+        self.page(
+            "areas/vertraege/stadtwerke-nord.md",
+            "---\nsummary: Gastarif Stadtwerke Nord\ntags: [contract]\naliases: [SWN-Gas]\n---\n"
+            "# Stadtwerke Nord\n\nVertragsnummer KD-884210.\n",
+        )
+        os.makedirs(os.path.join(self.root, "code", "webapp", ".git"), exist_ok=True)
+        self.page(
+            "projects/webapp/README.md",
+            "---\nsummary: Webapp Repo\ntags: [project]\npath: code/webapp\n---\n# Project: Webapp\n",
+        )
+        self.atlas("index")
+
+        # 1. Surgical prompt hook:
+        #    - Meta/conversational prose produces ZERO false-positive page hints
+        meta_out = self.hook("claude", "prompt", {
+            "prompt": "Ich habe jetzt ein Atlas-Update gemacht und noch mal den gleichen Prompt wieder benutzt. Sieht das jetzt besser aus?",
+            "session_id": "s-meta",
+        })
+        self.assertEqual(meta_out, "")
+
+        #    - Exact named entity / alias / contract ID produces surgical lead
+        ent_out = self.hook("claude", "prompt", {
+            "prompt": "Was steht bei Stadtwerke Nord zu KD-884210?",
+            "session_id": "s-ent",
+        })
+        self.assertIn("areas/vertraege/stadtwerke-nord.md", ent_out)
+
+        #    - Mail & Todo domain pointers fire deterministically
+        mail_out = self.hook("claude", "prompt", {
+            "prompt": "Schau bitte in mein Postfach nach neuen E-Mails",
+            "session_id": "s-dom",
+        })
+        self.assertIn("atlas.py mail", mail_out)
+        todo_out = self.hook("claude", "prompt", {
+            "prompt": "Welche offenen Aufgaben und To-Dos stehen heute an?",
+            "session_id": "s-dom",
+        })
+        self.assertIn("atlas.py todo", todo_out)
+
+        #    - Charter §1.5 project isolation: once routed into a code project, subsequent prompts stay quiet
+        r1 = self.hook("claude", "prompt", {
+            "prompt": "arbeite weiter im Projekt Webapp",
+            "session_id": "s-proj",
+            "cwd": fwd(self.root),
+        })
+        self.assertIn("project 'Webapp'", r1)
+        r2 = self.hook("claude", "prompt", {
+            "prompt": "baue für Max Mustermann einen neuen Button mit Preis 49,90 EUR ab 2026-12-01",
+            "session_id": "s-proj",
+            "cwd": fwd(os.path.join(self.root, "code", "webapp")),
+        })
+        self.assertEqual(r2, "")
+
+        # 2. Capture-First signals & opt-out (`do_not_store`):
+        fact_out = self.hook("claude", "prompt", {
+            "prompt": "Der neue Abschlag liegt ab 2026-12-01 bei 115,50 EUR monatlich.",
+            "session_id": "s-fact",
+        })
+        self.assertIn("Atlas learning signal (fact): capture-first", fact_out)
+        self.assertIn("atlas.py where", fact_out)
+
+        optout_prompt = "Bitte nicht speichern: Einmal-Code 774411 für den Test."
+        opt_out = self.hook("claude", "prompt", {
+            "prompt": optout_prompt,
+            "session_id": "s-optout",
+        })
+        self.assertIn("Do NOT store", opt_out)
+        self.assertNotIn("Atlas learning signal (fact)", opt_out)
+        tp_opt = os.path.join(self.tmp, "optout.jsonl")
+        with open(tp_opt, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"type": "USER_INPUT", "content": optout_prompt}) + "\n")
+            fh.write(json.dumps({
+                "type": "PLANNER_RESPONSE",
+                "content": "Verstanden, nichts gespeichert.\nAtlas: secret-leak-should-not-log",
+            }) + "\n")
+        stop_opt = self.hook("antigravity", "stop", {
+            "conversationId": "s-optout",
+            "terminationReason": "NO_TOOL_CALL",
+            "continuationActive": False,
+            "fullyIdle": True,
+            "lastUserInput": optout_prompt,
+            "transcriptPath": fwd(tp_opt),
+        })
+        self.assertEqual(stop_opt, "")
+        j_dir = os.path.join(self.brain, "journal")
+        j_files = [os.path.join(dp, f) for dp, _d, fs in os.walk(j_dir) for f in fs if f.endswith(".md")] if os.path.isdir(j_dir) else []
+        for jf in j_files:
+            self.assertNotIn("secret-leak-should-not-log", self.read(jf))
+
+        # 3. `atlas.py where` placement & grouping advisor:
+        w_out = self.atlas("where", "SWN-Gas", "Vertrag").stdout
+        self.assertIn("areas/vertraege/stadtwerke-nord.md", w_out)
+        self.assertIn("areas/vertraege/", w_out)
+
+        # 4. Zero-token `Stop` auto-heal on newly written dirty brain pages:
+        self.page(
+            "areas/auto/fahrzeugschein.md",
+            "---\nsummary: Zulassung Kombi\ntags: [kfz]\nverified: 2026-11-16\n---\n"
+            "# Fahrzeugschein\n\nUnterlagen liegen bei [[Max Mustermann]]. Tarif läuft parallel zu Stadtwerke Nord.\n",
+        )
+        tp_heal = os.path.join(self.tmp, "heal.jsonl")
+        with open(tp_heal, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"type": "USER_INPUT", "content": "speichere fahrzeugschein"}) + "\n")
+            fh.write(json.dumps({
+                "type": "PLANNER_RESPONSE",
+                "content": "Gespeichert.\nAtlas: areas/auto/fahrzeugschein.md angelegt",
+                "tool_calls": [{"name": "write_file", "args": {"Path": "brain/areas/auto/fahrzeugschein.md"}}],
+            }) + "\n")
+        self.hook("antigravity", "stop", {
+            "conversationId": "s-heal",
+            "terminationReason": "NO_TOOL_CALL",
+            "continuationActive": False,
+            "fullyIdle": True,
+            "lastUserInput": "speichere fahrzeugschein",
+            "transcriptPath": fwd(tp_heal),
+        })
+        healed = self.read(os.path.join(self.brain, "areas", "auto", "fahrzeugschein.md"))
+        self.assertIn("tags: [auto]", healed)
+        self.assertIn("[Max Mustermann](../../people/max-mustermann.md)", healed)
+        self.assertIn("related:", healed)
+        self.assertIn("areas/vertraege/stadtwerke-nord.md", healed)
+
+        # 5. Update-safe User Individualization (custom skill + `scripts/` + `triggers:` + `howto/scripts/` + overlay + secrets):
+        self.page(
+            "skills/gdrive/SKILL.md",
+            "---\nname: gdrive\ndescription: \"Sync and search personal Google Drive folders.\"\n"
+            "triggers: [google drive, gdrive]\n---\n# Google Drive Skill\n\nRun `atlas.py gdrive`.\n",
+        )
+        gdrive_script = os.path.join(self.brain, "skills", "gdrive", "scripts", "gdrive.py")
+        os.makedirs(os.path.dirname(gdrive_script), exist_ok=True)
+        with open(gdrive_script, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(
+                "import os, sys\n"
+                "print('GDRIVE_OK', bool(os.environ.get('ATLAS_BRAIN')), ' '.join(sys.argv[1:]))\n"
+            )
+        custom_sync = os.path.join(self.brain, "howto", "scripts", "custom_sync.py")
+        os.makedirs(os.path.dirname(custom_sync), exist_ok=True)
+        with open(custom_sync, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("print('CUSTOM_SYNC_OK')\n")
+        self.page(
+            "skills/atlas-mail/SKILL.md",
+            "---\nname: atlas-mail\ndescription: \"Personal mail account mapping.\"\n---\n# Mail Overlay\n",
+        )
+        sec_file = os.path.join(self.brain, "_secrets", "gdrive.env")
+        os.makedirs(os.path.dirname(sec_file), exist_ok=True)
+        with open(sec_file, "w", encoding="utf-8") as fh:
+            fh.write("GDRIVE_FOLDER_ID=dummy123\n")
+
+        self.wire_both()
+        # Subdirectory `scripts/gdrive.py` copied to both agent skill trees; core skill `atlas-mail` keeps overlay note
+        self.assertTrue(os.path.isfile(os.path.join(self.root, ".agents", "skills", "gdrive", "scripts", "gdrive.py")))
+        self.assertTrue(os.path.isfile(os.path.join(self.root, ".claude", "skills", "gdrive", "scripts", "gdrive.py")))
+        mail_wired = self.read(os.path.join(self.root, ".agents", "skills", "atlas-mail", "SKILL.md"))
+        self.assertIn("brain/skills/atlas-mail/SKILL.md", mail_wired)
+
+        # Prompt hook detects `triggers: [google drive, gdrive]`
+        ext_hint = self.hook("antigravity", "prompt", {
+            "conversationId": "s-ext",
+            "invocationNum": 0,
+            "lastUserInput": "Lade den Vertrag bitte in Google Drive hoch",
+            "workspacePaths": [fwd(self.root)],
+        })
+        self.assertIn("skill 'gdrive'", ext_hint)
+
+        # `atlas.py ext` lists both commands and `atlas.py gdrive` / `atlas.py custom-sync` execute directly
+        ext_json = json.loads(self.atlas("ext", "--json").stdout)
+        ext_names = {a for c in ext_json["custom_commands"] for a in c["aliases"]}
+        self.assertIn("gdrive", ext_names)
+        self.assertIn("custom-sync", ext_names)
+        gd_run = self.atlas("gdrive", "--folder", "Steuern").stdout.strip()
+        self.assertEqual(gd_run, "GDRIVE_OK True --folder Steuern")
+        cs_run = self.atlas("custom-sync").stdout.strip()
+        self.assertEqual(cs_run, "CUSTOM_SYNC_OK")
+
+        # Simulate upstream `/atlas-update` (`core-apply` + `wire`) -> all user customizations survive 100% intact!
+        up_repo = os.path.join(self.tmp, "upstream_next")
+        shutil.copytree(
+            REPO, up_repo,
+            ignore=shutil.ignore_patterns(".git", "__pycache__", "_atlas"),
+        )
+        with open(os.path.join(up_repo, "core", "VERSION"), "w", encoding="utf-8") as fh:
+            fh.write("9.9.9\n")
+        self.atlas("core-apply", "--source", up_repo, "--execute")
+        self.wire_both()
+
+        self.assertEqual(self.read(os.path.join(self.brain, "_atlas", "VERSION")).strip(), "9.9.9")
+        self.assertTrue(os.path.isfile(gdrive_script))
+        self.assertTrue(os.path.isfile(custom_sync))
+        self.assertTrue(os.path.isfile(sec_file))
+        self.assertTrue(os.path.isfile(os.path.join(self.root, ".agents", "skills", "gdrive", "scripts", "gdrive.py")))
+        self.assertEqual(self.atlas("gdrive", "--ping").stdout.strip(), "GDRIVE_OK True --ping")
+        chk_final = self.atlas("check", check=False).stdout
+        self.assertNotIn("ERROR", chk_final, chk_final)
+        self.assertNotIn("exceeds 2400", chk_final, chk_final)
 
 
 if __name__ == "__main__":

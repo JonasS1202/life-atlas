@@ -21,26 +21,17 @@ Every request goes to one of three places:
   agent in that repository: absolute paths, run commands inside its folder, follow its conventions. Do not consult the
   rest of Atlas unless the task needs something outside the project. Stay in the project until the user moves on.
 - **The user's life** (people, money, contracts, health, home, plans, ideas): look up what you do not already know in
-  this chat. Headers first (`atlas.py find <words>` or grep `^summary:`/`^tags:`), open only what fits. Hook hints are
-  leads; verify before you claim.
+  this chat via `atlas.py find <words>` (FTS5 + 1-hop graph), `atlas.py context <page>`, or header grep (`^summary:`/`^tags:`), and open only what fits. Hook hints are surgical entity leads; pull deeper context on demand and verify before you claim.
 - **Neither** (general question): just answer.
 If a project name is ambiguous, ask which one.
 
-## Keep what lasts
+## Keep what lasts (Capture-First)
 
-- Test: would the user or a later chat otherwise have to find this out or say it again? Then file it now in its one
-  place (`brain/INDEX.md` → *Where things go*) with `summary:` and `tags:` (from `brain/tags.md`); project knowledge on
-  the project page. Corrections and "from now on" wishes are always kept. Details: `brain/_atlas/procedures/learn.md`.
-- After a unit of work that changed or learned something, one line: `Atlas: <what changed where>` (or
-  `Atlas: nothing new`); it also becomes the daily log. Not needed after every small coding step.
-- Dates, events, workouts, blocked days & to-dos: `brain/calendar/README.md` (or `due: - YYYY-MM-DD what` in a page's
-  frontmatter). **Atlas First:** "my calendar" (`öffne meinen Kalender`) is ALWAYS the native Atlas calendar via
-  `/atlas-calendar` (`atlas.py calendar --open` → `http://127.0.0.1:8765/calendar.html`), NEVER Google/Apple Calendar
-  web URLs and NEVER `file://` HTML links.
-- The user decides what is stored. Credentials only into `brain/_secrets/` (the page notes where). Never store what they
-  say not to; record that wish in `brain/howto/`. If something seems unusual, ask once.
-- Antigravity's `/learn`: put its rules into `brain/howto/` and its skills into `brain/skills/`, never into `GEMINI.md`,
-  `AGENTS.md`, `.agents/` or `~/.gemini/`.
+- **Default-keep with timestamps:** File every new lasting fact, number, date, contact, decision, preference, or task update **now** — unless the user explicitly says not to store it. Before creating a new page, run `atlas.py where <topic>` so you extend an existing page or place it in the canonical `areas/<group>/` folder (`brain/INDEX.md`), with `summary:`, `tags:` (`brain/tags.md`), and `verified: YYYY-MM-DD` / `(Stand: YYYY-MM-DD)`. Project knowledge goes on the project page. Details: `brain/_atlas/procedures/learn.md`.
+- After a unit of work that changed or learned something, end with one line: `Atlas: <what changed where>` (or `Atlas: nothing new`); the stop hook logs it with `HH:MM` into `journal/` and auto-compiles `[[wikilinks]]`, tags, and `related:` links.
+- Dates, events, workouts, blocked days & to-dos: `brain/calendar/README.md` (`atlas.py todo`, or `due: - YYYY-MM-DD what` in frontmatter). **Atlas First:** "my calendar" (`öffne meinen Kalender`) is ALWAYS the native Atlas calendar via `/atlas-calendar` (`atlas.py calendar --open` → `http://127.0.0.1:8765/calendar.html`), NEVER Google/Apple Calendar web URLs and NEVER `file://` HTML links.
+- Privacy & opt-out: Never store what the user says not to (record standing exclusions in `brain/howto/`). Credentials go only into `brain/_secrets/` (`chmod 600`; the page notes where).
+- User extensions & `/learn`: Put user-specific rules into `brain/howto/`, custom CLI commands into `brain/howto/scripts/<cmd>.py` (`atlas.py <cmd>`), and custom skills/overlays into `brain/skills/<name>/` (wired via `atlas.py wire`, untouched by `/atlas-update`) — never loose in `GEMINI.md`, `AGENTS.md`, `.agents/` or `~/.gemini/`.
 
 ## Guard
 

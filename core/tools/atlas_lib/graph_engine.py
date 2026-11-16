@@ -1149,35 +1149,51 @@ def search_pages(brain, terms, idx=None, tag_vocab_map=None, skip_pages=None, li
 
 
 def compute_prompt_hints(brain, prompt, idx, tag_vocab_map, vocab_terms, skip_pages, max_hints=5, max_df_share=0.6, db_path=None):
-    """Fast SQLite-backed replacement for `hints()` + specificity-weighted 1-hop neighbor expansion.
+    """Surgical, zero-noise prompt lead detector (`PreInvocation` / `UserPromptSubmit`).
 
-    Returns `(direct_hints, linked_neighbors)` where:
-      - `direct_hints`: `[(rel, summary, matched_terms)]`
-      - `linked_neighbors`: `[(neighbor_rel, summary, via_rel, kind)]`
+    Matches ONLY explicit named entities (`people/`, titles, `aliases:`, glossary), alphanumeric IDs/tickers,
+    and concrete domain tag synonyms. Full-text FTS5/trigram search and 1-hop graph expansion stay strictly
+    on-demand in `atlas.py find`, `atlas.py where`, and `atlas.py context` (Agentic Pull, Charter §1.4).
     """
     skip = set(skip_pages or ()) | {"ROUTER.md", "INDEX.md", "tags.md", "settings.md"}
     low = norm_text(prompt)
     comp = re.sub(r"[^a-z0-9]", "", low)
     cands = {}
 
-    # 1. Known vocabulary entities (titles, aliases, glossary terms; skip addressing Atlas itself by bare name)
-    for t in vocab_terms:
+    generic_single = PROMPT_STOPWORDS | {
+        "readme", "overview", "index", "router", "settings", "atlas", "system",
+        "wissensdatenbank", "datenbank", "uebersicht", "übersicht", "leitfaden", "protokoll", "checkliste",
+        "dokumente", "unterlagen", "alltag", "wissen", "technik", "karriere", "unternehmertum",
+        "allgemein", "general", "sonstiges", "misc", "files", "archive", "archiv", "template", "vorlage",
+    }
+
+    # 1. Known vocabulary entities (people, specific titles, explicit aliases, glossary terms)
+    for t, dst_hint in (vocab_terms or {}).items():
         tl = norm_text(t).strip()
-        if not tl or tl in ("atlas",):
+        if not tl or len(tl) < 3:
+            continue
+        is_single_word = " " not in tl and "-" not in tl
+        is_person = str(dst_hint or "").startswith("people/")
+        if is_single_word and not is_person and (tl in generic_single or str(t).lower() in generic_single):
             continue
         if re.search(r"(?<![\w-])" + re.escape(tl) + r"(?![\w-])", low):
+            cands[t] = True
+        elif len(tl) >= 5 and re.search(r"(?<![\w-])" + re.escape(tl) + r"[a-z]{4,}(?![\w-])", low):
             cands[t] = True
         elif len(re.sub(r"[^a-z0-9]", "", tl)) >= 6 and re.sub(r"[^a-z0-9]", "", tl) in comp:
             cands[t] = True
 
-    # 2. Alphanumeric IDs (contract numbers, tickers like DBX0AN, C24, O2)
+    # 2. Alphanumeric IDs (contract numbers, tickers like DBX0AN, C24, IB-88663)
     for m in re.finditer(r"\b(?=[A-Za-z0-9./-]*\d)[A-Za-z0-9][A-Za-z0-9./-]{1,}[A-Za-z0-9]\b", prompt):
         tok = m.group(0)
-        if not re.match(r"^\d{1,2}$", tok):
+        if not re.match(r"^\d{1,2}$", tok) and not re.match(r"^20\d{2}(?:-\d{2}-\d{2})?$", tok):
             cands.setdefault(tok, False)
 
-    # 3. Tag & tag-synonym hits (never trigger on pronouns/stopwords like `ich`, `selbst`, `atlas`, `system`)
-    tag_ignore = {"atlas", "system", "self", "log", "learned", "project", "preference"}
+    # 3. Concrete domain tag & tag-synonym hits (skip structural/meta tags handled by dedicated routers)
+    tag_ignore = {
+        "atlas", "system", "self", "log", "learned", "project", "preference",
+        "wissen", "calendar", "kalender", "mail", "sport", "coach",
+    }
     canon = {s.lower(): t.lower() for t, syns in (tag_vocab_map or {}).items() for s in syns}
     tag_pages = {}
     for tag, syns in (tag_vocab_map or {}).items():
@@ -1185,36 +1201,20 @@ def compute_prompt_hints(brain, prompt, idx, tag_vocab_map, vocab_terms, skip_pa
             continue
         for word in [tag] + list(syns):
             nw = norm_text(word).strip()
-            if len(nw) < 3 or nw in PROMPT_STOPWORDS or word.lower() in PROMPT_STOPWORDS or nw in tag_ignore:
+            if len(nw) < 3 or nw in generic_single or word.lower() in generic_single or nw in tag_ignore:
                 continue
-            if re.search(r"(?<![\w-])" + re.escape(nw) + r"(?![\w-])", low):
+            tag_pat = (
+                r"(?:(?<![\w-])|[a-z]{3,})" + re.escape(nw) + r"(?![\w-])"
+                if len(nw) >= 5 else
+                r"(?<![\w-])" + re.escape(nw) + r"(?![\w-])"
+            )
+            if re.search(tag_pat, low):
                 tag_pages[tag] = [
                     r for r, e in idx.items()
-                    if r not in skip and not r.startswith("_")
+                    if r not in skip and not r.startswith("_") and not is_folder_hub(r)
                     and tag in {canon.get(t, t) for t in e.get("tags", [])}
                 ]
                 break
-
-    # 4. Non-stopword content tokens from the prompt (catches summaries, compounds, and 2-char uppercase acronyms)
-    boilerplate_stop = {
-        "pages", "notes", "history", "open", "stand", "value", "fact", "facts", "status", "details",
-        "source", "sources", "summary", "table", "timeline", "example", "readme", "template", "write",
-        "function", "python", "architecture", "purpose", "current", "state", "decisions", "questions",
-    }
-    free_tokens = set()
-    for raw_tok in re.findall(r"[\wÄÖÜäöüß-]{2,}", prompt):
-        clean_tok = raw_tok.strip("-_")
-        if not clean_tok:
-            continue
-        low_tok = clean_tok.lower()
-        folded_tok = norm_text(low_tok)
-        if low_tok in PROMPT_STOPWORDS or folded_tok in PROMPT_STOPWORDS or low_tok in boilerplate_stop:
-            continue
-        is_upper_acr = 2 <= len(clean_tok) <= 5 and clean_tok.isupper() and any(c.isalpha() for c in clean_tok)
-        if len(clean_tok) >= 5 or is_upper_acr:
-            if clean_tok not in cands and low_tok not in {k.lower() for k in cands}:
-                cands[clean_tok] = True
-                free_tokens.add(clean_tok)
 
     if not cands and not tag_pages:
         return [], []
@@ -1230,45 +1230,39 @@ def compute_prompt_hints(brain, prompt, idx, tag_vocab_map, vocab_terms, skip_pa
                 scores[rel] = scores.get(rel, 0.0) + 1.5 * idf
                 hits.setdefault(rel, set()).add("#" + tag)
 
-    conn = open_graph_db(brain, db_path)
-    try:
-        trigram_row = conn.execute("SELECT val FROM meta WHERE key='has_trigram'").fetchone()
-        has_trigram = bool(trigram_row and trigram_row["val"] == "1")
-        # Prioritize explicit vocab terms first, then content words
-        ordered_cands = sorted(cands.items(), key=lambda kv: (0 if kv[0] in vocab_terms else 1, -len(kv[0])))[:16]
-        for term, word_only in ordered_cands:
-            matched = query_term_matches(conn, term, has_trigram=has_trigram, exact_word=word_only and len(term) <= 3)
-            is_free = term in free_tokens
-            matched = {
-                p: s for p, s in matched.items()
-                if p in idx and p not in skip and not p.startswith("_")
-                and not (is_free and (is_folder_hub(p) or p.startswith(("journal/", "skills/"))))
-            }
-            if not matched or len(matched) > max_df_share * n:
-                continue
-            idf = math.log(1 + n / len(matched))
-            for rel, bm_s in matched.items():
-                mult = 1.3 if rel.startswith(canonical_prefixes) else 1.0
-                score = idf * (1.0 + math.log(1.0 + bm_s)) * mult
-                if vocab_terms.get(term) == rel:
-                    score += 2.0 * idf
-                scores[rel] = scores.get(rel, 0.0) + score
-                hits.setdefault(rel, set()).add(term)
-    finally:
-        conn.close()
+    if cands:
+        conn = open_graph_db(brain, db_path)
+        try:
+            trigram_row = conn.execute("SELECT val FROM meta WHERE key='has_trigram'").fetchone()
+            has_trigram = bool(trigram_row and trigram_row["val"] == "1")
+            ordered_cands = sorted(cands.items(), key=lambda kv: (0 if kv[0] in vocab_terms else 1, -len(kv[0])))[:12]
+            for term, word_only in ordered_cands:
+                # Direct target page from `_vocab` gets exact surgical priority without FTS fan-out noise
+                target_rel = vocab_terms.get(term)
+                if target_rel and target_rel in idx and target_rel not in skip and not target_rel.startswith("_"):
+                    scores[target_rel] = scores.get(target_rel, 0.0) + 12.0
+                    hits.setdefault(target_rel, set()).add(term)
+                    if target_rel != "glossary.md":
+                        continue
+                matched = query_term_matches(conn, term, has_trigram=has_trigram, exact_word=word_only and len(term) <= 3)
+                matched = {
+                    p: s for p, s in matched.items()
+                    if p in idx and p not in skip and not p.startswith("_")
+                    and not p.startswith(("journal/", "skills/")) and not is_folder_hub(p)
+                }
+                if not matched or len(matched) > max_df_share * n:
+                    continue
+                idf = math.log(1 + n / len(matched))
+                for rel, bm_s in matched.items():
+                    mult = 1.3 if rel.startswith(canonical_prefixes) else 1.0
+                    scores[rel] = scores.get(rel, 0.0) + idf * (1.0 + math.log(1.0 + bm_s)) * mult
+                    hits.setdefault(rel, set()).add(term)
+        finally:
+            conn.close()
 
     ranked = sorted(scores, key=lambda r: (-scores[r], r))[:max_hints]
     direct = [(rel, idx.get(rel, {}).get("summary", ""), sorted(hits[rel], key=str.lower)[:4]) for rel in ranked]
-    # Only expand 1-hop graph neighbors from strong/entity-anchored seeds (never from weak single free-token coincidences)
-    strong_seeds = [
-        r for r in ranked[:3]
-        if any(h.startswith("#") or h not in free_tokens or len(h) >= 8 for h in hits.get(r, ())) or len(hits.get(r, ())) >= 2
-    ]
-    exp = expand_1hop_neighbors(
-        brain, strong_seeds, skip_pages=skip | set(ranked), max_neighbors=3, include_daily_logs=False, db_path=db_path
-    ) if strong_seeds else []
-    neighbors = [(n_rel, idx.get(n_rel, {}).get("summary", ""), via_rel, kind) for n_rel, _sc, via_rel, kind in exp]
-    return direct, neighbors
+    return direct, []
 
 
 # ---------------------------------------------------------------- Entity Lexicon & Retroactive Linking (`atlas.py link`)
@@ -1335,7 +1329,7 @@ def _compile_lexicon_regex(lexicon):
     # Longest terms first so "Max Mustermann" wins over "Mustermann"
     ordered = sorted(lexicon.keys(), key=lambda s: (-len(s), s))
     alt = "|".join(re.escape(k) for k in ordered)
-    return re.compile(rf"(?<![\w/.-])({alt})(?![\w/.-])", re.IGNORECASE)
+    return re.compile(rf"(?<![\w/.-])({alt})(?!\.\w)(?![\w/-])", re.IGNORECASE)
 
 
 def scan_retroactive_links(brain, idx=None, db_path=None):
@@ -1637,6 +1631,122 @@ def compile_wikilinks_in_text(brain, src_rel, text, known_md, rel_lower, by_stem
         compiled += 1
 
     return new_text, compiled, list(reversed(unresolved)), list(reversed(ambiguous))
+
+
+def auto_heal_pages(brain, dirty_rels, tag_vocab_map=None, db_path=None):
+    """Zero-token background integrity pass for newly created/modified `.md` pages (`Stop` hook).
+
+    1. Syncs `index.sqlite` so new pages exist in the lookup table.
+    2. Compiles unambiguous `[[Target#Section|Label]]` wikilinks outside code blocks into relative Markdown links.
+    3. Normalizes YAML frontmatter tag synonyms (`tags: [kfz]` -> `tags: [auto]`) against `tags.md`.
+    4. Adds safe `related:` frontmatter edges when unambiguous canonical entities are mentioned in prose.
+    5. Re-syncs `index.sqlite` if any file was updated.
+    """
+    clean_rels = []
+    for r in dirty_rels or ():
+        rn = fwd(r).lstrip("./")
+        if not rn.lower().endswith(".md"):
+            continue
+        if rn.startswith(("_atlas/", "_secrets/", "_archive/", "inbox/")) or is_daily_log_file(rn):
+            continue
+        full = os.path.join(brain, *rn.split("/"))
+        if os.path.isfile(full):
+            clean_rels.append(rn)
+    if not clean_rels:
+        return 0
+
+    idx = sync_index(brain, budget=1.5, db_path=db_path)
+    known_md = set(idx.keys())
+    rel_lower, by_stem, by_name = _build_lookup_maps(known_md, idx)
+    lexicon, _ = build_entity_lexicon(brain, idx=idx)
+    lex_rx = _compile_lexicon_regex(lexicon) if lexicon else None
+    syn_to_tag = {
+        s.lower(): tag.lower()
+        for tag, syns in (tag_vocab_map or {}).items()
+        for s in syns
+        if s and s.lower() != tag.lower()
+    }
+
+    headings_by_rel = {}
+    existing_edges = set()
+    conn = open_graph_db(brain, db_path)
+    try:
+        for row in conn.execute("SELECT rel, anchor, title FROM headings"):
+            headings_by_rel.setdefault(row["rel"], {})[row["anchor"]] = row["title"]
+        for row in conn.execute("SELECT src, dst FROM edges WHERE kind IN ('body', 'related')"):
+            existing_edges.add((row["src"], row["dst"]))
+    finally:
+        conn.close()
+
+    healed_files = 0
+    for rel in clean_rels:
+        full = os.path.join(brain, *rel.split("/"))
+        try:
+            with open(full, encoding="utf-8", errors="replace") as fh:
+                orig_text = fh.read()
+        except OSError:
+            continue
+        new_text = orig_text
+
+        if "[[" in new_text:
+            new_text, _n_comp, _unres, _amb = compile_wikilinks_in_text(
+                brain, rel, new_text, known_md, rel_lower, by_stem, by_name, headings_by_rel
+            )
+
+        if syn_to_tag and new_text.startswith("---"):
+            end_fm = new_text.find("\n---", 3)
+            if end_fm > 0:
+                head, body = new_text[:end_fm], new_text[end_fm:]
+                fm = parse_frontmatter(new_text)
+                for raw_t in as_list(fm.get("tags")):
+                    tl = str(raw_t).strip().lower()
+                    canon_t = syn_to_tag.get(tl)
+                    if canon_t:
+                        head = re.sub(
+                            r"(?m)^(tags:.*?)(?<![\w-])" + re.escape(str(raw_t).strip()) + r"(?![\w-])",
+                            lambda m, ct=canon_t: m.group(1) + ct,
+                            head,
+                        )
+                        head = re.sub(
+                            r"(?m)^(\s*-\s+)" + re.escape(str(raw_t).strip()) + r"\s*$",
+                            lambda m, ct=canon_t: m.group(1) + ct,
+                            head,
+                        )
+                new_text = head + body
+
+        if lex_rx and new_text.startswith("---") and not is_folder_hub(rel) and rel not in ("ROUTER.md", "INDEX.md", "settings.md", "tags.md", "glossary.md"):
+            masked_p = mask_prose_for_mentions(new_text, mask_inline_code=True)
+            rel_targets = []
+            seen_d = set()
+            for m in lex_rx.finditer(masked_p):
+                info = lexicon.get(m.group(1).lower())
+                if not info:
+                    continue
+                dst_rel, _disp = info
+                if dst_rel == rel or dst_rel in seen_d or (rel, dst_rel) in existing_edges:
+                    continue
+                seen_d.add(dst_rel)
+                rel_targets.append(dst_rel)
+            if rel_targets:
+                new_text, _c_rel = _add_frontmatter_related(new_text, rel_targets[:6])
+
+        if new_text != orig_text:
+            tmp = f"{full}.{os.getpid()}.tmp"
+            try:
+                with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+                    fh.write(new_text)
+                os.replace(tmp, full)
+                healed_files += 1
+            except OSError:
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except OSError:
+                    pass
+
+    if healed_files:
+        sync_index(brain, budget=1.5, db_path=db_path)
+    return healed_files
 
 
 def _looks_like_local_source_path(s):

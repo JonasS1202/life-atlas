@@ -15,6 +15,7 @@ Commands
   projects    show the project registry the router uses
   index       build the SQLite search & graph cache in full (`_atlas/cache/index.sqlite`)
   find        ranked search: tags, aliases, title, summary, FTS5 + trigram full text, plus 1-hop linked leads
+  where       canonical placement & grouping guide before saving (`existing pages` + `areas/` folders + hub READMEs)
   graph       inspect a page's outlinks, backlinks (with context & #anchor), and unlinked mentions
   context     assemble a token-budgeted Markdown context dossier (target page + top specificity-ranked neighbors)
   link        retroactive wiki-linking (`--scan`, `--journals`, `--related`, `--inline`, `--execute`)
@@ -26,6 +27,7 @@ Commands
   check       verify the charter: sizes, links, reachability, duplicates, secrets, Git, backup, hooks, registry
   deadlines   list `due:` items; `--ics FILE` writes a calendar file
   todo        quick task triage (`list`, `done`, `skip`, `reopen`, `move --to <date|+Nd>`, `add`)
+  ext         inspect update-safe user extensions (`skills/`, `howto/scripts/`, `_secrets/`); `run <cmd>` executes one
   mail        multi-account IMAP mail engine (`accounts`, `folders`, `list`, `read`, `search`, `audit`, plus
               safety-gated `move` to `target_folder`, `copy`, `trash`, `delete`, `flags`, `labels`, `mkdir`)
   inventory   read-only map of the computer (names, sizes, types, markers; never file contents or credential stores)
@@ -445,6 +447,10 @@ def _apply(brain, changes, tag):
                     os.rmdir(parent)
                 except OSError:
                     pass
+        elif isinstance(new, bytes):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as fh:
+                fh.write(new)
         else:
             write(path, new)
 
@@ -571,12 +577,27 @@ def _skill_changes(brain, target_dir, remove):
                 text = text.rstrip("\n") + "\n" + note
         if not os.path.exists(dst) or read(dst) != text:
             out.append((dst, text, f"skill {name}"))
-        for extra in os.listdir(folder):  # supporting files of grown skills
-            src = os.path.join(folder, extra)
-            if extra != "SKILL.md" and os.path.isfile(src):
-                d2 = os.path.join(target_dir, name, extra)
-                if not os.path.exists(d2) or sha256_file(d2) != sha256_file(src):
-                    out.append((d2, read(src), f"skill file {name}/{extra}"))
+        grown_dir = os.path.join(brain, "skills", name)
+        asset_roots = [folder]
+        if os.path.isdir(grown_dir) and os.path.normcase(os.path.abspath(grown_dir)) != os.path.normcase(os.path.abspath(folder)):
+            asset_roots.append(grown_dir)
+        seen_rel = set()
+        for aroot in reversed(asset_roots):  # user grown files override core extras if both exist
+            for dp, dns, fns in os.walk(aroot):
+                dns[:] = sorted(d for d in dns if not d.startswith(".") and d != "__pycache__")
+                for fn in sorted(fns):
+                    if fn == "SKILL.md" or fn.startswith(".") or fn.endswith((".pyc", ".pyo")):
+                        continue
+                    src = os.path.join(dp, fn)
+                    rel_sub = fwd(os.path.relpath(src, aroot))
+                    if rel_sub in seen_rel:
+                        continue
+                    seen_rel.add(rel_sub)
+                    d2 = os.path.join(target_dir, name, *rel_sub.split("/"))
+                    if not os.path.exists(d2) or sha256_file(d2) != sha256_file(src):
+                        with open(src, "rb") as fh:
+                            raw_bytes = fh.read()
+                        out.append((d2, raw_bytes, f"skill file {name}/{rel_sub}"))
     return out
 
 
@@ -743,6 +764,52 @@ def cmd_find(args):
         say(f"  ↳ linked: {n_rel} — {ne.get('summary') or ne.get('title') or ''} (via {via_rel})")
     if not ranked:
         say("(nothing found)")
+
+
+def cmd_where(args):
+    """Canonical placement & grouping advisor before creating or updating pages (`Charter §1.3: One place per thing`)."""
+    _root, brain = paths(args)
+    hk = hook_module(brain)
+    idx = hk.load_index()
+    vocab = hk.tag_vocab()
+    terms = [t for t in (args.terms or []) if str(t).strip()]
+
+    if terms:
+        ranked, neighbors = graph_engine.search_pages(
+            brain, terms, idx=idx, tag_vocab_map=vocab, limit=6, text_search=True, db_path=hk.CACHE
+        )
+        say("=== 1. EXISTING CANDIDATE PAGES (extend an existing page before creating a new one!) ===")
+        if ranked:
+            for rel in ranked:
+                e = idx.get(rel, {})
+                tags = ",".join(e.get("tags", []))
+                say(f"  - {rel} — {e.get('summary') or e.get('title') or ''}" + (f" [{tags}]" if tags else ""))
+            for n_rel, _sc, via_rel, _kind in neighbors[:3]:
+                ne = idx.get(n_rel, {})
+                say(f"    ↳ related: {n_rel} — {ne.get('summary') or ne.get('title') or ''} (via {via_rel})")
+        else:
+            say("  (no existing page matched — create a new canonical page in the matching group below)")
+
+    say("=== 2. BRAIN GROUPS & CANONICAL FOLDERS (`brain/`) ===")
+    areas_dir = os.path.join(brain, "areas")
+    if os.path.isdir(areas_dir):
+        area_subs = sorted(
+            d for d in os.listdir(areas_dir)
+            if os.path.isdir(os.path.join(areas_dir, d)) and not d.startswith(".")
+        )
+        for ad in area_subs:
+            ar_readme = f"areas/{ad}/README.md"
+            ar_sum = (idx.get(ar_readme, {}).get("summary") or "").strip()
+            cnt = sum(1 for r in idx if r.startswith(f"areas/{ad}/") and r != ar_readme)
+            say(f"  - areas/{ad}/ ({cnt} pages; hub: {ar_readme})" + (f" — {ar_sum}" if ar_sum else ""))
+    say("  - people/<first-last>.md (hub: people/README.md) — one page per person")
+    say("  - projects/<slug>/README.md (hub: projects/README.md) — undertakings with a goal or code repos")
+    say("  - howto/<topic>.md (hub: howto/README.md; scripts: howto/scripts/) — rules, workflows, lessons, user scripts")
+    say("  - skills/<name>/SKILL.md (hub: skills/README.md) — custom user skills & `triggers:` (survive /atlas-update)")
+    say("  - calendar/README.md (`## Timeline` if dated, `## Open To-Dos` if undated) — tasks, deadlines, events")
+    say("  - self/ (hub: self/README.md) | settings.md (rhythms/style) | _secrets/<topic>.env (credentials only)")
+    say("=== 3. FILING CHECKLIST ===")
+    say("  Frontmatter: `summary:` + `tags:` (from tags.md) + `verified: YYYY-MM-DD` (on facts) + link in folder `README.md`.")
 
 
 def cmd_graph(args):
@@ -4171,6 +4238,152 @@ def cmd_state(args):
     say(json.dumps(get_state(brain), indent=2, ensure_ascii=False))
 
 
+BUILTIN_COMMANDS = {
+    "init", "wire", "unwire", "routes", "projects", "index", "find", "where", "graph", "context",
+    "link", "conflicts", "mark", "adopt", "code-sync", "probe", "check", "deadlines", "calendar",
+    "todo", "coach", "inventory", "move", "verify", "undo", "core-diff", "core-apply", "core-accept",
+    "dev-check", "dev-setup", "state", "mail", "ext", "run",
+}
+
+
+def _discover_user_commands(brain):
+    """Discover update-safe user CLI commands in `brain/howto/scripts/` and `brain/skills/*/scripts/`.
+
+    Returns `{cmd_name: {"path": abs_path, "rel": brain_rel, "runner": "python"|"sh"|"pwsh"}}`.
+    Built-in core commands can never be shadowed.
+    """
+    cmds = {}
+    search_dirs = []
+    howto_scripts = os.path.join(brain, "howto", "scripts")
+    if os.path.isdir(howto_scripts):
+        search_dirs.append(howto_scripts)
+    skills_root = os.path.join(brain, "skills")
+    if os.path.isdir(skills_root):
+        for sk in sorted(os.listdir(skills_root)):
+            sk_scripts = os.path.join(skills_root, sk, "scripts")
+            if os.path.isdir(sk_scripts):
+                search_dirs.append(sk_scripts)
+
+    for sdir in search_dirs:
+        for fn in sorted(os.listdir(sdir)):
+            if fn.startswith((".", "_")):
+                continue
+            full = os.path.join(sdir, fn)
+            if not os.path.isfile(full):
+                continue
+            stem, ext = os.path.splitext(fn)
+            ext_low = ext.lower()
+            if ext_low not in (".py", ".sh", ".ps1"):
+                continue
+            runner = "python" if ext_low == ".py" else ("sh" if ext_low == ".sh" else "pwsh")
+            slug = re.sub(r"[^a-z0-9-]+", "-", stem.lower().replace("_", "-")).strip("-")
+            if not slug or slug in BUILTIN_COMMANDS:
+                continue
+            rel = fwd(os.path.relpath(full, brain))
+            cmds.setdefault(slug, {"path": full, "rel": rel, "runner": runner})
+            if stem.lower() != slug and stem.lower() not in BUILTIN_COMMANDS:
+                cmds.setdefault(stem.lower(), {"path": full, "rel": rel, "runner": runner})
+    return cmds
+
+
+def _exec_user_command(root, brain, cmd_info, extra_argv):
+    env = dict(
+        os.environ,
+        ATLAS_ROOT=root,
+        ATLAS_BRAIN=brain,
+        ATLAS_SECRETS=os.path.join(brain, "_secrets"),
+    )
+    runner = cmd_info["runner"]
+    script = cmd_info["path"]
+    if runner == "python":
+        inv = [sys.executable, "-I", "-B", script] + list(extra_argv)
+    elif runner == "sh":
+        inv = ["bash", script] + list(extra_argv)
+    else:
+        pwsh = "powershell" if os.name == "nt" else "pwsh"
+        inv = [pwsh, "-NoProfile", "-File", script] + list(extra_argv)
+    res = subprocess.run(inv, env=env)
+    sys.exit(res.returncode)
+
+
+def cmd_ext(args):
+    """Inspect update-safe user individualizations in the grown layer (`skills/`, `howto/scripts/`, `_secrets/`)."""
+    root, brain = paths(args)
+    hk = hook_module(brain)
+    core_skills_dir = os.path.join(brain, "_atlas", "skills")
+    core_names = set(os.listdir(core_skills_dir)) if os.path.isdir(core_skills_dir) else set()
+    user_skills_dir = os.path.join(brain, "skills")
+    custom_skills, overlays = [], []
+    if os.path.isdir(user_skills_dir):
+        for name in sorted(os.listdir(user_skills_dir)):
+            sk_md = os.path.join(user_skills_dir, name, "SKILL.md")
+            if not os.path.isfile(sk_md):
+                continue
+            fm = hk.frontmatter(read(sk_md))
+            trigs = list(hk._as_list(fm.get("triggers"))) + list(hk._as_list(fm.get("aliases")))
+            info = {"name": name, "rel": f"skills/{name}/SKILL.md", "triggers": trigs}
+            if name in core_names:
+                overlays.append(info)
+            else:
+                custom_skills.append(info)
+
+    raw_cmds = _discover_user_commands(brain)
+    seen_paths = {}
+    for cname, cinfo in sorted(raw_cmds.items()):
+        seen_paths.setdefault(cinfo["rel"], []).append(cname)
+
+    sec_dir = os.path.join(brain, "_secrets")
+    secrets_files = sorted(
+        f for f in os.listdir(sec_dir) if not f.startswith(".") and os.path.isfile(os.path.join(sec_dir, f))
+    ) if os.path.isdir(sec_dir) else []
+
+    if getattr(args, "json", False):
+        say(json.dumps({
+            "root": fwd(root),
+            "custom_commands": [{"aliases": aliases, "rel": rel} for rel, aliases in sorted(seen_paths.items())],
+            "custom_skills": custom_skills,
+            "core_skill_overlays": overlays,
+            "secret_files": [f"_secrets/{f}" for f in secrets_files],
+        }, indent=2, ensure_ascii=False))
+        return
+
+    say("=== UPDATE-SAFE USER INDIVIDUALIZATION (`brain/` grown layer — never overwritten by `/atlas-update`) ===")
+    say(f"Custom CLI commands ({len(seen_paths)} — invoke via `atlas.py <cmd> ...` or `atlas.py run <cmd> ...`):")
+    if seen_paths:
+        for rel, aliases in sorted(seen_paths.items()):
+            say(f"  - {', '.join(aliases)}  ->  brain/{rel}")
+    else:
+        say("  (none yet — drop `brain/howto/scripts/<name>.py` or `brain/skills/<name>/scripts/<name>.py`)")
+    say(f"Custom user skills ({len(custom_skills)} in `brain/skills/` — wired to Claude & Antigravity):")
+    for sk in custom_skills:
+        tr = f" [triggers: {', '.join(sk['triggers'])}]" if sk["triggers"] else ""
+        say(f"  - {sk['name']}  (brain/{sk['rel']}){tr}")
+    if not custom_skills:
+        say("  (none yet)")
+    say(f"Core skill overlays ({len(overlays)} — user account/rule extensions appended on `wire`):")
+    for ov in overlays:
+        say(f"  - {ov['name']}  (brain/{ov['rel']})")
+    if not overlays:
+        say("  (none)")
+    say(f"Secret config files ({len(secrets_files)} in `brain/_secrets/`, git-ignored & never read by hooks):")
+    for sf in secrets_files:
+        say(f"  - brain/_secrets/{sf}")
+    if not secrets_files:
+        say("  (none)")
+
+
+def cmd_run(args, extra_argv=None):
+    """Execute a custom user command from `brain/howto/scripts/` or `brain/skills/*/scripts/`."""
+    root, brain = paths(args)
+    cmds = _discover_user_commands(brain)
+    target = (getattr(args, "target_cmd", None) or "").strip().lower()
+    rest = list(extra_argv if extra_argv is not None else (getattr(args, "cmd_args", None) or []))
+    if not target or target not in cmds:
+        avail = ", ".join(sorted(cmds)) or "(none)"
+        sys.exit(f"Unknown user command '{target}'. Available custom commands: {avail}")
+    _exec_user_command(root, brain, cmds[target], rest)
+
+
 def cmd_mail(args, extra_argv=None):
     """Delegate `atlas.py mail ...` to `atlas_mail.py` in the same tools directory."""
     root, _brain = paths(args)
@@ -4192,20 +4405,44 @@ def main():
             stream.reconfigure(encoding="utf-8", errors="replace")  # agents read this output; avoid code-page mojibake
         except (AttributeError, ValueError):
             pass
-    # Intercept `atlas.py [--root ROOT] mail ...` before top-level `-h` or flag parsing swallows mail flags
+    # Intercept `atlas.py [--root ROOT] mail ...`, `atlas.py [--root ROOT] run <cmd> ...`,
+    # and direct user custom commands `atlas.py [--root ROOT] <custom_cmd> ...` before top-level flag parsing
     argv = sys.argv[1:]
-    if "mail" in argv:
-        idx = argv.index("mail")
-        pre = argv[:idx]
-        if all(x in ("--root",) or not x.startswith("-") or pre[max(0, i - 1)] == "--root" for i, x in enumerate(pre)):
-            root_val = None
-            for i, tok in enumerate(pre):
-                if tok == "--root" and i + 1 < len(pre):
-                    root_val = pre[i + 1]
-                elif tok.startswith("--root="):
-                    root_val = tok.split("=", 1)[1]
-            ns = argparse.Namespace(root=root_val)
-            cmd_mail(ns, argv[idx + 1:])
+    root_val = None
+    pos_idx = None
+    i_arg = 0
+    while i_arg < len(argv):
+        tok = argv[i_arg]
+        if tok == "--root" and i_arg + 1 < len(argv):
+            root_val = argv[i_arg + 1]
+            i_arg += 2
+            continue
+        if tok.startswith("--root="):
+            root_val = tok.split("=", 1)[1]
+            i_arg += 1
+            continue
+        if tok.startswith("-"):
+            break
+        pos_idx = i_arg
+        break
+    if pos_idx is not None:
+        first_cmd = argv[pos_idx]
+        ns = argparse.Namespace(root=root_val)
+        if first_cmd == "mail":
+            cmd_mail(ns, argv[pos_idx + 1:])
+        if first_cmd == "run" and pos_idx + 1 < len(argv) and not argv[pos_idx + 1].startswith("-"):
+            ns.target_cmd = argv[pos_idx + 1]
+            cmd_run(ns, argv[pos_idx + 2:])
+        if first_cmd not in BUILTIN_COMMANDS:
+            try:
+                r_probe, b_probe = paths(ns)
+                user_cmds = _discover_user_commands(b_probe)
+                if first_cmd.lower() in user_cmds:
+                    _exec_user_command(r_probe, b_probe, user_cmds[first_cmd.lower()], argv[pos_idx + 1:])
+            except SystemExit:
+                raise
+            except Exception:
+                pass
     ap = argparse.ArgumentParser(prog="atlas.py", description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     ap.add_argument("--root", help="the Atlas folder (default: the one this tool is installed in, or $ATLAS_ROOT)")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -4236,6 +4473,9 @@ def main():
     p.add_argument("terms", nargs="+")
     p.add_argument("--limit", type=int, default=12)
     p.add_argument("--no-text", action="store_true", help="frontmatter only, skip the full-text pass")
+
+    p = sub.add_parser("where", help="canonical placement & grouping guide before filing knowledge")
+    p.add_argument("terms", nargs="*", help="topic words to check for existing pages & matching folder")
 
     p = sub.add_parser("graph", help="inspect a page's outlinks, backlinks, and unlinked mentions")
     p.add_argument("page", help="page path, stem, title, or alias")
@@ -4383,15 +4623,23 @@ def main():
     p = sub.add_parser("state")
     p.add_argument("--set", nargs="*", help="key=value (value 'now' = current time)")
 
+    p = sub.add_parser("ext", help="list update-safe user extensions (`skills/`, `howto/scripts/`, `_secrets/`)")
+    p.add_argument("--json", action="store_true", help="output JSON")
+
+    p = sub.add_parser("run", help="run a custom user command from `brain/howto/scripts/` or `brain/skills/*/scripts/`")
+    p.add_argument("target_cmd", help="custom command name (see `atlas.py ext`)")
+    p.add_argument("cmd_args", nargs=argparse.REMAINDER, help="arguments passed to the user script")
+
     sub.add_parser("mail", help="multi-account IMAP client & safety-gated organizer (delegates to atlas_mail.py)")
 
     args = ap.parse_args()
     handlers = {"init": cmd_init, "routes": cmd_routes, "projects": cmd_projects, "index": cmd_index, "probe": cmd_probe,
-                "find": cmd_find, "graph": cmd_graph, "context": cmd_context, "link": cmd_link, "conflicts": cmd_conflicts,
+                "find": cmd_find, "where": cmd_where, "graph": cmd_graph, "context": cmd_context, "link": cmd_link,
+                "conflicts": cmd_conflicts,
                 "mark": cmd_mark, "adopt": cmd_adopt, "code-sync": cmd_code_sync,
                 "core-accept": cmd_core_accept, "dev-check": cmd_dev_check, "dev-setup": cmd_dev_setup,
                 "check": cmd_check, "deadlines": cmd_deadlines, "calendar": cmd_calendar, "todo": cmd_todo,
-                "coach": cmd_coach,
+                "coach": cmd_coach, "ext": cmd_ext, "run": cmd_run,
                 "inventory": cmd_inventory, "move": cmd_move, "verify": cmd_verify, "undo": cmd_undo,
                 "core-diff": cmd_core_diff, "state": cmd_state}
     if args.cmd == "init" and not args.root:

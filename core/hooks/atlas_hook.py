@@ -73,6 +73,12 @@ TODO_ITEM = re.compile(r"^\s*-\s*\[([ xX-])\]\s*(?:\[(high|med|low)\]\s*)?(.+)$"
 TOKEN_ID = re.compile(r"\b(?=[A-Za-z0-9./-]*\d)[A-Za-z0-9][A-Za-z0-9./-]{3,}[A-Za-z0-9]\b")
 NAME_STOP = {"test", "tests", "app", "apps", "demo", "tmp", "temp", "notes", "misc", "code", "project", "projekt",
              "projects", "projekte", "readme", "main", "src", "docs", "data", "web", "api", "tool", "tools"}
+SIGNAL_DO_NOT_STORE = re.compile(
+    r"(?i)\b(nicht\s+(?:speichern|merken|aufnehmen|notieren|loggen|ablegen)|"
+    r"speicher(?:e)?\s+(?:das\s+|es\s+)?nicht|merk\s+(?:dir\s+)?(?:das\s+|es\s+)?nicht|"
+    r"behalt\s+das\s+f[uü]r\s+dich|off\s+the\s+record|"
+    r"do\s+not\s+(?:store|save|keep|log|record)|don'?t\s+(?:store|save|keep|log|record))\b"
+)
 SIGNAL_EXPLICIT = re.compile(
     r"(?i)\b(merk dir|merke dir|merk es dir|speicher(?:e)? (?:das|dir|bitte)|notier(?:e)? (?:das|dir)|vergiss nicht|"
     r"ab jetzt|ab sofort|von nun an|in zukunft|künftig|kuenftig|nie wieder|immer wenn|remember (?:that|this)|"
@@ -80,8 +86,29 @@ SIGNAL_EXPLICIT = re.compile(
 SIGNAL_CORRECTION = re.compile(
     r"(?i)(^\s*(nein|nee|falsch|no|wrong)\b[\s,.!]|\b(stimmt nicht|ist falsch|war falsch|nicht so|falsch verstanden|"
     r"korrigier|that'?s wrong|not like that|you misunderstood)\b)")
-LEARN_HINTS = {"explicit": "keep it now where it belongs (a rule or preference goes to howto/ or brain/settings.md)",
-               "correction": "a correction: fix the page it concerns and keep the lesson in howto/"}
+SIGNAL_FACT = re.compile(
+    r"(?i)(?:\b\d{1,2}\.\d{1,2}\.20\d{2}\b|\b20\d{2}-\d{2}-\d{2}\b|"
+    r"\b\d+(?:[.,]\d+)?\s*(?:€|eur|euro|usd|\$)\b|"
+    r"\b(?:hab(?:e)?\s+(?:heute|gerade|eben)|wir\s+haben\s+(?:heute|gerade|jetzt)|"
+    r"termin\s+ist\s+am|kostet\s+jetzt|zahlen\s+jetzt|"
+    r"gek[uü]ndigt|unterschrieben|gebucht|gekauft|vereinbart|entschieden|abgeschlossen)\b)"
+)
+SIGNAL_META_SKIP = re.compile(r"(?i)\b(?:atlas-update|screenshot|thinking\s+path|hook|bugfix|probe|test)\b")
+LEARN_HINTS = {
+    "explicit": "keep it now where it belongs (`atlas.py where <topic>`; rules/preferences go to howto/ or brain/settings.md) with Stand/verified date",
+    "correction": "a correction: fix the page it concerns and keep the lesson in howto/",
+    "fact": "capture-first: if this message states a new/updated fact, date, amount, contact, decision, or task status, file it now (`atlas.py where <topic>`) with Stand/verified date and end with `Atlas: <what changed where>`",
+}
+MAIL_RX = re.compile(
+    r"(?i)(?:^|\s)/atlas-mail\b|\b(?:atlas_mail|postf[aä]ch\w*|imap\b|ungelesen\w*\s+e?-?mails?|"
+    r"check\w*\s+(?:mal\s+)?(?:meine\s+)?e?-?mails?|hast\s+du\s+eine\s+e?-?mail|"
+    r"(?:eingegangen\w*|gesendet\w*|neue[n]?)\s+e?-?mails?|e?-?mails?\s+(?:von|an|aus|check\w*|such\w*|lesen|pr[uü]f\w*))\b"
+)
+TODO_RX = re.compile(
+    r"(?i)(?:^|\s)/atlas-(?:calendar|brief)\b|\b(?:offene[n]?\s+(?:aufgaben|to-?dos?|tasks?|punkte)|"
+    r"meine\s+(?:aufgaben|to-?dos?|termine)|[oö]ffne\s+(?:meinen\s+)?kalender|"
+    r"(?:aufgabe|to-?do|task)\w*\s+(?:abhaken|verschieben|erledigt|anlegen))\b"
+)
 
 
 # ---------------------------------------------------------------- small helpers
@@ -1824,6 +1851,10 @@ def _vocab(idx, skip_pages):
         title = e.get("title", "")
         if 3 <= len(title) <= 60 and not rel.endswith("README.md"):
             terms.setdefault(title, rel)
+        if not rel.endswith("README.md"):
+            stem = os.path.splitext(os.path.basename(rel))[0].replace("-", " ").replace("_", " ").strip()
+            if 4 <= len(stem) <= 60 and stem.lower() not in ("index", "readme") and not re.match(r"^\d{4}", stem):
+                terms.setdefault(stem, rel)
         if rel.startswith("people/") and title:
             words = title.split()
             if len(words) >= 2 and len(words[-1]) >= 4:
@@ -1914,11 +1945,63 @@ def detect_coach_mode(prompt, idx=None):
     return mode, why, macro
 
 
+def _detect_user_extensions(prompt):
+    """Match user-grown custom skills/commands in `brain/skills/*/SKILL.md` (`triggers:` or `aliases:` frontmatter)."""
+    skills_dir = os.path.join(BRAIN, "skills")
+    if not os.path.isdir(skills_dir) or not prompt.strip():
+        return []
+    low = graph_engine.norm_text(prompt)
+    core_skills_dir = os.path.join(BRAIN, "_atlas", "skills")
+    core_names = set(os.listdir(core_skills_dir)) if os.path.isdir(core_skills_dir) else set()
+    hits = []
+    for name in sorted(os.listdir(skills_dir)):
+        sk_md = os.path.join(skills_dir, name, "SKILL.md")
+        if not os.path.isfile(sk_md):
+            continue
+        try:
+            with open(sk_md, encoding="utf-8", errors="replace") as fh:
+                fm = frontmatter(fh.read(4000))
+        except OSError:
+            continue
+        trigs = list(_as_list(fm.get("triggers"))) + list(_as_list(fm.get("aliases")))
+        if name not in core_names and len(name) >= 4:
+            trigs.append(name)
+            trigs.append(name.replace("-", " "))
+        for tr in trigs:
+            tn = graph_engine.norm_text(tr).strip()
+            if len(tn) >= 4 and re.search(r"(?<![\w-])" + re.escape(tn) + r"(?![\w-])", low):
+                cmd_cand = ""
+                for sp in (
+                    os.path.join(BRAIN, "howto", "scripts", f"{name}.py"),
+                    os.path.join(skills_dir, name, "scripts", f"{name}.py"),
+                ):
+                    if os.path.isfile(sp):
+                        cmd_cand = name
+                        break
+                hits.append((name, f"skills/{name}/SKILL.md", cmd_cand))
+                break
+    return hits
+
+
 def prompt_text(prompt, cwd, session):
     idx = load_index(budget=INDEX_BUDGET_S)
     st = _state()
     sess = _session(st, session)
     lines = []
+
+    # 1. Explicit privacy opt-out (`do-not-store` overrides all capture/learning nudges for this turn)
+    do_not_store = bool(SIGNAL_DO_NOT_STORE.search(prompt))
+    if do_not_store:
+        sess["do_not_store"] = True
+        sess.pop("signal", None)
+        lines.append(
+            "Atlas privacy guard (do-not-store): Do NOT store the facts or content of this message in brain/ or journal/; "
+            "only record a general 'never store <topic>' rule in howto/ if requested."
+        )
+    else:
+        sess.pop("do_not_store", None)
+
+    # 2. Project routing (Charter §1.1 & §1.5: inside a project, step back and act like a normal coding agent)
     routes = route(prompt, cwd, idx)
     seen = set(sess.get("routed", []))
     root = _root()
@@ -1933,43 +2016,75 @@ def prompt_text(prompt, cwd, session):
                      ".agents/rules) once; after that work there like a normal coding agent.")
         sess.setdefault("routed", []).append(p["slug"])
         sess["project"] = p["slug"]
-    coach_enabled = (
-        "coach" in st.get("modules", [])
-        or os.path.isdir(os.path.join(BRAIN, "coach"))
-        or os.path.isfile(os.path.join(BRAIN, "_atlas", "procedures", "coach.md"))
-    )
-    if (coach_enabled or COACH_RX_EXPLICIT.search(prompt)) and not routes:
-        c_mode, c_why, c_macro = detect_coach_mode(prompt, idx)
-        if c_mode:
-            stale_note = ""
-            if c_macro and c_macro.get("stale") and c_mode in ("plan-14d", "macro"):
-                stale_note = f" Macro plan is STALE ({c_macro.get('stale_reason')}) -> update brain/coach/macro-plan.md FIRST before writing 14d workouts."
-            depth_flag = " --depth pro" if (c_mode == "dna" or coach_engine.PRO_QUERY_RX.search(prompt)) else ""
-            lines.append(
-                f"Atlas coach -> mode '{c_mode}' ({c_why}). Run `python -I {_show('_atlas/tools/atlas.py', cwd)} coach context --mode {c_mode}{depth_flag}` "
-                f"and follow {_show('_atlas/procedures/coach.md', cwd)}.{stale_note}"
-            )
-            sess["coach_mode"] = c_mode
-    kind = "explicit" if SIGNAL_EXPLICIT.search(prompt) else ("correction" if SIGNAL_CORRECTION.search(prompt) else "")
-    if kind:
-        sess["signal"] = kind
-        lines.append(f"Atlas learning signal ({kind}): {LEARN_HINTS[kind]}.")
-    skip = {p["page"] for p, _ in routes}
-    # File paths in the message are routing input, not search terms ("C:/Atlas/code/shop" must not hint "Atlas").
-    plain = re.sub(r"[A-Za-z]:[\\/][^\s\"'`]*|~?/[\w.-]+/[^\s\"'`]*", " ", prompt)
-    if len(plain.strip()) >= 3:
-        found, linked = graph_engine.compute_prompt_hints(
-            BRAIN, plain, idx, tag_vocab(), _vocab(idx, skip), skip,
-            max_hints=MAX_HINTS, max_df_share=MAX_DF_SHARE, db_path=CACHE,
+
+    explicit_atlas_cmd = bool(re.search(r"(?i)(?:^|\s)/atlas-[a-z-]+", prompt))
+    in_project = bool(sess.get("project")) and not explicit_atlas_cmd
+
+    # 3. Domain & user-extension routers (Coach, Mail, Tasks/Calendar, Custom Skills — only outside code-project mode)
+    tools_py = _show("_atlas/tools/atlas.py", cwd)
+    if not in_project and not routes:
+        coach_enabled = (
+            "coach" in st.get("modules", [])
+            or os.path.isdir(os.path.join(BRAIN, "coach"))
+            or os.path.isfile(os.path.join(BRAIN, "_atlas", "procedures", "coach.md"))
         )
-    else:
-        found, linked = [], []
-    if found:
-        lines.append("Atlas pages for this message (leads; open only what you need):")
-        for rel, summary, terms in found:
-            lines.append(f"- {_show(rel, cwd)}" + (f" — {summary}" if summary else "") + f" [{', '.join(terms)}]")
-        for n_rel, n_sum, _via, _kind in linked:
-            lines.append(f"  ↳ linked: {_show(n_rel, cwd)}" + (f" — {n_sum}" if n_sum else ""))
+        c_mode = None
+        if coach_enabled or COACH_RX_EXPLICIT.search(prompt):
+            c_mode, c_why, c_macro = detect_coach_mode(prompt, idx)
+            if c_mode:
+                stale_note = ""
+                if c_macro and c_macro.get("stale") and c_mode in ("plan-14d", "macro"):
+                    stale_note = f" Macro plan is STALE ({c_macro.get('stale_reason')}) -> update brain/coach/macro-plan.md FIRST before writing 14d workouts."
+                depth_flag = " --depth pro" if (c_mode == "dna" or coach_engine.PRO_QUERY_RX.search(prompt)) else ""
+                lines.append(
+                    f"Atlas coach -> mode '{c_mode}' ({c_why}). Run `python -I {tools_py} coach context --mode {c_mode}{depth_flag}` "
+                    f"and follow {_show('_atlas/procedures/coach.md', cwd)}.{stale_note}"
+                )
+                sess["coach_mode"] = c_mode
+        if not c_mode and MAIL_RX.search(prompt):
+            mail_proc = _show("_atlas/procedures/mail.md", cwd)
+            user_mail_sk = os.path.join(BRAIN, "skills", "atlas-mail", "SKILL.md")
+            overlay_bit = f" + {_show('skills/atlas-mail/SKILL.md', cwd)}" if os.path.isfile(user_mail_sk) else ""
+            lines.append(
+                f"Atlas mail -> Run `python -I {tools_py} mail accounts|list|search|read ...` and follow {mail_proc}{overlay_bit}."
+            )
+        if not c_mode and TODO_RX.search(prompt):
+            lines.append(
+                f"Atlas tasks/calendar -> Use `python -I {tools_py} todo` (`list|done|move|skip|add`) or `python -I {tools_py} calendar`."
+            )
+        for ext_name, ext_rel, ext_cmd in _detect_user_extensions(prompt)[:2]:
+            cli_bit = f"; CLI: `python -I {tools_py} {ext_cmd} ...`" if ext_cmd else ""
+            lines.append(f"Atlas user extension -> skill '{ext_name}' ({_show(ext_rel, cwd)}){cli_bit}.")
+
+    # 4. Capture-first signals (explicit "remember", corrections, and substantive new facts/dates/amounts)
+    if not do_not_store:
+        if SIGNAL_EXPLICIT.search(prompt):
+            kind = "explicit"
+        elif SIGNAL_CORRECTION.search(prompt):
+            kind = "correction"
+        elif not in_project and SIGNAL_FACT.search(prompt) and not SIGNAL_META_SKIP.search(prompt):
+            kind = "fact"
+        else:
+            kind = ""
+        if kind:
+            sess["signal"] = kind
+            lines.append(f"Atlas learning signal ({kind}): {LEARN_HINTS[kind]}.")
+
+    # 5. Surgical named-entity / alias / ID / domain-tag leads (zero speculative full-text noise; skipped inside code projects)
+    if not in_project:
+        skip = {p["page"] for p, _ in routes}
+        plain = re.sub(r"[A-Za-z]:[\\/][^\s\"'`]*|~?/[\w.-]+/[^\s\"'`]*", " ", prompt)
+        if len(plain.strip()) >= 3:
+            found, _linked = graph_engine.compute_prompt_hints(
+                BRAIN, plain, idx, tag_vocab(), _vocab(idx, skip), skip,
+                max_hints=MAX_HINTS, max_df_share=MAX_DF_SHARE, db_path=CACHE,
+            )
+        else:
+            found = []
+        if found:
+            lines.append("Atlas entity leads (use `atlas.py find <words>` if you need broader search):")
+            for rel, summary, terms in found:
+                lines.append(f"- {_show(rel, cwd)}" + (f" — {summary}" if summary else "") + f" [{', '.join(terms)}]")
     _save_state(st)
     return "\n".join(lines)
 
@@ -2089,6 +2204,10 @@ def _decide(session, marker_seen, did_work):
     st = _state()
     sess = _session(st, session)
     sess["turns"] = sess.get("turns", 0) + 1
+    if sess.pop("do_not_store", False):
+        sess.pop("signal", None)
+        _save_state(st)
+        return None
     signal = sess.pop("signal", "")
     if marker_seen:
         sess["last_marker"], sess["since_marker"] = _now_iso(), 0
@@ -2097,8 +2216,10 @@ def _decide(session, marker_seen, did_work):
     sess["since_marker"] = sess.get("since_marker", 0) + 1
     mode = s.get("reminder", "signals")
     reason = None
-    if signal and mode in ("signals", "every-turn", "rare"):
+    if signal in ("explicit", "correction") and mode in ("signals", "every-turn", "rare"):
         reason = REMINDER_SIGNAL.format(kind=signal)
+    elif signal == "fact" and mode in ("signals", "every-turn"):
+        reason = REMINDER_SIGNAL.format(kind="new fact/date/amount")
     elif did_work and mode == "every-turn":
         reason = REMINDER
     elif did_work and mode == "signals":
@@ -2112,6 +2233,42 @@ def _decide(session, marker_seen, did_work):
         sess["last_nag"] = _now_iso()
     _save_state(st)
     return reason
+
+
+def _auto_heal_dirty_brain_pages():
+    """Run zero-token auto-integrity (`[[wikilinks]]`, tag synonyms, `related:` edges, SQLite sync) on dirty `.md` pages."""
+    dirty = []
+    if os.path.isdir(os.path.join(BRAIN, ".git")):
+        res = _git("status", "--porcelain", "-uall")
+        if res.returncode == 0 and res.stdout.strip():
+            for raw_ln in res.stdout.splitlines():
+                if len(raw_ln) < 4 or "D" in raw_ln[:2]:
+                    continue
+                p_part = raw_ln[3:].strip()
+                if " -> " in p_part:
+                    p_part = p_part.split(" -> ", 1)[1].strip()
+                p_part = p_part.strip('"')
+                if p_part.lower().endswith(".md") and not p_part.startswith(("_atlas/", "_secrets/", "_archive/")):
+                    dirty.append(p_part)
+    else:
+        st = _state()
+        cutoff = float(st.get("last_autoheal_ts") or (time.time() - 300.0))
+        for dp, dns, fns in os.walk(BRAIN):
+            dns[:] = [d for d in dns if not d.startswith((".", "_atlas", "_secrets", "_archive"))]
+            for fn in fns:
+                if not fn.lower().endswith(".md"):
+                    continue
+                full = os.path.join(dp, fn)
+                try:
+                    if os.path.getmtime(full) >= cutoff:
+                        dirty.append(os.path.relpath(full, BRAIN).replace("\\", "/"))
+                except OSError:
+                    continue
+        st["last_autoheal_ts"] = time.time()
+        _save_state(st)
+    if not dirty:
+        return 0
+    return graph_engine.auto_heal_pages(BRAIN, dirty, tag_vocab_map=tag_vocab(), db_path=CACHE)
 
 
 def _calendar_needs_render():
@@ -2269,11 +2426,15 @@ def stop(agent, data):
         session = str(data.get("conversationId") or "")
         last, ag_did_work = _parse_antigravity_turn(data.get("transcriptPath"))
     context = st.get("sessions", {}).get(session, {}).get("project") or "—"
-    if s.get("daily_log", "on") != "off":
+    if s.get("daily_log", "on") != "off" and not st.get("sessions", {}).get(session, {}).get("do_not_store"):
         try:
             daily_log(last, context)
         except Exception as exc:
             _log_hook_error("stop.daily_log", exc)
+    try:
+        _auto_heal_dirty_brain_pages()
+    except Exception as exc:
+        _log_hook_error("stop.auto_heal", exc)
     try:
         if _calendar_needs_render():
             render_calendar_html()
