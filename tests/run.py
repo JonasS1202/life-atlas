@@ -1234,15 +1234,16 @@ class UiReleaseV11(AtlasCase):
         self.git(self.brain, "add", "-A")
         self.git(self.brain, "commit", "-q", "-m", "local template edits")
 
+        expected_ver = self.read(os.path.join(REPO, "core", "VERSION")).strip()
         diff_out = self.atlas("core-diff", "--source", REPO).stdout
         self.assertIn("update (upstream changed, yours untouched): _atlas/templates/calendar.html", diff_out)
         self.assertIn("kept: changed only in this Atlas: _atlas/templates/person.md", diff_out)
-        self.assertIn("1.1.1", diff_out)
+        self.assertIn(expected_ver, diff_out)
 
         self.atlas("core-apply", "--source", REPO, "--execute")
         self.assertIn("🕸️ Brain Graph", self.read(inst_tpl))
         self.assertIn("## Custom Local Section", self.read(person_tpl))
-        self.assertEqual(self.read(os.path.join(self.brain, "_atlas", "VERSION")).strip(), "1.1.1")
+        self.assertEqual(self.read(os.path.join(self.brain, "_atlas", "VERSION")).strip(), expected_ver)
         self.assertIn("ok", self.atlas("check").stdout.lower())
 
         # 4. v1.1.1 Coach Sync & Readiness Regression:
@@ -1314,6 +1315,153 @@ class UiReleaseV11(AtlasCase):
         self.assertIn("Training-window overlap today: 17:30 Vereinssitzung", ctx_v111)
         self.assertNotIn("FatMax", ctx_v111)
         self.assertNotIn("Storer", ctx_v111)
+
+    def test_antigravity_session_delivery_stop_and_daily_task_triage(self):
+        import datetime as dt
+        today = dt.date.today()
+        d_over3 = (today - dt.timedelta(days=3)).isoformat()
+        d_over1 = (today - dt.timedelta(days=1)).isoformat()
+        d_today = today.isoformat()
+        d_plus4 = (today + dt.timedelta(days=4)).isoformat()
+        d_plus5 = (today + dt.timedelta(days=5)).isoformat()
+        d_tom = (today + dt.timedelta(days=1)).isoformat()
+
+        self.page(
+            "calendar/README.md",
+            "---\nsummary: Central calendar and to-do hub\ntags: [atlas, calendar]\n---\n# Calendar & To-Dos\n\n"
+            "## Timeline\n\n"
+            f"- [ ] {d_over3} [todo] Offerte prüfen\n"
+            f"- [ ] {d_today} [todo] Steuerunterlagen einreichen\n"
+            f"- [ ] {d_plus5} 10:00 [event] Quartalsplanung\n\n"
+            "## Open To-Dos\n\n"
+            "- [ ] [high] Backup-Konzept testen\n",
+        )
+        self.page(
+            "areas/vertraege/strom.md",
+            f"---\nsummary: Stromvertrag\ntags: [contract]\ndue:\n  - {d_over1} Kündigungsfrist Stromvertrag\n---\n# Strom\n",
+        )
+
+        # 1. Antigravity SessionStart warm-up emits `{}` and NEVER burns `last_briefing` on empty tabs
+        res_warm = subprocess.run(
+            [sys.executable, "-I", "-B", self.hookf, "antigravity", "session"],
+            input=json.dumps({"conversationId": "empty-tab", "workspacePaths": [fwd(self.root)]}),
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+        self.assertEqual(res_warm.returncode, 0)
+        self.assertEqual(json.loads(res_warm.stdout.strip()), {})
+        st_after_warm = json.loads(self.read(os.path.join(self.brain, "_atlas", "state.json")))
+        self.assertEqual(st_after_warm.get("last_briefing", ""), "")
+
+        # 2. First real Antigravity user turn (`PreInvocation`, invocationNum=0) delivers `Atlas · ok` + daily briefing
+        #    + numbered Task check-in via non-deprecated `systemMessage`
+        res_c1_raw = subprocess.run(
+            [sys.executable, "-I", "-B", self.hookf, "antigravity", "prompt"],
+            input=json.dumps({
+                "conversationId": "c1",
+                "invocationNum": 0,
+                "lastUserInput": "moin, was liegt heute an?",
+                "workspacePaths": [fwd(self.root)],
+            }),
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+        self.assertEqual(res_c1_raw.returncode, 0)
+        c1_json = json.loads(res_c1_raw.stdout.strip())
+        self.assertIn("systemMessage", c1_json["injectSteps"][0])
+        self.assertNotIn("ephemeralMessage", c1_json["injectSteps"][0])
+        c1_text = c1_json["injectSteps"][0]["systemMessage"]["systemMessage"]
+        self.assertIn("Atlas · ok", c1_text)
+        self.assertIn("Atlas briefing (first chat today)", c1_text)
+        self.assertIn("Task check-in", c1_text)
+        self.assertIn("abhaken/done", c1_text)
+        self.assertIn("verschieben/move", c1_text)
+        self.assertIn("jetzt angehen", c1_text)
+        self.assertIn(f"1. [OVERDUE 3 d · {d_over3}] Offerte prüfen", c1_text)
+        self.assertIn(f"2. [OVERDUE 1 d · {d_over1}] [deadline] Kündigungsfrist Stromvertrag", c1_text)
+        self.assertIn(f"3. [DUE TODAY · {d_today}] Steuerunterlagen einreichen", c1_text)
+        self.assertIn("4. [OPEN · high] Backup-Konzept testen", c1_text)
+        self.assertIn("Quartalsplanung", c1_text)
+
+        # 3. Turn 2 in the SAME conversation `c1` (`invocationNum=0`) does NOT repeat `Atlas · ok` or briefing
+        c1_turn2 = self.hook("antigravity", "prompt", {
+            "conversationId": "c1",
+            "invocationNum": 0,
+            "lastUserInput": "erklär mir Rekursion",
+            "workspacePaths": [fwd(self.root)],
+        })
+        self.assertEqual(c1_turn2, "")
+
+        # 4. Turn 1 in a SECOND conversation `c2` on the same day gets `Atlas · ok` + `Due today/overdue`, NOT briefing
+        c2_turn1 = self.hook("antigravity", "prompt", {
+            "conversationId": "c2",
+            "invocationNum": 0,
+            "lastUserInput": "Nein, merk dir ab jetzt immer UTF-8",
+            "workspacePaths": [fwd(self.root)],
+        })
+        self.assertIn("Atlas · ok", c2_turn1)
+        self.assertIn("Due today/overdue", c2_turn1)
+        self.assertNotIn("Atlas briefing", c2_turn1)
+        self.assertNotIn("Task check-in", c2_turn1)
+
+        # 5. Antigravity `Stop` handles `terminationReason == "NO_TOOL_CALL"` and respects `continuationActive`
+        tp_ag = os.path.join(self.tmp, "ag_transcript.jsonl")
+        with open(tp_ag, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"type": "USER_INPUT", "content": "Nein, merk dir ab jetzt immer UTF-8"}) + "\n")
+            fh.write(json.dumps({"type": "PLANNER_RESPONSE", "content": "Alles klar."}) + "\n")
+        stop_cont = self.hook("antigravity", "stop", {
+            "conversationId": "c2",
+            "terminationReason": "NO_TOOL_CALL",
+            "continuationActive": True,
+            "fullyIdle": True,
+            "lastUserInput": "Nein, merk dir ab jetzt immer UTF-8",
+            "transcriptPath": fwd(tp_ag),
+        })
+        self.assertEqual(stop_cont, "")
+        stop_nudge = self.hook("antigravity", "stop", {
+            "conversationId": "c2",
+            "terminationReason": "NO_TOOL_CALL",
+            "continuationActive": False,
+            "fullyIdle": True,
+            "lastUserInput": "Nein, merk dir ab jetzt immer UTF-8",
+            "transcriptPath": fwd(tp_ag),
+        })
+        self.assertIn("learning signal", stop_nudge)
+
+        # 6. `atlas.py todo` end-to-end triage: list -> done #1 -> move undated -> move due_fm -> skip -> done due_fm -> add
+        todo_list = self.atlas("todo").stdout
+        self.assertIn("1. [OVERDUE 3 d", todo_list)
+        self.assertIn("4. [OPEN · high] Backup-Konzept testen", todo_list)
+
+        self.assertIn("done:", self.atlas("todo", "done", "1").stdout)
+        self.assertIn(f"scheduled -> {d_plus4}:", self.atlas("todo", "move", "Backup-Konzept", "--to", "+4d").stdout)
+        self.assertIn(f"rescheduled -> {d_tom}:", self.atlas("todo", "move", "Kündigungsfrist Stromvertrag", "--to", "tomorrow").stdout)
+        self.assertIn("skipped:", self.atlas("todo", "skip", "Steuerunterlagen").stdout)
+        self.assertIn("added:", self.atlas("todo", "add", "Neues Ticket anlegen", "--prio", "high").stdout)
+
+        cal_after = self.read(os.path.join(self.brain, "calendar", "README.md"))
+        self.assertIn(f"- [x] {d_over3} [todo] Offerte prüfen", cal_after)
+        self.assertIn(f"- [-] {d_today} [todo] Steuerunterlagen einreichen", cal_after)
+        self.assertIn(f"- [ ] {d_plus4} [todo] Backup-Konzept testen", cal_after)
+        # Promoted out of `## Open To-Dos`
+        open_sec = cal_after.split("## Open To-Dos", 1)[1]
+        self.assertNotIn("Backup-Konzept testen", open_sec)
+        self.assertIn("- [ ] [high] Neues Ticket anlegen", open_sec)
+
+        strom_after_move = self.read(os.path.join(self.brain, "areas", "vertraege", "strom.md"))
+        self.assertIn(f"- {d_tom} Kündigungsfrist Stromvertrag", strom_after_move)
+
+        # Mark frontmatter `due:` deadline as done
+        self.assertIn("done:", self.atlas("todo", "done", "Kündigungsfrist Stromvertrag").stdout)
+        strom_after_done = self.read(os.path.join(self.brain, "areas", "vertraege", "strom.md"))
+        self.assertIn(f'"[x] {d_tom} Kündigungsfrist Stromvertrag"', strom_after_done)
+
+        todo_remaining = self.atlas("todo").stdout
+        self.assertNotIn("Offerte prüfen", todo_remaining)
+        self.assertNotIn("Steuerunterlagen einreichen", todo_remaining)
+        self.assertNotIn("Kündigungsfrist Stromvertrag", todo_remaining)
+        self.assertIn("Neues Ticket anlegen", todo_remaining)
+
+        todo_with_upcoming = self.atlas("todo", "list", "--all").stdout
+        self.assertIn(f"[in 4 d · {d_plus4}] Backup-Konzept testen", todo_with_upcoming)
 
 
 if __name__ == "__main__":

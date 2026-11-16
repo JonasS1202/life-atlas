@@ -36,12 +36,32 @@ In your reply:
 - Give the user the clickable `http://127.0.0.1:<port>/calendar.html` link printed by the command (`[📅 Atlas Kalender öffnen](http://127.0.0.1:.../calendar.html)`).
 - Summarize the next upcoming items and top open to-dos in a few crisp lines.
 
-## 3. Adding or updating events, blockers, goals, workouts & to-dos
+## 3. Quick task triage (`atlas.py todo`) & manual calendar edits
 
-- **Dated items** go into `brain/calendar/README.md` under `## Timeline`:
+Use `atlas.py todo` for atomic, zero-token task operations (automatically syncs `index.sqlite` and refreshes `calendar.html`):
+
+```bash
+# List numbered actionable tasks (overdue, due today, and open to-dos; add --all for future dates):
+python -I <ROOT>/brain/_atlas/tools/atlas.py todo
+
+# Check off (`[x]`) or skip (`[-]`) by briefing #number, task text, or --file/--line:
+python -I <ROOT>/brain/_atlas/tools/atlas.py todo done 1
+python -I <ROOT>/brain/_atlas/tools/atlas.py todo done "Tax return"
+python -I <ROOT>/brain/_atlas/tools/atlas.py todo skip 2
+
+# Reschedule a dated task/due: item OR schedule an undated Open To-Do onto a date:
+python -I <ROOT>/brain/_atlas/tools/atlas.py todo move 2 --to 2026-11-20
+python -I <ROOT>/brain/_atlas/tools/atlas.py todo move "Tax return" --to +3d
+
+# Add a new dated `[todo]` or undated `[high|med|low]` Open To-Do:
+python -I <ROOT>/brain/_atlas/tools/atlas.py todo add "Call dentist" --to tomorrow
+python -I <ROOT>/brain/_atlas/tools/atlas.py todo add "Review backup disk" --prio high
+```
+
+For multi-line edits or events/workouts/goals/blockers in `brain/calendar/README.md`:
+- **Dated items** go under `## Timeline`:
   `- [ ] YYYY-MM-DD [kind] What` (or `YYYY-MM-DD..YYYY-MM-DD`, optional `HH:MM` or `HH:MM-HH:MM`).
   Kinds: `[event]`, `[blocked]`, `[goal:A]`, `[workout:cycling]`, `[workout:running]`, `[todo]`, `[birthday]`, `[deadline]`.
-- **Undated tasks** go into `brain/calendar/README.md` under `## Open To-Dos`:
-  `- [ ] [high|med|low] Task description` (when the user assigns a date to a task later, move it up to `## Timeline`).
-- After editing `brain/calendar/README.md`, run `atlas.py calendar` (or `--open` if requested) so the live HTML view
-  updates immediately.
+- **Undated tasks** go under `## Open To-Dos`:
+  `- [ ] [high|med|low] Task description` (moving to a date via `atlas.py todo move` promotes it to `## Timeline`).
+- After manual edits to `brain/calendar/README.md`, run `atlas.py calendar` (or `--open` if requested) so `calendar.html` updates immediately.

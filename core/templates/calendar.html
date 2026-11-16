@@ -777,6 +777,27 @@ function renderCoachRibbon(coach){
     .concat(rdy.taper && rdy.taper.recommendation ? [rdy.taper.recommendation] : []);
   const guardHtml = guards.length ? `<div class="guardrail-bar">🛡️ <strong>Coach Guardrail:</strong> ${esc(guards[0])}</div>` : '';
 
+  const dna = tel.dna_snapshot || {};
+  const dnaSc = dna.statcard || {};
+  const dnaScores = dnaSc.scores || {};
+  const dnaHasScores = ['peak_shape','freshness','durability','trajectory'].some(k => dnaScores[k] !== undefined && dnaScores[k] !== null);
+  const dnaHtml = (mode === 'pro' && (dna.archetype || dna.primary_limiter || dnaHasScores)) ? `
+    <div class="macro-banner" style="margin-top:8px;border-color:rgba(167,139,250,0.32);background:rgba(139,92,246,0.08)">
+      <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center">
+        <strong>🧬 Athlete DNA:</strong>
+        ${dna.archetype ? `<span style="color:#c4b5fd;font-weight:700">${esc(dna.archetype)}</span>` : ''}
+        ${dna.primary_limiter ? `<span style="color:var(--muted-hi)">Limiter: <strong style="color:var(--text)">${esc(dna.primary_limiter)}</strong></span>` : ''}
+      </div>
+      <div class="macro-badges">
+        ${['peak_shape','freshness','durability','trajectory'].filter(k => dnaScores[k] !== undefined && dnaScores[k] !== null).map(k => {
+          const lbl = k === 'peak_shape' ? 'Peak' : (k === 'freshness' ? 'Fresh' : (k === 'durability' ? 'Durab' : 'Trend'));
+          return `<span class="tag ok">${lbl} ${esc(dnaScores[k])}</span>`;
+        }).join('')}
+        ${dna.confidence ? `<span class="tag ${dna.confidence==='low'?'med':'ok'}">Conf: ${esc(dna.confidence)}</span>` : ''}
+      </div>
+    </div>
+  ` : '';
+
   coachRib.innerHTML = `
     <div class="coach-hdr">
       <div class="coach-title">
@@ -797,6 +818,7 @@ function renderCoachRibbon(coach){
       </div>
     </div>
     ${pmcHtml}
+    ${dnaHtml}
     ${schedConflictHtml}
     ${guardHtml}
     <div class="phys-chips">${proChips}${baseChips || (!proChips ? '<div class="phys-chip"><span class="k">Tipp:</span><strong class="v">Leistungsdaten in coach/profile.md hinterlegen</strong></div>' : '')}</div>

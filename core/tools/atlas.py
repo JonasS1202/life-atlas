@@ -25,6 +25,7 @@ Commands
   probe       run the registered hooks with sample input and check their output
   check       verify the charter: sizes, links, reachability, duplicates, secrets, Git, backup, hooks, registry
   deadlines   list `due:` items; `--ics FILE` writes a calendar file
+  todo        quick task triage (`list`, `done`, `skip`, `reopen`, `move --to <date|+Nd>`, `add`)
   mail        multi-account IMAP mail engine (`accounts`, `folders`, `list`, `read`, `search`, `audit`, plus
               safety-gated `move` to `target_folder`, `copy`, `trash`, `delete`, `flags`, `labels`, `mkdir`)
   inventory   read-only map of the computer (names, sizes, types, markers; never file contents or credential stores)
@@ -56,7 +57,7 @@ DEFAULT_UPSTREAM = "https://github.com/JonasS1202/life-atlas.git"
 TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if TOOLS_DIR not in sys.path:
     sys.path.insert(0, TOOLS_DIR)
-from atlas_lib import coach_engine, graph_engine
+from atlas_lib import cal_engine, coach_engine, graph_engine
 
 INSTALLED_BRAIN = os.path.normpath(os.path.join(TOOLS_DIR, "..", ".."))
 HOOK_FILE = os.path.normpath(os.path.join(TOOLS_DIR, "..", "hooks", "atlas_hook.py"))
@@ -885,7 +886,7 @@ SAMPLES = {
     ("claude", "stop"): {"hook_event_name": "Stop", "stop_hook_active": True, "last_assistant_message": "Atlas: probe"},
     ("antigravity", "session"): {"conversationId": "probe", "workspacePaths": []},
     ("antigravity", "prompt"): {"conversationId": "probe", "invocationNum": 0, "lastUserInput": "probe: glossary"},
-    ("antigravity", "stop"): {"conversationId": "probe", "terminationReason": "error", "fullyIdle": True},
+    ("antigravity", "stop"): {"conversationId": "probe", "terminationReason": "ERROR", "fullyIdle": True},
 }
 
 
@@ -1531,6 +1532,102 @@ def cmd_calendar(args):
     if args.ics:
         _write_ics(args.ics, _deadlines(brain, None if args.all else args.days))
     _open_visual_calendar(hk, idx, getattr(args, "open", False), view=req_view)
+
+
+def _resolve_todo_target(hk, idx, query, file_rel=None, line_no=None):
+    """Resolve `query` (1-based number `#1`/`1` or text substring) and/or `--file`/`--line` to `(rel, line, what)`."""
+    clean_q = (query or "").strip()
+    if file_rel:
+        return file_rel, line_no, clean_q
+    tasks = hk.actionable_tasks(idx, include_upcoming_days=365)
+    m_num = re.match(r"^#?(\d+)$", clean_q)
+    if m_num:
+        n = int(m_num.group(1))
+        if 1 <= n <= len(tasks):
+            t = tasks[n - 1]
+            return t["rel"], (t["line"] if t["line"] > 0 else 0), t["what"]
+        sys.exit(f"todo: task #{n} out of range (1..{len(tasks)} active task(s)).")
+    if not clean_q:
+        sys.exit("todo: specify a task number (e.g. `1`), task text, or `--file <rel> --line <N>`.")
+    want = cal_engine._norm_todo_compare(clean_q)
+    exact = [t for t in tasks if cal_engine._norm_todo_compare(t["what"]) == want]
+    if len(exact) == 1:
+        t = exact[0]
+        return t["rel"], (t["line"] if t["line"] > 0 else 0), t["what"]
+    subs = [t for t in tasks if want in cal_engine._norm_todo_compare(t["what"]) or cal_engine._norm_todo_compare(t["what"]) in want]
+    if len(subs) == 1:
+        t = subs[0]
+        return t["rel"], (t["line"] if t["line"] > 0 else 0), t["what"]
+    if len(subs) > 1:
+        preview = "; ".join(f"#{t['num']} {t['what']} [{t['rel']}]" for t in subs[:5])
+        sys.exit(f"todo: ambiguous match '{clean_q}' ({len(subs)} hits: {preview}). Pass task `#num` or `--file`/`--line`.")
+    return "calendar/README.md", line_no, clean_q
+
+
+def cmd_todo(args):
+    _root, brain = paths(args)
+    hk = hook_module(brain)
+    idx = hk.load_index()
+    action = (args.action or "list").lower()
+    query = " ".join(args.target or []).strip()
+
+    if action == "list":
+        horizon = (args.days if args.days else 365) if args.all else 0
+        tasks = hk.actionable_tasks(idx, include_upcoming_days=horizon)
+        if not tasks:
+            say("todo: no actionable open or overdue tasks")
+        else:
+            for t in tasks:
+                loc = f"{t['rel']}:{t['line']}" if t["line"] else t["rel"]
+                k_tag = "[deadline] " if t["kind"] == "deadline" else ""
+                say(f"{t['num']:2d}. [{t['badge']}] {k_tag}{t['what']}  [{loc}]")
+        if getattr(args, "open", False):
+            _open_visual_calendar(hk, idx, open_now=True, view="todo")
+        return
+
+    if action == "add":
+        text = query or (args.text or "").strip()
+        if not text:
+            sys.exit("todo add: provide task text (e.g. `atlas.py todo add \"Tax return\" --to +3d`).")
+        res = cal_engine.add_todo_in_brain(brain, text, target_date_spec=args.to, prio=args.prio or "med")
+        if not res.get("ok"):
+            sys.exit(f"todo add failed: {res.get('error')}")
+        idx = hk.load_index()
+        if getattr(args, "open", False):
+            _open_visual_calendar(hk, idx, open_now=True, view="todo")
+        else:
+            hk.render_calendar_html(idx, start_server=False)
+        say(f"added: {res['entry']}  [{res['rel']}:{res['line']}]")
+        return
+
+    rel, ln, what = _resolve_todo_target(hk, idx, query, file_rel=args.file, line_no=args.line)
+    if action in ("done", "skip", "reopen"):
+        st_map = {"done": "done", "skip": "skipped", "reopen": "open"}
+        res = cal_engine.toggle_todo_in_brain(brain, rel, line_no=ln, what=what, target_status=st_map[action])
+        if not res.get("ok"):
+            sys.exit(f"todo {action} failed: {res.get('error')}")
+        idx = hk.load_index()
+        if getattr(args, "open", False):
+            _open_visual_calendar(hk, idx, open_now=True, view="todo")
+        else:
+            hk.render_calendar_html(idx, start_server=False)
+        say(f"{res['status']}: {what or rel}  [{res['rel']}:{res['line']}]")
+        return
+
+    if action == "move":
+        if not args.to:
+            sys.exit("todo move: pass `--to <YYYY-MM-DD|+Nd|+Nw|tomorrow>`.")
+        res = cal_engine.reschedule_task_in_brain(brain, rel, args.to, line_no=ln, what=what)
+        if not res.get("ok"):
+            sys.exit(f"todo move failed: {res.get('error')}")
+        idx = hk.load_index()
+        if getattr(args, "open", False):
+            _open_visual_calendar(hk, idx, open_now=True, view="todo")
+        else:
+            hk.render_calendar_html(idx, start_server=False)
+        kind_lbl = "scheduled" if res.get("promoted") else "rescheduled"
+        say(f"{kind_lbl} -> {res['date']}: {what or rel}  [{res['rel']}:{res['line']}]")
+        return
 
 
 # ================================================================= coach (Cycling, Running & Strength)
@@ -2702,8 +2799,10 @@ def _coach_context(
 
     prof_path = os.path.join(brain, "coach", "profile.md")
     rdy_path = os.path.join(brain, "coach", "readiness.md")
+    dna_path = os.path.join(brain, "coach", "dna.md")
     prof_text = read(prof_path) if os.path.isfile(prof_path) else ""
     rdy_text = read(rdy_path) if os.path.isfile(rdy_path) else ""
+    dna_text = read(dna_path) if os.path.isfile(dna_path) else ""
 
     telemetry = coach_engine.build_coach_telemetry(
         profile_text=prof_text,
@@ -2713,6 +2812,7 @@ def _coach_context(
         strava_connected=bool(c_state.get("strava_connected")),
         explicit_depth=depth_override if depth_override and depth_override != "auto" else None,
         query_text=query_text or "",
+        dna_text=dna_text,
     )
     depth = telemetry["depth"]
 
@@ -2818,6 +2918,13 @@ def _coach_context(
             say(act_text[:act_text.index("## Tier 3")].strip())
         else:
             say(act_text)
+
+    if eff_mode == "dna":
+        say("\n" + coach_engine.build_dna_context_block(
+            activities=c_state.get("activities", []),
+            telemetry=telemetry,
+            dna_snapshot_text=dna_text,
+        ))
 
     if deep_dive:
         say(f"\n=== 7. DEEP-DIVE ACTIVITY ({deep_dive}) ===")
@@ -4194,12 +4301,27 @@ def main():
     p.add_argument("--ics-source", help="URL or file path of an .ics feed")
     p.add_argument("--execute", action="store_true")
 
+    p = sub.add_parser("todo", help="quick task triage: list, done, skip, reopen, move, add")
+    p.add_argument("action", nargs="?", default="list",
+                   choices=("list", "done", "skip", "reopen", "move", "add"),
+                   help="task action (default: list)")
+    p.add_argument("target", nargs="*", help="task `#number` from briefing/list, task substring, or text for `add`")
+    p.add_argument("--to", "--date", dest="to", help="target date (`YYYY-MM-DD`, `+3d`, `+1w`, `today`, `tomorrow`) for `move` or `add`")
+    p.add_argument("--prio", choices=("high", "med", "low"), default="med", help="priority for undated `add` (default: med)")
+    p.add_argument("--file", help="brain-relative `.md` path (optional when matching by `#number` or text)")
+    p.add_argument("--line", type=int, help="1-based line number (`0` for frontmatter `due:`)")
+    p.add_argument("--text", help="optional task text alias for `add`")
+    p.add_argument("--days", type=int, default=365, help="upcoming horizon in days when `--all` is passed to `list`")
+    p.add_argument("--all", action="store_true", help="include upcoming scheduled tasks in `list`")
+    p.add_argument("--open", action="store_true", help="open visual calendar in To-Do view")
+    p.add_argument("--execute", action="store_true", help="accepted for CLI consistency")
+
     p = sub.add_parser("coach")
     p.add_argument("action", nargs="?", default="context",
                    choices=("context", "status", "auth-strava", "sync", "note", "zwo"),
                    help="coach action (default: context)")
     p.add_argument("--init", action="store_true", help="scaffold brain/coach/ and harvest existing athlete thresholds")
-    p.add_argument("--mode", choices=("auto", "daily", "checkin", "plan-14d", "macro"), default="auto",
+    p.add_argument("--mode", choices=("auto", "daily", "checkin", "plan-14d", "macro", "dna"), default="auto",
                    help="context slicing mode (default: auto)")
     p.add_argument("--depth", choices=("auto", "simple", "standard", "pro"), default="auto",
                    help="coaching depth override (default: auto from coach/profile.md & streams)")
@@ -4268,7 +4390,8 @@ def main():
                 "find": cmd_find, "graph": cmd_graph, "context": cmd_context, "link": cmd_link, "conflicts": cmd_conflicts,
                 "mark": cmd_mark, "adopt": cmd_adopt, "code-sync": cmd_code_sync,
                 "core-accept": cmd_core_accept, "dev-check": cmd_dev_check, "dev-setup": cmd_dev_setup,
-                "check": cmd_check, "deadlines": cmd_deadlines, "calendar": cmd_calendar, "coach": cmd_coach,
+                "check": cmd_check, "deadlines": cmd_deadlines, "calendar": cmd_calendar, "todo": cmd_todo,
+                "coach": cmd_coach,
                 "inventory": cmd_inventory, "move": cmd_move, "verify": cmd_verify, "undo": cmd_undo,
                 "core-diff": cmd_core_diff, "state": cmd_state}
     if args.cmd == "init" and not args.root:

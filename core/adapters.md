@@ -1,6 +1,6 @@
 # Adapters: how Atlas plugs into each agent
 
-Verified: **2026-11-13** against the official docs listed below. `/atlas-update` compares this page with the current
+Verified: **2026-11-16** against the official docs listed below. `/atlas-update` compares this page with the current
 official documentation and proposes changes (charter §7). Anything marked *unconfirmed* must be tested on the real
 machine (`atlas.py probe`, a fresh chat) and fixed here when it turns out differently.
 
@@ -48,9 +48,9 @@ chat starts in ROOT.
 
 | | Claude Code | Antigravity |
 |---|---|---|
-| Session start | stdin `session_id`, `cwd`, `source`; output `hookSpecificOutput.additionalContext` | stdin `conversationId`, `workspacePaths`; output `injectSteps: [{systemMessage: {systemMessage: …}}]` |
-| Each user message | `UserPromptSubmit`: stdin `prompt`, `cwd`, `session_id`; output `hookSpecificOutput.additionalContext` | `PreInvocation` runs before **every** model call; Atlas acts only on `invocationNum == 0`; stdin `lastUserInput`; output `injectSteps: [{ephemeralMessage: …}]` |
-| End of turn | `Stop`: stdin `stop_hook_active`, `last_assistant_message`, `transcript_path`, `session_id`; continue with `{"decision": "block", "reason": …}`; built-in loop guard, cap 8 | `Stop`: stdin `terminationReason`, `fullyIdle`, `lastUserInput`, `transcriptPath`; continue with `{"decision": "continue", "reason": …}`; no loop guard: Atlas keeps one in `state.json` |
+| Session start | stdin `session_id`, `cwd`, `source`; output `hookSpecificOutput.additionalContext` | `SessionStart` fires when a chat tab is initialized (before user input; Antigravity 2.0 drops `SessionStart.injectSteps` from the transcript): Atlas warms up Git pull, SQLite index & loopback calendar server and emits `{}` without consuming `last_briefing` |
+| Each user message | `UserPromptSubmit`: stdin `prompt`, `cwd`, `session_id`; output `hookSpecificOutput.additionalContext` | `PreInvocation` runs before **every** model call; Atlas acts only on `invocationNum == 0`; stdin `lastUserInput`, `conversationId`; on the first turn of each conversation/day prepends `session_text` (`Atlas · ok` + daily briefing / task check-in); output `injectSteps: [{systemMessage: {systemMessage: …}}]` (`ephemeralMessage` is deprecated in Antigravity 2.0) |
+| End of turn | `Stop`: stdin `stop_hook_active`, `last_assistant_message`, `transcript_path`, `session_id`; continue with `{"decision": "block", "reason": …}`; built-in loop guard, cap 8 | `Stop`: stdin `terminationReason` (`"NO_TOOL_CALL"` on normal completion), `continuationActive`, `fullyIdle`, `lastUserInput`, `transcriptPath`; continue with `{"decision": "continue", "reason": …}`; checks `continuationActive` plus a fallback guard in `state.json` |
 | Command shell | Git Bash on Windows by default (PowerShell without Git Bash) | **unconfirmed**; `wire` writes absolute paths without spaces (8.3 short paths on Windows) so any shell works |
 
 What the session hook always does, in both agents: print `Atlas · ok` (the heartbeat the router checks for), pull the

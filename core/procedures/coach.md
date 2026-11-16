@@ -10,6 +10,7 @@ All coaching state lives in `brain/coach/` and `brain/calendar/README.md`:
 - `brain/coach/readiness.md` — Daily readiness check-in log (`RHR`, sleep hours/quality, soreness/fatigue `1–5`, subjective notes) updated via `atlas.py coach note`.
 - `brain/coach/macro-plan.md` — Long-term season periodization (weekly phases `Base | Build | Peak | Taper | Deload`, target hours, sport split, key stimulus). Updated every 1–2 weeks or when goals/blockers change.
 - `brain/coach/power-curve.md` — 3-Epoch Peak Matrix (`42d Current` · `90d Meso` · `365d Season/All-Time`), Calibrated `CP/W'` & `CS/D'`, Multi-Tier Durability (`>15/25/35 kJ/kg` & `>5 kJ/kg >CP`), Fiber Typology, and Running Best Paces.
+- `brain/coach/dna.md` — Persistent Athlete / Rider DNA Scouting Report (`Archetype`, `Primary Limiter`, calibrated `0–100` scores, `ceilings`, and `statcard` JSON), automatically surfaced in `pro` context & dashboard.
 - `brain/coach/activities.md` — 3-Tier activity log (`W'bal`, `matches`, torque/`F_opt`, steady-state `Pw:Hr`, CHO `g/h`, cross-sport load) + subjective athlete feedback (`feedback:`). Raw 1Hz streams & `coach_telemetry.json` live git-ignored in `brain/_atlas/cache/`.
 - `brain/calendar/README.md` — Single source of truth for dated `[goal:A/B]`, `[blocked]` windows, and the concrete **14-day workouts** (`[workout:cycling]`, `[workout:running]`, `[workout:strength]`).
 - `brain/coach/workouts/` — Generated `.zwo` files for structured cycling workouts.
@@ -78,6 +79,22 @@ Triggered when planning or adjusting the next 1–2 weeks:
 
 ### Mode C: Daily Coaching & Dynamic Adaptation (`daily` / `adapt`)
 - **Illness / Fever / Blocker:** Mark affected workouts `[-]`, add `- [ ] YYYY-MM-DD [blocked] <Reason>` if needed, and rebalance remaining sessions without stacking hard days back-to-back.
+
+### Mode D: Athlete / Rider DNA Scouting (`dna`)
+Triggered on *"Rider DNA"*, *"Athlete DNA"*, *"Scouting"*, *"Wo stehe ich leistungsmäßig?"*, *"Was ist mein Limiter?"*, or *"Formanalyse"* (never forced in `SIMPLE` mode):
+1. **Three Hard Rules (Anti-Hallucination Contract):**
+   - **REASON BEFORE NUMBER:** Every score, ceiling, or phenotype in the structured summary MUST be derived from concrete enriched efforts in the prose first.
+   - **MANDATORY EVIDENCE:** Cite exact dates, watts/pace, `kJ_before`/`km_before`, `lead-in`, `VI`, `split`, and `HR` for every claim.
+   - **MANDATORY CONFIDENCE, FORCED LOW ON THIN DATA:** Never manufacture precision when true all-out anchors are missing — mark `confidence: "low"` and state clearly that a number is an extrapolation.
+2. **Reading Enriched Efforts:** Distinguish fresh ceilings from fatigued or surgy efforts (`VI > 1.05`, high `kJ_before`, or negative splits `first -> second` proving reserve) to infer true fresh capacity.
+3. **0–100 Calibration Rubrics:**
+   - `peak_shape`: `100` = within ~2% of all-time & fresh; `85` = ~5% below; `70` = ~10% below; `<55` = rebuilding/off-season.
+   - `freshness`: `100` = rested (`TSB >= +10`, low ATL, good readiness); `50` = normal training load; `<30` = overreached (`TSB <= -20` or `ACWR > 1.35`).
+   - `durability`: `100` = `<3%` drop after `>25–35 kJ/kg` and `<4%` `Pw:Hr` drift; `75` = `5–8%` drop; `<55` = sharp late fade.
+   - `trajectory`: `100` = clear multi-quarter upward trend; `60` = plateau/maintenance; `<40` = declining trend.
+4. **Two-Part Output & Persistence (`brain/coach/dna.md`):**
+   - Deliver a concise **World-Tour Scouting Report** (1. *Your DNA / Archetyp & Physiologie*, 2. *Right Now / Aktuelle Form & Limiter*), plus a fenced `json` **`statcard`** block (`archetype`, `primary_limiter`, `confidence`, `scores: {peak_shape, freshness, durability, trajectory}`, `ceilings`, `evidence`).
+   - Persist the full report into `brain/coach/dna.md` (with YAML frontmatter: `summary:`, `tags: [coach, dna]`, `updated: YYYY-MM-DD`, `archetype:`, `primary_limiter:`, `confidence:`).
 
 ## 6. Pro Sports-Science Guardrails (`coach_engine.py`)
 

@@ -2,6 +2,17 @@
 
 Written for users: `/atlas-update` shows the sections between the installed and the new version.
 
+## [1.2.0] - 2026-11-16
+
+- **Reliable Antigravity 2.0 Hook Delivery (`atlas_hook.py`, `adapters.md`):**
+  - **`SessionStart` Warm-Up + First-Turn `PreInvocation` Delivery:** Antigravity 2.0 executes `SessionStart` before the first user message and drops `SessionStart.injectSteps` from the chat trajectory. `SessionStart` now warms up Git pull, `index.sqlite`, and the loopback calendar server without consuming `last_briefing`, while `PreInvocation` (`invocationNum == 0`) reliably injects `Atlas · ok` and the daily briefing once per conversation/day via `systemMessage` (replacing deprecated `ephemeralMessage`).
+  - **Antigravity 2.0 `Stop` Contract Parity:** Recognizes `terminationReason == "NO_TOOL_CALL"` alongside `model_stop` and honors `continuationActive` to prevent duplicate stop nudges.
+- **Daily Actionable Task Check-In & Zero-Token `atlas.py todo` Triage (`atlas_hook.py`, `atlas.py`, `cal_engine.py`, `brief.md`, `calendar.md`):**
+  - **Once-Daily Task Check-In:** The first chat each day presents up to 5 priority-ordered numbered tasks (`1..N`: overdue `[todo]`/`[deadline]` first, then due today, then `[high]`/`[med]`/`[low]` `Open To-Dos`) with quick triage options to **check off**, **reschedule**, or **tackle now**.
+  - **Atomic `atlas.py todo` CLI (`list`, `done`, `skip`, `reopen`, `move`, `add`):** Targets tasks by briefing `#number`, text match, or `--file`/`--line` across `calendar/README.md`, `areas/` checklists, and decentralized `due:` YAML frontmatter entries; supports natural date specs (`YYYY-MM-DD`, `+3d`, `+1w`, `today`, `tomorrow`), promotes undated tasks into `## Timeline` chronologically, and immediately refreshes `calendar.html`.
+- **Athlete / Rider DNA Physiological Scouting (`coach_engine.py`, `atlas.py`, `atlas_hook.py`, `coach.md`, `calendar.html`):**
+  - **Mode `dna` (`--mode dna` / `"Rider DNA"`, `"Athlete DNA"`, `"Limiter"`):** Surfaces enriched efforts, multi-quarter trajectory, ceilings, and 0–100 calibration rubrics (`peak_shape`, `freshness`, `durability`, `trajectory`) backed by an anti-hallucination evidence contract, persisting structured `statcard` reports in `brain/coach/dna.md` and displaying a `🧬 Athlete DNA` summary strip in Pro Mode inside `calendar.html`.
+
 ## [1.1.1] - 2026-11-13
 
 - **Strict Physiological Readiness vs. Calendar Deadlines (`coach_engine.py`, `calendar.html`):**

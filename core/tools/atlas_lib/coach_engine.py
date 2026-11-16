@@ -8,6 +8,7 @@ and calendar constraints.
 from __future__ import annotations
 
 import datetime as dt
+import json
 import math
 import os
 import re
@@ -51,7 +52,7 @@ PRO_QUERY_RX = re.compile(
     r"ctl\b|atl\b|tsb\b|acwr\b|monoton\w*|trimp\b|rtss\b|hrtss\b|srpe\b|"
     r"typolog\w*|muskelfaser\w*|fiber\s+type|pdc\b|torque|drehmoment|quadrant\w*|"
     r"durability|erm[uü]dungswiderstand|pw\s*:\s*hr|decoupling|entkopplung|"
-    r"ampk|mtor\w*|bosquet|peronnet|hypoxi\w*)\b"
+    r"ampk|mtor\w*|bosquet|peronnet|hypoxi\w*|rider\s*dna|athlete\s*dna|athleten-?dna|limiter)\b"
 )
 
 
@@ -1048,6 +1049,151 @@ def compute_environment_adjustments(
     return out
 
 
+def enrich_cycling_peak(
+    watts: list[float],
+    hr: list[float],
+    window_sec: int,
+) -> dict[str, Any] | None:
+    """Locate the best `window_sec` cycling power effort and enrich it with pre-load, VI, split, and HR."""
+    n = len(watts)
+    if n < window_sec or window_sec <= 0:
+        return None
+    clean_w = [max(0.0, float(x or 0.0)) for x in watts]
+    win_sum = sum(clean_w[:window_sec])
+    best_sum = win_sum
+    best_start = 0
+    for i in range(1, n - window_sec + 1):
+        win_sum += clean_w[i + window_sec - 1] - clean_w[i - 1]
+        if win_sum > best_sum:
+            best_sum = win_sum
+            best_start = i
+    avg_w = best_sum / window_sec
+    if avg_w <= 0:
+        return None
+
+    end_s = best_start + window_sec
+    kj_before = int(round(sum(clean_w[:best_start]) / 1000.0))
+    lead_start = max(0, best_start - 600)
+    lead_slice = clean_w[lead_start:best_start]
+    lead_in_w = int(round(sum(lead_slice) / len(lead_slice))) if lead_slice else None
+
+    seg_w = clean_w[best_start:end_s]
+    if window_sec >= 30:
+        r30 = sum(seg_w[:30])
+        f_sum = (r30 / 30.0) ** 4
+        cnt = 1
+        for k in range(30, window_sec):
+            r30 += seg_w[k] - seg_w[k - 30]
+            f_sum += (r30 / 30.0) ** 4
+            cnt += 1
+        seg_np = (f_sum / cnt) ** 0.25
+        vi = round(seg_np / avg_w, 2)
+    else:
+        vi = 1.0
+
+    half = window_sec // 2
+    first_w = int(round(sum(seg_w[:half]) / half)) if half > 0 else int(round(avg_w))
+    second_w = int(round(sum(seg_w[half:]) / max(1, window_sec - half)))
+    drift_w = second_w - first_w
+
+    avg_hr = None
+    max_hr = None
+    if len(hr) == n:
+        hr_seg = [float(x) for x in hr[best_start:end_s] if x and float(x) > 30.0]
+        if hr_seg:
+            avg_hr = int(round(sum(hr_seg) / len(hr_seg)))
+            max_hr = int(round(max(hr_seg)))
+
+    return {
+        "avg_w": int(round(avg_w)),
+        "start_s": best_start,
+        "kj_before": kj_before,
+        "lead_in_w": lead_in_w,
+        "vi": vi,
+        "first_half_w": first_w,
+        "second_half_w": second_w,
+        "drift_w": drift_w,
+        "avg_hr": avg_hr,
+        "max_hr": max_hr,
+    }
+
+
+def enrich_running_peak(
+    vel: list[float],
+    hr: list[float],
+    dist_m: float,
+) -> dict[str, Any] | None:
+    """Locate the fastest `dist_m` running effort and enrich it with prior distance, lead-in pace, split, and HR."""
+    n = len(vel)
+    if n < 30 or dist_m <= 0:
+        return None
+    clean_v = [max(0.0, float(x or 0.0)) for x in vel]
+    pref_d = [0.0] * (n + 1)
+    for i, v in enumerate(clean_v):
+        pref_d[i + 1] = pref_d[i] + v
+    if pref_d[-1] < dist_m:
+        return None
+
+    best_sec = None
+    best_i = 0
+    best_j = 0
+    j = 0
+    for i in range(n):
+        while j < n and (pref_d[j] - pref_d[i]) < dist_m:
+            j += 1
+        if (pref_d[j] - pref_d[i]) >= dist_m:
+            sec = j - i
+            if best_sec is None or sec < best_sec:
+                best_sec = sec
+                best_i = i
+                best_j = j
+    if not best_sec or best_sec <= 0:
+        return None
+
+    sec_per_km = round(best_sec / (dist_m / 1000.0), 1)
+    km_before = round(pref_d[best_i] / 1000.0, 2)
+
+    lead_in_pace = None
+    if best_i >= 60:
+        lead_start = max(0, best_i - 600)
+        lead_dist = pref_d[best_i] - pref_d[lead_start]
+        lead_sec = best_i - lead_start
+        if lead_dist >= 100.0 and lead_sec > 0:
+            lead_spk = lead_sec / (lead_dist / 1000.0)
+            if 120.0 <= lead_spk <= 900.0:
+                lead_in_pace = format_pace(lead_spk)
+
+    mid = best_i + (best_j - best_i) // 2
+    d1 = pref_d[mid] - pref_d[best_i]
+    t1 = mid - best_i
+    d2 = pref_d[best_j] - pref_d[mid]
+    t2 = best_j - mid
+    first_spk = (t1 / (d1 / 1000.0)) if d1 > 50 else sec_per_km
+    second_spk = (t2 / (d2 / 1000.0)) if d2 > 50 else sec_per_km
+    split_delta_s = round(second_spk - first_spk, 1)
+
+    avg_hr = None
+    max_hr = None
+    if len(hr) == n:
+        hr_seg = [float(x) for x in hr[best_i:best_j] if x and float(x) > 30.0]
+        if hr_seg:
+            avg_hr = int(round(sum(hr_seg) / len(hr_seg)))
+            max_hr = int(round(max(hr_seg)))
+
+    return {
+        "sec_per_km": sec_per_km,
+        "fmt": format_pace(sec_per_km),
+        "start_s": best_i,
+        "km_before": km_before,
+        "lead_in_pace": lead_in_pace,
+        "first_half_pace": format_pace(first_spk),
+        "second_half_pace": format_pace(second_spk),
+        "split_delta_s": split_delta_s,
+        "avg_hr": avg_hr,
+        "max_hr": max_hr,
+    }
+
+
 def compute_stream_metrics(
     streams: dict[str, Any],
     ftp_watts: int = 275,
@@ -1146,6 +1292,15 @@ def compute_stream_metrics(
         out["fat_burn_g"] = sub["fat_burn_g"]
         out["fueling_g_h"] = sub["fueling_g_h"]
 
+        # Enriched Rider DNA key peaks (0 LLM tokens, cached in activities.json)
+        e_peaks: dict[str, Any] = {}
+        for ep_lbl, ep_sec in (("3m", 180), ("5m", 300), ("20m", 1200)):
+            ep_data = enrich_cycling_peak(watts, hr if len(hr) == n else [], ep_sec)
+            if ep_data:
+                e_peaks[ep_lbl] = ep_data
+        if e_peaks:
+            out["enriched_peaks"] = e_peaks
+
     if hr:
         valid_hr = [x for x in hr if x > 30]
         if valid_hr:
@@ -1178,6 +1333,13 @@ def compute_stream_metrics(
                 best_paces[d_lbl] = {"sec_per_km": round(sec_per_km, 1), "fmt": format_pace(sec_per_km)}
         if best_paces:
             out["best_paces"] = best_paces
+        e_run_peaks: dict[str, Any] = {}
+        for rd_lbl, rd_m in (("1km", 1000.0), ("3km", 3000.0), ("5km", 5000.0)):
+            erp = enrich_running_peak(vel, hr if len(hr) == n_v else [], rd_m)
+            if erp:
+                e_run_peaks[rd_lbl] = erp
+        if e_run_peaks:
+            out["enriched_run_peaks"] = e_run_peaks
 
     return out
 
@@ -1766,6 +1928,7 @@ def aggregate_epoch_curves(
         for tier_k, _ in DURABILITY_TIERS
     }
     run_ep: dict[str, dict[str, tuple[float, str]]] = {d: {} for d, _ in RUN_SPLIT_DISTANCES}
+    quarterly: dict[str, dict[str, Any]] = {}
 
     for a in activities or []:
         if not isinstance(a, dict) or not a.get("date"):
@@ -1775,7 +1938,35 @@ def aggregate_epoch_curves(
         except ValueError:
             continue
         age = (ref_today - adate).days
-        if age < 0 or age > 365:
+        if age < 0:
+            continue
+
+        # Quarterly trajectory buckets (all available history, up to last 8 quarters kept in return)
+        q_key = f"{adate.year}-Q{(adate.month - 1) // 3 + 1}"
+        qb = quarterly.setdefault(q_key, {
+            "sessions": 0,
+            "hours": 0.0,
+            "cycling_5s": 0,
+            "cycling_5m": 0,
+            "cycling_20m": 0,
+            "run_1km_spk": None,
+            "run_5km_spk": None,
+        })
+        qb["sessions"] += 1
+        qb["hours"] = round(qb["hours"] + float(a.get("duration_min") or 0.0) / 60.0, 1)
+        if is_valid_cycling_power_activity(a):
+            pf_q = a.get("peaks_fresh") or {}
+            for k_src, k_dst in (("5s", "cycling_5s"), ("5m", "cycling_5m"), ("20m", "cycling_20m")):
+                v_q = pf_q.get(k_src)
+                if v_q and int(v_q) > qb[k_dst]:
+                    qb[k_dst] = int(v_q)
+        bp_q = a.get("best_paces") or {}
+        for d_src, d_dst in (("1km", "run_1km_spk"), ("5km", "run_5km_spk")):
+            spk_q, _ = _extract_pace_spk(bp_q.get(d_src))
+            if spk_q and spk_q > 0 and (qb[d_dst] is None or spk_q < qb[d_dst]):
+                qb[d_dst] = spk_q
+
+        if age > 365:
             continue
 
         if is_valid_cycling_power_activity(a):
@@ -1814,12 +2005,196 @@ def aggregate_epoch_curves(
                     if age <= ep_days and (cur_best is None or spk < cur_best[0]):
                         run_ep[d_lbl][ep_name] = (spk, fmt_s or format_pace(spk))
 
+    q_sorted = {
+        qk: {
+            "sessions": qv["sessions"],
+            "hours": qv["hours"],
+            "cycling": {
+                k: qv[src] for k, src in (("5s", "cycling_5s"), ("5m", "cycling_5m"), ("20m", "cycling_20m")) if qv[src]
+            },
+            "running": {
+                k: format_pace(qv[src]) for k, src in (("1km", "run_1km_spk"), ("5km", "run_5km_spk")) if qv[src]
+            },
+        }
+        for qk, qv in sorted(quarterly.items())[-8:]
+    }
+
     return {
         "fresh": fresh_ep,
         "fatigued_1500kj": fatig_ep,
         "durability_tiers": dur_ep,
         "run_splits": run_ep,
+        "quarterly": q_sorted,
     }
+
+
+def parse_dna_snapshot(dna_text: str) -> dict[str, Any]:
+    """Extract structured Athlete/Rider DNA summary & statcard JSON from `brain/coach/dna.md`."""
+    if not dna_text or not dna_text.strip():
+        return {}
+    out: dict[str, Any] = {}
+    fm_match = re.match(r"^---\s*\n(.*?)\n---", dna_text, re.S)
+    if fm_match:
+        fm = fm_match.group(1)
+        for key in ("updated", "archetype", "primary_limiter", "confidence"):
+            m = re.search(rf"(?im)^{key}\s*:\s*[\"']?(.+?)[\"']?\s*$", fm)
+            if m:
+                out[key] = m.group(1).strip()
+
+    json_blocks = re.findall(r"```json\s*\n(.*?)\n```", dna_text, re.S | re.I)
+    for blk in reversed(json_blocks):
+        try:
+            data = json.loads(blk)
+            if isinstance(data, dict) and ("archetype" in data or "scores" in data or "peak_shape" in data):
+                out["statcard"] = data
+                if data.get("archetype") and not out.get("archetype"):
+                    out["archetype"] = str(data["archetype"])
+                if data.get("primary_limiter") and not out.get("primary_limiter"):
+                    out["primary_limiter"] = str(data["primary_limiter"])
+                if data.get("confidence") and not out.get("confidence"):
+                    out["confidence"] = str(data["confidence"])
+                break
+        except (ValueError, TypeError):
+            continue
+    return out
+
+
+def _format_enriched_cycling_effort(act: dict[str, Any], dur_lbl: str, ep: dict[str, Any]) -> str:
+    """Format one enriched cycling peak effort into a dense scouting line."""
+    hr_s = f", HR {ep['avg_hr']}/{ep['max_hr']}" if ep.get("avg_hr") and ep.get("max_hr") else ""
+    lead_s = f", lead-in 10m@{ep['lead_in_w']}W" if ep.get("lead_in_w") is not None else ""
+    drift = ep.get("drift_w", 0)
+    split_s = f", split {ep.get('first_half_w')}->{ep.get('second_half_w')}W ({drift:+d}W)" if ep.get("first_half_w") else ""
+    return (
+        f"  - {act.get('date')} '{act.get('name', 'Ride')}' | {dur_lbl}: {ep.get('avg_w')}W "
+        f"(began {ep.get('start_s', 0)}s / {ep.get('kj_before', 0)}kJ in{lead_s}, VI {ep.get('vi', 1.0):.2f}{split_s}{hr_s})"
+    )
+
+
+def _format_enriched_running_effort(act: dict[str, Any], d_lbl: str, ep: dict[str, Any]) -> str:
+    """Format one enriched running peak effort into a dense scouting line."""
+    hr_s = f", HR {ep['avg_hr']}/{ep['max_hr']}" if ep.get("avg_hr") and ep.get("max_hr") else ""
+    lead_s = f", lead-in {ep['lead_in_pace']}" if ep.get("lead_in_pace") else ""
+    delta = ep.get("split_delta_s", 0.0)
+    split_s = f", split {ep.get('first_half_pace')}->{ep.get('second_half_pace')} ({delta:+.1f}s/km)" if ep.get("first_half_pace") else ""
+    return (
+        f"  - {act.get('date')} '{act.get('name', 'Run')}' | {d_lbl}: {ep.get('fmt')} "
+        f"(began {ep.get('km_before', 0):.1f}km in{lead_s}{split_s}{hr_s})"
+    )
+
+
+def build_dna_context_block(
+    activities: list[dict[str, Any]],
+    telemetry: dict[str, Any],
+    dna_snapshot_text: str = "",
+    today: dt.date | None = None,
+) -> str:
+    """Build the two-horizon Athlete/Rider DNA scouting package (All-Time + Quarterly + 10-Week Enriched Window)."""
+    ref_today = today or dt.date.today()
+    curves = telemetry.get("curves") or {}
+    fresh = curves.get("fresh") or {}
+    lines: list[str] = ["=== ATHLETE / RIDER DNA SCOUTING CONTEXT ==="]
+
+    # 1. Normalized Power Profile (20m := 1.00)
+    p20_90 = (fresh.get("20m") or {}).get("90d")
+    p20_365 = (fresh.get("20m") or {}).get("365d")
+    ref_20 = p20_90 or p20_365
+    if ref_20 and ref_20 > 0:
+        norm_parts = []
+        for dur in ("5s", "1m", "5m", "20m", "60m"):
+            v = (fresh.get(dur) or {}).get("90d") or (fresh.get(dur) or {}).get("365d")
+            if v:
+                norm_parts.append(f"{dur}={v}W ({v / ref_20:.2f}x)")
+        if norm_parts:
+            lines.append("Normalized Power Profile (20m := 1.00): " + " | ".join(norm_parts))
+
+    # 2. Quarterly Trajectory
+    q_data = curves.get("quarterly") or {}
+    if q_data:
+        lines.append("\nQuarterly Trajectory:")
+        for qk, qv in q_data.items():
+            cyc = qv.get("cycling") or {}
+            run = qv.get("running") or {}
+            c_str = " ".join(f"{k}:{v}W" for k, v in cyc.items())
+            r_str = " ".join(f"{k}:{v}" for k, v in run.items())
+            bits = [b for b in (f"Cyc[{c_str}]" if c_str else "", f"Run[{r_str}]" if r_str else "") if b]
+            lines.append(f"  - {qk}: {qv.get('sessions', 0)} sessions, {qv.get('hours', 0)}h" + (f" | {' | '.join(bits)}" if bits else ""))
+
+    # 3. All-Time Defining Efforts (Enriched)
+    valid_acts = [a for a in (activities or []) if isinstance(a, dict) and a.get("date")]
+    cyc_enriched: list[tuple[int, dict[str, Any], str, dict[str, Any]]] = []
+    run_enriched: list[tuple[float, dict[str, Any], str, dict[str, Any]]] = []
+    for a in valid_acts:
+        if is_valid_cycling_power_activity(a):
+            ep_map = a.get("enriched_peaks") or {}
+            for dur_lbl in ("20m", "5m", "3m"):
+                ep = ep_map.get(dur_lbl)
+                if isinstance(ep, dict) and ep.get("avg_w"):
+                    cyc_enriched.append((int(ep["avg_w"]), a, dur_lbl, ep))
+        erp_map = a.get("enriched_run_peaks") or {}
+        for d_lbl in ("5km", "3km", "1km"):
+            erp = erp_map.get(d_lbl)
+            if isinstance(erp, dict) and erp.get("sec_per_km"):
+                run_enriched.append((float(erp["sec_per_km"]), a, d_lbl, erp))
+
+    if cyc_enriched:
+        lines.append("\nAll-Time Defining Cycling Efforts (Enriched):")
+        for dur_lbl in ("20m", "5m", "3m"):
+            sub = sorted([x for x in cyc_enriched if x[2] == dur_lbl], key=lambda x: x[0], reverse=True)
+            fresh_top = [x for x in sub if x[3].get("kj_before", 0) < 1000][:2]
+            fatig_top = [x for x in sub if x[3].get("kj_before", 0) >= 1000][:2]
+            for _w, act, dl, ep in fresh_top + fatig_top:
+                lines.append(_format_enriched_cycling_effort(act, dl, ep))
+
+    if run_enriched:
+        lines.append("\nAll-Time Defining Running Efforts (Enriched):")
+        for d_lbl in ("5km", "3km", "1km"):
+            sub = sorted([x for x in run_enriched if x[2] == d_lbl], key=lambda x: x[0])[:2]
+            for _spk, act, dl, ep in sub:
+                lines.append(_format_enriched_running_effort(act, dl, ep))
+
+    # 4. 10-Week Detailed Window (70 days)
+    cutoff_70d = (ref_today - dt.timedelta(days=70)).isoformat()
+    recent_70d = sorted(
+        [a for a in valid_acts if str(a.get("date", ""))[:10] >= cutoff_70d],
+        key=lambda x: (str(x.get("date", "")), str(x.get("id", ""))),
+        reverse=True,
+    )
+    lines.append(f"\nRecent 10-Week Training Window ({len(recent_70d)} sessions since {cutoff_70d}):")
+    for a in recent_70d[:25]:
+        bits = [f"{a.get('date')} [{a.get('sport', '?')}] '{a.get('name', 'Session')}' {a.get('duration_min', 0)}m"]
+        if a.get("systemic_tss"):
+            bits.append(f"TSS {a['systemic_tss']}")
+        if is_valid_cycling_power_activity(a):
+            if a.get("np_w"):
+                bits.append(f"NP {a['np_w']}W")
+            if a.get("work_kj"):
+                bits.append(f"{a['work_kj']}kJ")
+            if a.get("steady_decoupling_pct") is not None:
+                bits.append(f"Pw:Hr {a['steady_decoupling_pct']:+.1f}%")
+            ep20 = (a.get("enriched_peaks") or {}).get("20m")
+            ep5 = (a.get("enriched_peaks") or {}).get("5m")
+            if ep20:
+                bits.append(f"20m:{ep20['avg_w']}W@{ep20.get('kj_before', 0)}kJ")
+            elif ep5:
+                bits.append(f"5m:{ep5['avg_w']}W@{ep5.get('kj_before', 0)}kJ")
+        elif a.get("best_paces"):
+            bp5 = (a.get("best_paces") or {}).get("5km", {}).get("fmt")
+            bp1 = (a.get("best_paces") or {}).get("1km", {}).get("fmt")
+            if bp5:
+                bits.append(f"5k:{bp5}")
+            elif bp1:
+                bits.append(f"1k:{bp1}")
+        fb = a.get("feedback")
+        if fb and fb != "pending":
+            bits.append(f"fb='{str(fb)[:60]}'")
+        lines.append("  - " + " | ".join(bits))
+
+    if dna_snapshot_text and dna_snapshot_text.strip():
+        lines.append("\nPrevious DNA Snapshot (brain/coach/dna.md):")
+        lines.append(dna_snapshot_text.strip()[:1500])
+
+    return "\n".join(lines)
 
 
 def build_coach_telemetry(
@@ -1833,6 +2208,7 @@ def build_coach_telemetry(
     fallback_ftp: int | None = None,
     fallback_weight: float | None = None,
     today: dt.date | None = None,
+    dna_text: str = "",
 ) -> dict[str, Any]:
     """Build unified Simple/Standard/Pro telemetry snapshot in < 2 ms (0 LLM tokens)."""
     ref_today = today or dt.date.today()
@@ -1925,6 +2301,7 @@ def build_coach_telemetry(
         "durability_5m_90d": dur_summary,
         "last_activity": last_act,
         "curves": curves,
+        "dna_snapshot": parse_dna_snapshot(dna_text),
     }
 
 
@@ -2003,6 +2380,17 @@ def format_pro_telemetry_block(telemetry: dict[str, Any]) -> str:
         met_parts.append(f"5m Durability [{d_str}]")
     if met_parts:
         lines.append("Metabolic & Durability: " + " | ".join(met_parts))
+
+    dna = telemetry.get("dna_snapshot") or {}
+    if dna.get("archetype") or dna.get("primary_limiter"):
+        sc = dna.get("statcard") or {}
+        scores = sc.get("scores") or {}
+        score_bits = [f"{k}={scores[k]}" for k in ("peak_shape", "freshness", "durability", "trajectory") if k in scores]
+        lines.append(
+            f"DNA Snapshot ({dna.get('updated') or 'saved'}): Archetype={dna.get('archetype', '?')} | "
+            f"Limiter={dna.get('primary_limiter', '?')}"
+            + (f" | Scores({', '.join(score_bits)})" if score_bits else "")
+        )
 
     # Last Activity telemetry
     la = telemetry.get("last_activity")

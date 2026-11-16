@@ -204,12 +204,260 @@ def find_checkbox_lines(lines):
             yield idx, m_cb.group(2), m_cb.group(3)
 
 
-def toggle_todo_in_brain(brain, rel, line_no=None, what="", target_done=None):
-    """Safely toggle `- [ ]` <-> `- [x]` on a task/workout line inside `<BRAIN>/<rel>`.
+def _atomic_write_text(target_real, content):
+    tmp_path = f"{target_real}.{os.getpid()}.tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(content)
+        os.replace(tmp_path, target_real)
+        return None
+    except OSError as exc:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        return f"cannot write file: {exc}"
 
-    Enforces strict path confinement, ignores YAML frontmatter and fenced code blocks,
-    verifies `line_no` / `what`, and writes atomically with LF line endings.
+
+def parse_target_date(spec, today=None):
+    """Parse `YYYY-MM-DD`, `+Nd`, `+Nw`, or natural aliases (`today`/`heute`, `tomorrow`/`morgen`) into `YYYY-MM-DD`."""
+    today = today or dt.date.today()
+    raw = str(spec or "").strip().lower()
+    if not raw:
+        raise ValueError("missing target date (expected YYYY-MM-DD or +Nd)")
+    if raw in ("today", "heute", "0d", "+0d"):
+        return today.isoformat()
+    if raw in ("tomorrow", "morgen"):
+        return (today + dt.timedelta(days=1)).isoformat()
+    if raw in ("übermorgen", "uebermorgen", "day-after-tomorrow"):
+        return (today + dt.timedelta(days=2)).isoformat()
+    m_rel = re.match(r"^\+?(\d+)\s*([dwm]?)$", raw)
+    if m_rel:
+        n = int(m_rel.group(1))
+        unit = m_rel.group(2) or "d"
+        days = n * (7 if unit == "w" else (30 if unit == "m" else 1))
+        return (today + dt.timedelta(days=days)).isoformat()
+    try:
+        return dt.date.fromisoformat(raw[:10]).isoformat()
+    except ValueError as exc:
+        raise ValueError(f"invalid target date '{spec}' (expected YYYY-MM-DD, +Nd, +Nw, today, tomorrow)") from exc
+
+
+def _find_frontmatter_due_lines(lines):
+    """Yield `(idx_0based, indent_dash_prefix, inner_value)` for `- ...` items under `due:` in YAML frontmatter."""
+    if not lines or lines[0].strip() != "---":
+        return
+    in_due = False
+    for idx in range(1, len(lines)):
+        line = lines[idx]
+        stripped = line.strip()
+        if stripped in ("---", "..."):
+            break
+        if not stripped or stripped.startswith("#"):
+            continue
+        m_key = re.match(r"^([A-Za-z_][\w-]*)\s*:\s*(.*)$", line)
+        if m_key and not line.startswith((" ", "\t", "-")):
+            in_due = m_key.group(1).lower() == "due"
+            continue
+        if in_due:
+            m_item = re.match(r"^(\s*-\s+)(.+?)\s*$", line)
+            if m_item:
+                val = m_item.group(2).strip().strip("\"'")
+                yield idx, m_item.group(1), val
+
+
+def _match_line_index(candidates, line_no=None, want_norm=""):
+    """Pick the best 0-based line index from `[(idx, norm_text), ...]` using `line_no` and/or `want_norm`."""
+    by_idx = dict(candidates)
+    chosen_idx = None
+    if line_no is not None and int(line_no) > 0:
+        ln_idx = int(line_no) - 1
+        if ln_idx in by_idx:
+            rest_norm = by_idx[ln_idx]
+            if not want_norm or want_norm in rest_norm or rest_norm in want_norm:
+                chosen_idx = ln_idx
+    if chosen_idx is None and want_norm:
+        exact_hits = [idx for idx, r_norm in candidates if r_norm == want_norm]
+        if len(exact_hits) == 1:
+            chosen_idx = exact_hits[0]
+        elif len(exact_hits) > 1 and line_no is not None and int(line_no) > 0:
+            target_0 = int(line_no) - 1
+            chosen_idx = min(exact_hits, key=lambda i: abs(i - target_0))
+        else:
+            sub_hits = [idx for idx, r_norm in candidates if want_norm in r_norm or r_norm in want_norm]
+            if len(sub_hits) == 1:
+                chosen_idx = sub_hits[0]
+            elif len(sub_hits) > 1 and line_no is not None and int(line_no) > 0:
+                target_0 = int(line_no) - 1
+                chosen_idx = min(sub_hits, key=lambda i: abs(i - target_0))
+    return chosen_idx
+
+
+def _insert_into_timeline_lines(lines, entry_line, target_date_iso):
+    """Insert `entry_line` chronologically under `## Timeline` in `calendar/README.md` lines."""
+    tl_idx = None
+    next_sec_idx = len(lines)
+    for i, ln in enumerate(lines):
+        if ln.startswith("## ") and "timeline" in ln.lower():
+            tl_idx = i
+            for j in range(i + 1, len(lines)):
+                if lines[j].startswith("## "):
+                    next_sec_idx = j
+                    break
+            break
+    if tl_idx is None:
+        if lines and lines[-1].strip() != "":
+            lines.append("")
+        lines.extend(["## Timeline", "", entry_line])
+        return len(lines)
+
+    insert_at = next_sec_idx
+    last_item_idx = None
+    for k in range(tl_idx + 1, next_sec_idx):
+        m_d = re.match(r"^\s*-\s*(?:\[[ xX-]\]\s*)?(\d{4}-\d{2}-\d{2})\b", lines[k])
+        if m_d:
+            last_item_idx = k
+            if m_d.group(1) > target_date_iso:
+                insert_at = k
+                break
+    else:
+        if last_item_idx is not None:
+            insert_at = last_item_idx + 1
+        else:
+            insert_at = next_sec_idx
+            while insert_at > tl_idx + 1 and not lines[insert_at - 1].strip():
+                insert_at -= 1
+    lines.insert(insert_at, entry_line)
+    return insert_at + 1
+
+
+def _ensure_calendar_readme_lines(brain):
+    """Load `brain/calendar/README.md` lines, creating a standard skeleton if missing."""
+    cal_dir = os.path.join(brain, "calendar")
+    os.makedirs(cal_dir, exist_ok=True)
+    cal_path = os.path.join(cal_dir, "README.md")
+    if os.path.isfile(cal_path):
+        with open(cal_path, encoding="utf-8", errors="replace") as fh:
+            raw = fh.read()
+        return cal_path, raw.splitlines(), raw.endswith("\n")
+    default_lines = [
+        "---",
+        "summary: Central calendar and to-do hub: timeline and open to-dos",
+        "tags: [atlas, calendar]",
+        "---",
+        "# Calendar & To-Dos",
+        "",
+        "## Timeline",
+        "",
+        "## Open To-Dos",
+        "",
+    ]
+    return cal_path, default_lines, True
+
+
+def toggle_todo_in_brain(brain, rel, line_no=None, what="", target_done=None, target_status=None):
+    """Safely toggle or set `- [ ]` / `- [x]` / `- [-]` on a task/workout or `due:` frontmatter line in `<BRAIN>/<rel>`.
+
+    Enforces strict path confinement, ignores fenced code blocks, verifies `line_no` / `what`,
+    and writes atomically with LF line endings.
     """
+    validated, err = _validate_brain_rel_path(brain, rel)
+    if err:
+        return {"ok": False, "error": err, "code": 400}
+    norm_rel, target_real = validated
+    if line_no is not None:
+        try:
+            int(line_no)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "invalid line number", "code": 400}
+    try:
+        with open(target_real, encoding="utf-8", errors="replace") as fh:
+            raw_content = fh.read()
+    except OSError as exc:
+        return {"ok": False, "error": f"cannot read file: {exc}", "code": 500}
+
+    had_trailing_nl = raw_content.endswith("\n")
+    lines = raw_content.splitlines()
+    want_norm = _norm_todo_compare(what) if what else ""
+
+    checkboxes = list(find_checkbox_lines(lines))
+    cb_candidates = [(idx, _norm_todo_compare(rest)) for idx, _b, rest in checkboxes]
+    chosen_idx = None if (line_no is not None and int(line_no) == 0) else _match_line_index(cb_candidates, line_no=line_no, want_norm=want_norm)
+
+    if chosen_idx is not None:
+        orig_line = lines[chosen_idx]
+        m_cb = _CHECKBOX_LINE_RX.match(orig_line)
+        if not m_cb:
+            return {"ok": False, "error": "target line is not a Markdown checkbox", "code": 400}
+        prefix, cur_box, suffix = m_cb.group(1), m_cb.group(2), m_cb.group(3)
+        if target_status in ("done", "skipped", "open"):
+            eff_status = target_status
+        elif target_done is None:
+            eff_status = "open" if cur_box.lower() == "x" else "done"
+        else:
+            eff_status = "done" if bool(target_done) else "open"
+        new_box = {"done": "x", "skipped": "-", "open": " "}[eff_status]
+        lines[chosen_idx] = f"{prefix}[{new_box}]{suffix}"
+        new_content = "\n".join(lines) + ("\n" if had_trailing_nl or raw_content else "")
+        w_err = _atomic_write_text(target_real, new_content)
+        if w_err:
+            return {"ok": False, "error": w_err, "code": 500}
+        return {
+            "ok": True,
+            "rel": norm_rel,
+            "line": chosen_idx + 1,
+            "done": eff_status == "done",
+            "status": eff_status,
+        }
+
+    # Fallback for `due:` frontmatter items (`line_no` is None or 0)
+    if line_no in (None, 0):
+        fm_items = list(_find_frontmatter_due_lines(lines))
+        fm_candidates = [(idx, _norm_todo_compare(re.sub(r"^\[[ xX-]\]\s*", "", val))) for idx, _p, val in fm_items]
+        fm_idx = _match_line_index(fm_candidates, line_no=None, want_norm=want_norm)
+        if fm_idx is not None:
+            fm_by_idx = {idx: (pref, val) for idx, pref, val in fm_items}
+            pref, val = fm_by_idx[fm_idx]
+            m_box = re.match(r"^\[([ xX-])\]\s*(.+)$", val)
+            cur_b = m_box.group(1).lower() if m_box else " "
+            clean_val = m_box.group(2).strip() if m_box else val
+            if target_status in ("done", "skipped", "open"):
+                eff_status = target_status
+            elif target_done is None:
+                eff_status = "open" if cur_b == "x" else "done"
+            else:
+                eff_status = "done" if bool(target_done) else "open"
+            if eff_status == "open":
+                lines[fm_idx] = f"{pref}{clean_val}"
+            else:
+                box_ch = "x" if eff_status == "done" else "-"
+                safe_val = clean_val.replace('"', "'")
+                lines[fm_idx] = f'{pref}"[{box_ch}] {safe_val}"'
+            new_content = "\n".join(lines) + ("\n" if had_trailing_nl or raw_content else "")
+            w_err = _atomic_write_text(target_real, new_content)
+            if w_err:
+                return {"ok": False, "error": w_err, "code": 500}
+            return {
+                "ok": True,
+                "rel": norm_rel,
+                "line": fm_idx + 1,
+                "done": eff_status == "done",
+                "status": eff_status,
+            }
+
+    if not checkboxes:
+        return {"ok": False, "error": f"no toggleable checkbox found in {norm_rel}", "code": 404}
+    return {"ok": False, "error": "matching checkbox line not found", "code": 404}
+
+
+def reschedule_task_in_brain(brain, rel, target_date_spec, line_no=None, what="", today=None):
+    """Move/reschedule a dated `[todo]`/`due:` item or promote an undated `Open To-Do` onto `target_date_spec`."""
+    try:
+        target_iso = parse_target_date(target_date_spec, today=today)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc), "code": 400}
+
     validated, err = _validate_brain_rel_path(brain, rel)
     if err:
         return {"ok": False, "error": err, "code": 400}
@@ -222,81 +470,149 @@ def toggle_todo_in_brain(brain, rel, line_no=None, what="", target_done=None):
 
     had_trailing_nl = raw_content.endswith("\n")
     lines = raw_content.splitlines()
-    checkboxes = list(find_checkbox_lines(lines))
-    if not checkboxes:
-        return {"ok": False, "error": f"no toggleable checkbox found in {norm_rel}", "code": 404}
-
-    cb_by_idx = {idx: (box, rest) for idx, box, rest in checkboxes}
     want_norm = _norm_todo_compare(what) if what else ""
-    chosen_idx = None
 
-    if line_no is not None:
-        try:
-            ln_idx = int(line_no) - 1
-        except (TypeError, ValueError):
-            return {"ok": False, "error": "invalid line number", "code": 400}
-        if ln_idx in cb_by_idx:
-            _box, rest = cb_by_idx[ln_idx]
-            rest_norm = _norm_todo_compare(rest)
-            if not want_norm or want_norm in rest_norm or rest_norm in want_norm:
-                chosen_idx = ln_idx
+    checkboxes = list(find_checkbox_lines(lines))
+    cb_candidates = [(idx, _norm_todo_compare(rest)) for idx, _b, rest in checkboxes]
+    chosen_idx = None if (line_no is not None and int(line_no) == 0) else _match_line_index(cb_candidates, line_no=line_no, want_norm=want_norm)
 
-    if chosen_idx is None and want_norm:
-        exact_hits = [idx for idx, _b, rest in checkboxes if _norm_todo_compare(rest) == want_norm]
-        if len(exact_hits) == 1:
-            chosen_idx = exact_hits[0]
-        elif len(exact_hits) > 1 and line_no is not None:
-            target_0 = int(line_no) - 1
-            chosen_idx = min(exact_hits, key=lambda i: abs(i - target_0))
+    if chosen_idx is not None:
+        m_cb = _CHECKBOX_LINE_RX.match(lines[chosen_idx])
+        prefix, rest = m_cb.group(1), m_cb.group(3).strip()
+        m_dated = re.match(r"^(\d{4}-\d{2}-\d{2})(?:\.\.(\d{4}-\d{2}-\d{2}))?\s+(.*)$", rest)
+        if m_dated:
+            old_s = dt.date.fromisoformat(m_dated.group(1))
+            new_s = dt.date.fromisoformat(target_iso)
+            tail = m_dated.group(3).strip()
+            if m_dated.group(2):
+                old_e = dt.date.fromisoformat(m_dated.group(2))
+                new_e = (new_s + (old_e - old_s)).isoformat()
+                date_tok = f"{target_iso}..{new_e}"
+            else:
+                date_tok = target_iso
+            new_line = f"{prefix}[ ] {date_tok} {tail}"
+            if norm_rel == "calendar/README.md":
+                lines.pop(chosen_idx)
+                new_ln = _insert_into_timeline_lines(lines, new_line, target_iso)
+            else:
+                lines[chosen_idx] = new_line
+                new_ln = chosen_idx + 1
+            new_content = "\n".join(lines) + ("\n" if had_trailing_nl or raw_content else "")
+            w_err = _atomic_write_text(target_real, new_content)
+            if w_err:
+                return {"ok": False, "error": w_err, "code": 500}
+            return {"ok": True, "rel": norm_rel, "line": new_ln, "date": target_iso, "promoted": False}
+
+        # Undated checkbox -> strip `[high|med|low]` and schedule onto `target_iso`
+        clean_task = re.sub(r"^\[(?:high|med|low)\]\s*", "", rest, flags=re.I).strip()
+        if not re.match(r"^\[[a-zA-Z]+(?::[a-zA-Z0-9_-]+)?\]\s+", clean_task):
+            dated_tail = f"[todo] {clean_task}"
         else:
-            sub_hits = [
-                idx for idx, _b, rest in checkboxes
-                if want_norm in _norm_todo_compare(rest) or _norm_todo_compare(rest) in want_norm
-            ]
-            if len(sub_hits) == 1:
-                chosen_idx = sub_hits[0]
-            elif len(sub_hits) > 1 and line_no is not None:
-                target_0 = int(line_no) - 1
-                chosen_idx = min(sub_hits, key=lambda i: abs(i - target_0))
+            dated_tail = clean_task
 
-    if chosen_idx is None:
-        return {"ok": False, "error": "matching checkbox line not found", "code": 404}
+        if norm_rel == "calendar/README.md":
+            lines.pop(chosen_idx)
+            entry_line = f"- [ ] {target_iso} {dated_tail}"
+            new_ln = _insert_into_timeline_lines(lines, entry_line, target_iso)
+            new_content = "\n".join(lines) + ("\n" if had_trailing_nl or raw_content else "")
+            w_err = _atomic_write_text(target_real, new_content)
+            if w_err:
+                return {"ok": False, "error": w_err, "code": 500}
+            return {"ok": True, "rel": norm_rel, "line": new_ln, "date": target_iso, "promoted": True}
 
-    orig_line = lines[chosen_idx]
-    m_cb = _CHECKBOX_LINE_RX.match(orig_line)
-    if not m_cb:
-        return {"ok": False, "error": "target line is not a Markdown checkbox", "code": 400}
+        # Undated checkbox in another brain page -> date it in-place AND add to `calendar/README.md` Timeline
+        lines[chosen_idx] = f"{prefix}[ ] {target_iso} {dated_tail}"
+        new_content = "\n".join(lines) + ("\n" if had_trailing_nl or raw_content else "")
+        w_err = _atomic_write_text(target_real, new_content)
+        if w_err:
+            return {"ok": False, "error": w_err, "code": 500}
+        cal_path, cal_lines, cal_nl = _ensure_calendar_readme_lines(brain)
+        ref_suffix = "" if norm_rel in dated_tail else f" ({norm_rel})"
+        cal_entry = f"- [ ] {target_iso} {dated_tail}{ref_suffix}"
+        if not any(_norm_todo_compare(clean_task) in _norm_todo_compare(ln) and target_iso in ln for ln in cal_lines):
+            cal_ln = _insert_into_timeline_lines(cal_lines, cal_entry, target_iso)
+            _atomic_write_text(cal_path, "\n".join(cal_lines) + ("\n" if cal_nl else "\n"))
+        else:
+            cal_ln = chosen_idx + 1
+        return {"ok": True, "rel": "calendar/README.md", "line": cal_ln, "source_rel": norm_rel, "date": target_iso, "promoted": True}
 
-    prefix, cur_box, suffix = m_cb.group(1), m_cb.group(2), m_cb.group(3)
-    cur_done = cur_box.lower() == "x"
-    if target_done is None:
-        new_done = not cur_done
-    else:
-        new_done = bool(target_done)
-    new_box = "x" if new_done else " "
-    lines[chosen_idx] = f"{prefix}[{new_box}]{suffix}"
+    # Frontmatter `due:` fallback
+    if line_no in (None, 0):
+        fm_items = list(_find_frontmatter_due_lines(lines))
+        fm_candidates = [(idx, _norm_todo_compare(re.sub(r"^\[[ xX-]\]\s*", "", val))) for idx, _p, val in fm_items]
+        fm_idx = _match_line_index(fm_candidates, line_no=None, want_norm=want_norm)
+        if fm_idx is not None:
+            fm_by_idx = {idx: (pref, val) for idx, pref, val in fm_items}
+            pref, val = fm_by_idx[fm_idx]
+            unboxed = re.sub(r"^\[[ xX-]\]\s*", "", val).strip()
+            m_d = re.match(r"^(\d{4}-\d{2}-\d{2})(?:\.\.(\d{4}-\d{2}-\d{2}))?\s+(.*)$", unboxed)
+            if not m_d:
+                return {"ok": False, "error": f"frontmatter due entry has no movable YYYY-MM-DD date: {val}", "code": 400}
+            old_s = dt.date.fromisoformat(m_d.group(1))
+            new_s = dt.date.fromisoformat(target_iso)
+            if m_d.group(2):
+                old_e = dt.date.fromisoformat(m_d.group(2))
+                date_tok = f"{target_iso}..{(new_s + (old_e - old_s)).isoformat()}"
+            else:
+                date_tok = target_iso
+            lines[fm_idx] = f"{pref}{date_tok} {m_d.group(3).strip()}"
+            new_content = "\n".join(lines) + ("\n" if had_trailing_nl or raw_content else "")
+            w_err = _atomic_write_text(target_real, new_content)
+            if w_err:
+                return {"ok": False, "error": w_err, "code": 500}
+            return {"ok": True, "rel": norm_rel, "line": fm_idx + 1, "date": target_iso, "promoted": False}
 
-    new_content = "\n".join(lines) + ("\n" if had_trailing_nl or raw_content else "")
-    tmp_path = f"{target_real}.{os.getpid()}.tmp"
-    try:
-        with open(tmp_path, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write(new_content)
-        os.replace(tmp_path, target_real)
-    except OSError as exc:
+    return {"ok": False, "error": "matching task not found", "code": 404}
+
+
+def add_todo_in_brain(brain, text, target_date_spec=None, prio="med", kind="todo", today=None):
+    """Add a dated `[todo]` under `## Timeline` or an undated `[prio]` task under `## Open To-Dos` in `calendar/README.md`."""
+    clean = str(text or "").strip()
+    if len(clean) < 2:
+        return {"ok": False, "error": "task text is empty", "code": 400}
+    cal_path, lines, had_nl = _ensure_calendar_readme_lines(brain)
+    if target_date_spec:
         try:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except OSError:
-            pass
-        return {"ok": False, "error": f"cannot write file: {exc}", "code": 500}
+            target_iso = parse_target_date(target_date_spec, today=today)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc), "code": 400}
+        entry = f"- [ ] {target_iso} [{kind}] {clean}"
+        ln = _insert_into_timeline_lines(lines, entry, target_iso)
+        w_err = _atomic_write_text(cal_path, "\n".join(lines) + ("\n" if had_nl else "\n"))
+        if w_err:
+            return {"ok": False, "error": w_err, "code": 500}
+        return {"ok": True, "rel": "calendar/README.md", "line": ln, "date": target_iso, "entry": entry}
 
-    return {
-        "ok": True,
-        "rel": norm_rel,
-        "line": chosen_idx + 1,
-        "done": new_done,
-        "status": "done" if new_done else "open",
-    }
+    eff_prio = prio.lower() if str(prio or "").lower() in ("high", "med", "low") else "med"
+    entry = f"- [ ] [{eff_prio}] {clean}"
+    todo_sec = None
+    insert_at = len(lines)
+    for i, line in enumerate(lines):
+        if line.startswith("## ") and any(w in line.lower() for w in ("to-do", "todo", "aufgaben", "backlog")):
+            todo_sec = i
+            insert_at = len(lines)
+            for j in range(i + 1, len(lines)):
+                if lines[j].startswith("## "):
+                    insert_at = j
+                    break
+            break
+    if todo_sec is None:
+        if lines and lines[-1].strip() != "":
+            lines.append("")
+        lines.extend(["## Open To-Dos", "", entry])
+        ln = len(lines)
+    else:
+        while insert_at > todo_sec + 1 and not lines[insert_at - 1].strip():
+            insert_at -= 1
+        if insert_at == todo_sec + 1:
+            lines.insert(insert_at, "")
+            insert_at += 1
+        lines.insert(insert_at, entry)
+        ln = insert_at + 1
+    w_err = _atomic_write_text(cal_path, "\n".join(lines) + ("\n" if had_nl else "\n"))
+    if w_err:
+        return {"ok": False, "error": w_err, "code": 500}
+    return {"ok": True, "rel": "calendar/README.md", "line": ln, "prio": eff_prio, "entry": entry}
 
 
 def build_brain_graph_payload(brain, idx=None, db_path=None, today=None):

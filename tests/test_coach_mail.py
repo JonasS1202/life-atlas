@@ -414,6 +414,110 @@ class CoachMailUnit(unittest.TestCase):
         self.assertNotIn("Storer", pro_blk)
         self.assertNotIn("Touran", pro_blk)
 
+    def test_rider_dna_enriched_peaks_quarterly_and_mode_detection(self):
+        # 1. Cycling enrich_peak: 10m lead-in @ 200W (=120 kJ), then 5m negative split (310W -> 330W)
+        watts = [200.0] * 600 + [310.0] * 150 + [330.0] * 150
+        hr = [140.0] * 600 + [168.0] * 150 + [178.0] * 150
+        c_metrics = ce.compute_stream_metrics(
+            {"watts": watts, "heartrate": hr},
+            ftp_watts=280,
+            weight_kg=70.0,
+            sport="cycling",
+            device_watts=True,
+        )
+        ep = c_metrics.get("enriched_peaks") or {}
+        self.assertIn("5m", ep)
+        self.assertIn("3m", ep)
+        self.assertNotIn("20m", ep)
+        p5 = ep["5m"]
+        self.assertEqual(p5["avg_w"], 320)
+        self.assertEqual(p5["start_s"], 600)
+        self.assertEqual(p5["kj_before"], 120)
+        self.assertEqual(p5["lead_in_w"], 200)
+        self.assertGreater(p5["drift_w"], 0)
+        self.assertEqual(p5["avg_hr"], 173)
+        self.assertEqual(p5["max_hr"], 178)
+
+        # 2. Running enrich_peak: 10m @ 3.0 m/s (1.8 km), then 1km fast split (4.0 m/s -> 4.5 m/s)
+        vel = [3.0] * 600 + [4.0] * 125 + [4.5] * 112
+        r_hr = [142.0] * 600 + [170.0] * 125 + [182.0] * 112
+        r_metrics = ce.compute_stream_metrics(
+            {"velocity_smooth": vel, "heartrate": r_hr},
+            sport="running",
+        )
+        erp = r_metrics.get("enriched_run_peaks") or {}
+        self.assertIn("1km", erp)
+        r1k = erp["1km"]
+        self.assertGreater(r1k["km_before"], 1.7)
+        self.assertIsNotNone(r1k["lead_in_pace"])
+        self.assertLess(r1k["split_delta_s"], 0)  # faster 2nd half = negative split
+        self.assertGreater(r1k["max_hr"], 175)
+
+        # 3. Quarterly curves + DNA context + DNA snapshot parsing
+        today = dt.date(2026, 11, 14)
+        acts = [
+            {
+                "id": "1",
+                "date": "2025-05-10",
+                "sport": "cycling",
+                "device_watts": True,
+                "name": "Spring Climb",
+                "duration_min": 120,
+                "peaks_fresh": {"5s": 900, "5m": 340, "20m": 290},
+                "enriched_peaks": {"5m": p5},
+            },
+            {
+                "id": "2",
+                "date": "2026-11-01",
+                "sport": "cycling",
+                "device_watts": True,
+                "name": "Autumn TT",
+                "duration_min": 90,
+                "np_w": 270,
+                "work_kj": 1400,
+                "peaks_fresh": {"5s": 950, "5m": 360, "20m": 310},
+                "enriched_peaks": {"5m": p5},
+            },
+        ]
+        dna_md = (
+            "---\n"
+            "updated: 2026-11-10\n"
+            "archetype: Endurance Diesel\n"
+            "primary_limiter: VO2max Ceiling\n"
+            "confidence: medium\n"
+            "---\n"
+            "```json\n"
+            '{"archetype": "Endurance Diesel", "primary_limiter": "VO2max Ceiling", '
+            '"scores": {"peak_shape": 84, "freshness": 72, "durability": 88, "trajectory": 90}}\n'
+            "```\n"
+        )
+        tel = ce.build_coach_telemetry(
+            profile_text="depth: pro\nweight_kg: 70\n",
+            activities=acts,
+            today=today,
+            dna_text=dna_md,
+        )
+        q = tel["curves"]["quarterly"]
+        self.assertIn("2025-Q2", q)
+        self.assertIn("2026-Q4", q)
+        self.assertEqual(q["2025-Q2"]["cycling"]["20m"], 290)
+        self.assertEqual(tel["dna_snapshot"]["archetype"], "Endurance Diesel")
+        self.assertIn("DNA Snapshot (2026-11-10): Archetype=Endurance Diesel", ce.format_pro_telemetry_block(tel))
+
+        dna_ctx = ce.build_dna_context_block(acts, tel, dna_snapshot_text=dna_md, today=today)
+        self.assertIn("Quarterly Trajectory:", dna_ctx)
+        self.assertIn("All-Time Defining Cycling Efforts (Enriched):", dna_ctx)
+        self.assertIn("began 600s / 120kJ in", dna_ctx)
+
+        # 4. Hook mode detection for Rider DNA
+        hooks_dir = os.path.join(REPO, "core", "hooks")
+        if hooks_dir not in sys.path:
+            sys.path.insert(0, hooks_dir)
+        import atlas_hook
+        mode, why, _ = atlas_hook.detect_coach_mode("Analysiere meine Rider DNA und was ist mein Limiter?")
+        self.assertEqual(mode, "dna")
+        self.assertIn("DNA", why)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -3,13 +3,15 @@
 Registered by `atlas.py wire` (project scope: <ROOT>/.claude/settings.json, <ROOT>/.agents/hooks.json):
   python -I <ROOT>/brain/_atlas/hooks/atlas_hook.py <agent> <event>
     agent: claude | antigravity
-    event: session  (Claude SessionStart,      Antigravity SessionStart)
+    event: session  (Claude SessionStart,      Antigravity SessionStart warm-up)
            prompt   (Claude UserPromptSubmit,  Antigravity PreInvocation, first invocation of a turn only)
            stop     (Claude Stop,              Antigravity Stop)
 
-session: heartbeat `Atlas · ok`; pull the brain from its remote; once a day (settings) a briefing with deadlines,
-         inbox, due maintenance/update checks, things Antigravity's /learn wrote outside Atlas, one question; in other
-         chats only what is overdue or due today.
+session: heartbeat `Atlas · ok`; pull the brain from its remote; once a day (settings) a briefing with actionable task
+         check-in (done / reschedule / tackle now), upcoming calendar items, inbox, due maintenance/update checks,
+         things Antigravity's /learn wrote outside Atlas, one question; in other chats only what is overdue or due today.
+         In Antigravity, `SessionStart` warms up git/index/calendar server and `PreInvocation` (`invocationNum == 0`,
+         first turn of each conversation/day) injects `session_text` via `systemMessage` so briefings are never lost.
 prompt:  ROUTING first (project named by name, alias, folder, path, or the chat's folder; once per chat), learning
          signals ("remember", "from now on", corrections), then knowledge hints with their one-line summary.
          Prints nothing when nothing matches.
@@ -332,10 +334,8 @@ def emit_context(agent, event, text):
     if agent == "claude":
         name = "SessionStart" if event == "session" else "UserPromptSubmit"
         out = {"hookSpecificOutput": {"hookEventName": name, "additionalContext": text}}
-    elif event == "session":
-        out = {"injectSteps": [{"systemMessage": {"systemMessage": text}}]}
     else:
-        out = {"injectSteps": [{"ephemeralMessage": text}]}
+        out = {"injectSteps": [{"systemMessage": {"systemMessage": text}}]}
     sys.stdout.write(json.dumps(out))
 
 
@@ -1202,6 +1202,14 @@ def _extract_coach_context(idx, cal_items=None):
                 rdy_txt = fh.read(HEAD_BYTES)
         except OSError:
             pass
+    dna_txt = ""
+    dna_full = os.path.join(BRAIN, "coach", "dna.md")
+    if os.path.isfile(dna_full):
+        try:
+            with open(dna_full, encoding="utf-8", errors="replace") as fh:
+                dna_txt = fh.read(HEAD_BYTES)
+        except OSError:
+            pass
     try:
         tel = coach_engine.build_coach_telemetry(
             profile_text=prof_txt_full,
@@ -1210,6 +1218,7 @@ def _extract_coach_context(idx, cal_items=None):
             cal_items=cal_items,
             strava_connected=c_state["strava_connected"],
             fallback_ftp=ftp_watts,
+            dna_text=dna_txt,
         )
         tel_compact = {k: v for k, v in tel.items() if k != "curves"}
         raw_pc = c_state["power_curve"]
@@ -1275,6 +1284,68 @@ def deadlines(idx, days=30):
             prefix = f"({it['start'].isoformat()}..{it['end'].isoformat()}) {prefix}"
         out.append((when, it["delta"], (prefix + it["what"]).strip(), it["rel"]))
     return sorted(out)
+
+
+def actionable_tasks(idx=None, include_upcoming_days=0):
+    """Return priority-ordered actionable tasks (overdue & due-today `[todo]`/`[deadline]` + undated `open_todos`)."""
+    if idx is None:
+        idx = load_index(budget=INDEX_BUDGET_S)
+    out = []
+    dated = calendar_items(idx, days=max(0, int(include_upcoming_days or 0)), past_days=3650, include_done=False)
+    for it in dated:
+        if it["kind"] not in ("todo", "deadline"):
+            continue
+        delta = it["delta"]
+        if delta < 0:
+            prio, badge = "overdue", f"OVERDUE {-delta} d · {it['start'].isoformat()}"
+        elif delta == 0:
+            prio, badge = "today", f"DUE TODAY · {it['start'].isoformat()}"
+        else:
+            prio, badge = "scheduled", f"in {delta} d · {it['start'].isoformat()}"
+        what_clean = _clean_md_inline(it["what"])
+        out.append({
+            "source": "dated" if it.get("can_toggle") else "due_fm",
+            "kind": it["kind"],
+            "prio": prio,
+            "badge": badge,
+            "date": it["start"].isoformat(),
+            "delta": delta,
+            "what": what_clean,
+            "rel": it["rel"],
+            "line": int(it.get("line") or 0),
+            "can_toggle": bool(it.get("can_toggle", False)),
+        })
+
+    for td in open_todos(include_done=False):
+        w_clean = td["what"]
+        t_new = _cal_tokens(w_clean)
+        dup = False
+        for ex in out:
+            if ex["what"].lower() == w_clean.lower():
+                dup = True
+                break
+            t_ex = _cal_tokens(ex["what"])
+            if t_new and t_ex and len(t_new & t_ex) / max(min(len(t_new), len(t_ex)), 1) >= 0.6:
+                dup = True
+                break
+        if dup:
+            continue
+        out.append({
+            "source": "undated",
+            "kind": "todo",
+            "prio": td["prio"],
+            "badge": f"OPEN · {td['prio']}",
+            "date": "",
+            "delta": None,
+            "what": w_clean,
+            "rel": td["rel"],
+            "line": int(td.get("line") or 0),
+            "can_toggle": bool(td.get("can_toggle", False)),
+        })
+
+    for i, item in enumerate(out, 1):
+        item["num"] = i
+    return out
 
 
 CAL_TEMPLATE = cal_engine.load_calendar_template()
@@ -1482,7 +1553,31 @@ def foreign_items(root, user_home=None):
             and not (i["global"] and os.path.normcase(i["path"]) in snapshot)]
 
 
-def session_text(cwd, session):
+def session_warmup(cwd, session):
+    """Warm up git remote, SQLite index & loopback calendar server on Antigravity `SessionStart` without burning daily state."""
+    st = _state()
+    try:
+        msg = pull()
+    except Exception as exc:
+        _log_hook_error("warmup.pull", exc)
+        msg = ""
+    if msg:
+        prev = st.get("pending_pull_msg", "")
+        st["pending_pull_msg"] = (prev + "\n" + msg).strip() if prev and msg not in prev else (msg or prev)
+    idx = load_index(budget=INDEX_BUDGET_S)
+    try:
+        render_calendar_html(idx, start_server=True)
+    except Exception as exc:
+        _log_hook_error("warmup.render_calendar", exc)
+    if session:
+        _session(st, session)["warmed_at"] = _now_iso()
+    st["last_hook_run"] = _now_iso()
+    _save_state(st)
+    _sync_antigravity_router(st)
+    sys.stdout.write("{}")
+
+
+def session_text(cwd, session, skip_pull=False):
     s = settings()
     st = _state()
     lines = ["Atlas · ok"]
@@ -1492,16 +1587,25 @@ def session_text(cwd, session):
         lines.append(f"Hook warning (recent logged error in _atlas/cache/hook_errors.log): {err_sum}")
         if not PROBE:
             st["last_error_notified"] = err_iso
-    try:
-        msg = "" if PROBE else pull()
-    except Exception as exc:
-        _log_hook_error("session.pull", exc)
+    if PROBE:
         msg = ""
+    elif skip_pull:
+        msg = st.pop("pending_pull_msg", "")
+    else:
+        try:
+            msg = pull()
+        except Exception as exc:
+            _log_hook_error("session.pull", exc)
+            msg = ""
+        pend_msg = st.pop("pending_pull_msg", "")
+        if pend_msg and pend_msg not in msg:
+            msg = (pend_msg + "\n" + msg).strip()
     if msg:
         lines.append(msg)
     idx = load_index(budget=INDEX_BUDGET_S)
     today = dt.date.today().isoformat()
-    due = deadlines(idx, days=_int(s.get("deadline_days"), 30))
+    horizon_days = _int(s.get("deadline_days"), 30)
+    due = deadlines(idx, days=horizon_days)
     mode = s.get("briefing", "daily")
     last = st.get("last_briefing", "")
     brief = (mode == "daily" and last != today) or (mode == "weekly" and (not last or (
@@ -1509,16 +1613,37 @@ def session_text(cwd, session):
     if brief:
         st["last_briefing"] = today
         parts = []
-        if due:
-            items = []
-            for when, delta, what, rel in due[:8]:
-                tag = f"OVERDUE {-delta} d" if delta < 0 else ("today" if delta == 0 else f"in {delta} d")
-                items.append(f"- {when.isoformat()} ({tag}): {what or '(no note)'}  [{_show(rel, cwd)}]")
-            parts.append("Calendar & deadlines:\n" + "\n".join(items))
-        todos = open_todos(include_done=False)
-        if todos:
-            top = [f"[{t['prio']}] {t['what']}" for t in todos[:5]]
-            parts.append(f"Open to-dos ({len(todos)} in brain/calendar/README.md): " + "; ".join(top))
+        tasks = actionable_tasks(idx, include_upcoming_days=0)
+        shown_task_keys = set()
+        if tasks:
+            top_tasks = tasks[:5]
+            t_lines = []
+            for t in top_tasks:
+                shown_task_keys.add((t["date"], t["what"].lower()))
+                loc = f"{_show(t['rel'], cwd)}:{t['line']}" if t["line"] else _show(t["rel"], cwd)
+                k_tag = "[deadline] " if t["kind"] == "deadline" else ""
+                t_lines.append(f"  {t['num']}. [{t['badge']}] {k_tag}{t['what']}  [{loc}]")
+            extra_note = f" (+{len(tasks) - len(top_tasks)} more open)" if len(tasks) > len(top_tasks) else ""
+            tools_py = _show("_atlas/tools/atlas.py", cwd)
+            parts.append(
+                f"Task check-in{extra_note} (once today — list numbered in the user's language and offer quick triage: "
+                f"check off [abhaken/done], reschedule [verschieben/move], or tackle now [jetzt angehen]; "
+                f"apply replies via `python -I {tools_py} todo done|move|skip ...`):\n"
+                + "\n".join(t_lines)
+            )
+        cal_upcoming = []
+        for when, delta, what, rel in due:
+            if delta < 0:
+                continue
+            clean_w = _clean_md_inline(re.sub(r"^(?:\([^)]+\)\s+)?(?:\d{1,2}:\d{2}(?:-\d{1,2}:\d{2})?\s+)?(?:\[[a-zA-Z0-9_:-]+\]\s+)?", "", what))
+            if delta == 0 and (when.isoformat(), clean_w.lower()) in shown_task_keys:
+                continue
+            tag = "today" if delta == 0 else f"in {delta} d"
+            cal_upcoming.append(f"- {when.isoformat()} ({tag}): {what or '(no note)'}  [{_show(rel, cwd)}]")
+            if len(cal_upcoming) >= 6:
+                break
+        if cal_upcoming:
+            parts.append("Calendar & deadlines:\n" + "\n".join(cal_upcoming))
         if not PROBE:
             try:
                 cal_uri = render_calendar_html(idx, start_server=True)
@@ -1575,7 +1700,8 @@ def session_text(cwd, session):
         if s.get("questions") == "per-briefing":
             parts.append("Question: ask the user one short question about a real gap that matters now (a missing "
                          "notice period, an unknown contact); skip it if nothing matters. Settings may turn this off.")
-        lines.append("Atlas briefing (first chat today): give the user 3-6 short lines, then handle their request."
+        lines.append("Atlas briefing (first chat today): give a concise daily briefing (with the numbered task check-in "
+                     "if tasks are open), then handle the user's request right away."
                      + ("\n" + "\n".join(parts) if parts else "\nNothing pending; say so in one line."))
     else:
         if not PROBE:
@@ -1596,6 +1722,8 @@ def session_text(cwd, session):
                                                    or 99) >= 7:
         st["last_weekly"] = _now_iso()
         lines.append("Weekly session (settings): offer a short /atlas-interview round today.")
+    if session:
+        _session(st, session)["session_injected"] = today
     st["last_hook_run"] = _now_iso()
     if not PROBE:  # `atlas.py probe` must not use up the day's briefing
         _save_state(st)
@@ -1739,6 +1867,10 @@ COACH_RX_PLAN14 = re.compile(
     r"(?i)\b(?:2-?wochen-?plan\w*|zwei-?wochen\w*|14-?\s*tage\w*|14d\b|n[aä]chsten?\s+(?:zwei\s+)?wochen?\s+(?:planen|train\w*|workouts?)|"
     r"trainingsplan\s+(?:f[uü]r|schreiben|erstellen|planen)|workouts?\s+(?:planen|erstellen|schreiben)|wochenplan\s+training)\b"
 )
+COACH_RX_DNA = re.compile(
+    r"(?i)\b(?:rider\s*dna|athlete\s*dna|athleten-?dna|dna\s*(?:profil|analyse|report|scouting)|scouting\s*report|"
+    r"wo\s+stehe\s+ich\s+leistungsm[aä][sß]ig|was\s+ist\s+mein\s+limiter|mein\s+limiter|formanalyse|leistungsprofil\s+analys\w*)\b"
+)
 COACH_RX_CHECKIN = re.compile(
     r"(?i)\b(?:rpe\s*\d|beine\s+waren|puls\s+war|ruhepuls\s+\d|rhr\s+\d|strava\s+sync\w*|"
     r"ride\s+check-?in|readiness\s+check|feedback\s+zum\s+(?:ride|training|workout|lauf)|"
@@ -1761,6 +1893,8 @@ def detect_coach_mode(prompt, idx=None):
         mode, why = "macro", "macro periodization request"
     elif COACH_RX_PLAN14.search(low):
         mode, why = "plan-14d", "14-day workout planning request"
+    elif COACH_RX_DNA.search(low):
+        mode, why = "dna", "Athlete / Rider DNA physiological scouting request"
     elif COACH_RX_CHECKIN.search(low):
         mode, why = "checkin", "ride feedback / Strava check-in"
     elif COACH_RX_DAILY.search(low) or explicit:
@@ -1801,7 +1935,7 @@ def prompt_text(prompt, cwd, session):
             stale_note = ""
             if c_macro and c_macro.get("stale") and c_mode in ("plan-14d", "macro"):
                 stale_note = f" Macro plan is STALE ({c_macro.get('stale_reason')}) -> update brain/coach/macro-plan.md FIRST before writing 14d workouts."
-            depth_flag = " --depth pro" if coach_engine.PRO_QUERY_RX.search(prompt) else ""
+            depth_flag = " --depth pro" if (c_mode == "dna" or coach_engine.PRO_QUERY_RX.search(prompt)) else ""
             lines.append(
                 f"Atlas coach -> mode '{c_mode}' ({c_why}). Run `python -I {_show('_atlas/tools/atlas.py', cwd)} coach context --mode {c_mode}{depth_flag}` "
                 f"and follow {_show('_atlas/procedures/coach.md', cwd)}.{stale_note}"
@@ -2045,9 +2179,11 @@ def stop(agent, data):
         if reason:
             emit_continue(agent, reason)
         return
-    if data.get("terminationReason") not in (None, "model_stop") or data.get("fullyIdle") is False:
+    if data.get("continuationActive") or data.get("fullyIdle") is False:
         return
-    # Antigravity has no stop_hook_active: one reminder per user message at most.
+    if data.get("terminationReason") not in (None, "model_stop", "NO_TOOL_CALL"):
+        return
+    # Extra state guard in case older Antigravity builds omit `continuationActive`.
     key = hashlib.sha256((session + (data.get("lastUserInput") or "")).encode("utf-8")).hexdigest()[:16]
     if _state().get("antigravity_last_nudge") == key:
         return
@@ -2074,6 +2210,9 @@ def main():
     else:
         cwd, session = data.get("cwd") or os.getcwd(), str(data.get("session_id") or "")
     if event == "session":
+        if agent == "antigravity" and not PROBE:
+            session_warmup(cwd, session)
+            return
         emit_context(agent, event, session_text(cwd, session))
     elif event == "prompt":
         if agent == "antigravity":
@@ -2083,6 +2222,19 @@ def main():
         else:
             prompt = data.get("prompt") or ""
         if AUTOMATED.search(prompt):
+            return
+        if agent == "antigravity":
+            today = dt.date.today().isoformat()
+            st_pre = _state()
+            sess_pre = st_pre.get("sessions", {}).get(session, {}) if session else {}
+            need_session = (not session) or (sess_pre.get("session_injected") != today)
+            s_out = ""
+            if need_session:
+                warmed = sess_pre.get("warmed_at", "")
+                skip_pull = bool(warmed and ((_age_days(warmed) or 1.0) * 86400 < 120))
+                s_out = session_text(cwd, session, skip_pull=skip_pull)
+            p_out = prompt_text(prompt, cwd, session)
+            emit_context(agent, event, "\n".join(x for x in (s_out, p_out) if x))
             return
         emit_context(agent, event, prompt_text(prompt, cwd, session))
     else:
@@ -2094,5 +2246,4 @@ if __name__ == "__main__":
         main()
     except Exception as exc:
         _log_hook_error("main", exc)
-    sys.exit(0)
     sys.exit(0)

@@ -414,6 +414,78 @@ class UiCalUnit(unittest.TestCase):
         self.assertTrue(r_tel["cs_model"]["valid"])
         self.assertGreater(r_tel["metabolic"]["vo2max_est"], 50.0)
 
+    def test_todo_triage_helpers_dates_ranges_and_cross_file_promotion(self):
+        base = dt.date(2026, 11, 16)
+        self.assertEqual(cal_engine.parse_target_date("today", today=base), "2026-11-16")
+        self.assertEqual(cal_engine.parse_target_date("morgen", today=base), "2026-11-17")
+        self.assertEqual(cal_engine.parse_target_date("uebermorgen", today=base), "2026-11-18")
+        self.assertEqual(cal_engine.parse_target_date("+3d", today=base), "2026-11-19")
+        self.assertEqual(cal_engine.parse_target_date("+2w", today=base), "2026-11-30")
+        with self.assertRaises(ValueError):
+            cal_engine.parse_target_date("not-a-date", today=base)
+
+        cal_md = os.path.join(self.brain, "calendar", "README.md")
+        _write_file(
+            cal_md,
+            "---\nsummary: Calendar\ntags: [calendar]\n---\n# Calendar\n\n"
+            "## Timeline\n\n"
+            "- [ ] 2026-11-14..2026-11-16 [blocked] Konferenz Berlin\n\n"
+            "## Open To-Dos\n\n"
+            "- [ ] [med] Angebot kalkulieren\n",
+        )
+        area_md = os.path.join(self.brain, "areas", "finanzen", "checkliste.md")
+        _write_file(
+            area_md,
+            "---\nsummary: Checkliste\ntags: [work]\ndue:\n  - 2026-11-15 Quartalsabschluss prüfen\n---\n"
+            "# Checkliste\n\n## Offene Punkte\n\n- [ ] [high] Belege archivieren\n",
+        )
+
+        def _rf(p):
+            with open(p, encoding="utf-8") as fh:
+                return fh.read()
+
+        # Shift date range `2026-11-14..2026-11-16` -> `2026-11-20..2026-11-22`
+        r_rng = cal_engine.reschedule_task_in_brain(
+            self.brain, "calendar/README.md", "2026-11-20", what="Konferenz Berlin", today=base
+        )
+        self.assertTrue(r_rng["ok"])
+        self.assertIn("2026-11-20..2026-11-22 [blocked] Konferenz Berlin", _rf(cal_md))
+
+        # Promote undated task from `areas/finanzen/checkliste.md` into `calendar/README.md` Timeline
+        r_prom = cal_engine.reschedule_task_in_brain(
+            self.brain, "areas/finanzen/checkliste.md", "+5d", what="Belege archivieren", today=base
+        )
+        self.assertTrue(r_prom["ok"])
+        self.assertTrue(r_prom["promoted"])
+        self.assertEqual(r_prom["date"], "2026-11-21")
+        cal_txt = _rf(cal_md)
+        self.assertIn("- [ ] 2026-11-21 [todo] Belege archivieren (areas/finanzen/checkliste.md)", cal_txt)
+        area_txt = _rf(area_md)
+        self.assertIn("- [ ] 2026-11-21 [todo] Belege archivieren", area_txt)
+
+        # Skip & reopen frontmatter `due:` item
+        r_skip_fm = cal_engine.toggle_todo_in_brain(
+            self.brain, "areas/finanzen/checkliste.md", line_no=0, what="Quartalsabschluss prüfen", target_status="skipped"
+        )
+        self.assertTrue(r_skip_fm["ok"])
+        self.assertEqual(r_skip_fm["status"], "skipped")
+        self.assertIn('"[-] 2026-11-15 Quartalsabschluss prüfen"', _rf(area_md))
+
+        r_reopen_fm = cal_engine.toggle_todo_in_brain(
+            self.brain, "areas/finanzen/checkliste.md", line_no=0, what="Quartalsabschluss prüfen", target_status="open"
+        )
+        self.assertTrue(r_reopen_fm["ok"])
+        self.assertIn("- 2026-11-15 Quartalsabschluss prüfen", _rf(area_md))
+
+        # Add dated & undated tasks via `add_todo_in_brain`
+        r_add_d = cal_engine.add_todo_in_brain(self.brain, "Server-Patch einspielen", target_date_spec="tomorrow", today=base)
+        self.assertTrue(r_add_d["ok"])
+        self.assertEqual(r_add_d["date"], "2026-11-17")
+        cal_final = _rf(cal_md)
+        # Chronological ordering inside `## Timeline`: 2026-11-17 appears BEFORE 2026-11-20 and 2026-11-21
+        self.assertLess(cal_final.index("2026-11-17"), cal_final.index("2026-11-20"))
+        self.assertLess(cal_final.index("2026-11-20"), cal_final.index("2026-11-21"))
+
 
 if __name__ == "__main__":
     unittest.main()
