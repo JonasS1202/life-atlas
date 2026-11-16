@@ -27,10 +27,10 @@ EDGE_WEIGHTS = {
 LINK_RX = re.compile(r"(?<!!)\[([^\]\r\n]*)\]\(([^)\s]+)\)")
 WIKILINK_RX = re.compile(r"(?<!!)\[\[([^\[\]\r\n]+?)\]\]")
 TICK_RX = re.compile(
-    r"`((?:brain/)?(?:areas|projects|people|howto|journal|inbox|self|skills|calendar|coach|_atlas)/[^`\s]+\.md)`"
+    r"`((?:brain/)?[A-Za-z0-9_.-]+/[^`\s]+\.md)`"
 )
 BRAIN_PATH_RX = re.compile(
-    r"(`?)((?:brain/)?(?:areas|projects|people|howto|journal|inbox|self|skills|calendar|coach)/"
+    r"(?<![:/\w])(`?)((?:brain/)?[A-Za-z0-9_.-]+/"
     r"[^\s`()\[\]<>\"',;:]+?\.md)\1"
 )
 HEADING_RX = re.compile(r"(?m)^(#{1,6})[ \t]+([^\r\n]+?)[ \t]*#*[ \t]*$")
@@ -176,6 +176,17 @@ def slugify_heading(title):
     s = re.sub(r"[\s]+", "-", s).strip("-")
     s = re.sub(r"-{2,}", "-", s)
     return s
+
+
+_SYSTEM_REL_PREFIXES = ("_", ".", "journal/", "inbox/", "skills/", "calendar/")
+_ROOT_STRUCTURAL_FILES = {"INDEX.md", "ROUTER.md", "README.md", "tags.md", "settings.md", "glossary.md"}
+
+
+def is_user_knowledge_rel(rel):
+    """True for any user knowledge page in `brain/` (standard or custom top-level folders, flat or nested)."""
+    if not rel or rel in _ROOT_STRUCTURAL_FILES:
+        return False
+    return not rel.startswith(_SYSTEM_REL_PREFIXES)
 
 
 def is_folder_hub(rel):
@@ -1311,7 +1322,9 @@ def compute_prompt_hints(brain, prompt, idx, tag_vocab_map, vocab_terms, skip_pa
                 ]
                 tag_hubs[tag] = [
                     r for r, e in idx.items()
-                    if r not in skip and r.startswith("areas/") and r.count("/") == 2 and r.endswith("/README.md")
+                    if r not in skip and is_folder_hub(r) and "/" in r
+                    and not r.startswith(_SYSTEM_REL_PREFIXES)
+                    and r not in ("people/README.md", "projects/README.md", "howto/README.md")
                     and tag in {canon.get(t, t) for t in e.get("tags", [])}
                 ]
                 break
@@ -1320,8 +1333,8 @@ def compute_prompt_hints(brain, prompt, idx, tag_vocab_map, vocab_terms, skip_pa
         return [], []
 
     n = max(len(idx), 1)
+    max_df = max(3, int(math.ceil(max_df_share * n)))
     scores, hits = {}, {}
-    canonical_prefixes = ("areas/", "projects/", "people/", "howto/", "self/", "calendar/", "coach/", "glossary.md")
 
     if cands:
         conn = open_graph_db(brain, db_path)
@@ -1343,11 +1356,11 @@ def compute_prompt_hints(brain, prompt, idx, tag_vocab_map, vocab_terms, skip_pa
                     if p in idx and p not in skip and not p.startswith("_")
                     and not p.startswith(("journal/", "skills/")) and not is_folder_hub(p)
                 }
-                if not matched or len(matched) > max_df_share * n:
+                if not matched or len(matched) > max_df:
                     continue
                 idf = math.log(1 + n / len(matched))
                 for rel, bm_s in matched.items():
-                    mult = 1.3 if rel.startswith(canonical_prefixes) else 1.0
+                    mult = 1.3 if (is_user_knowledge_rel(rel) or rel in ("calendar/README.md", "glossary.md")) else 1.0
                     scores[rel] = scores.get(rel, 0.0) + idf * (1.0 + math.log(1.0 + bm_s)) * mult
                     hits.setdefault(rel, set()).add(term)
         finally:
@@ -1357,7 +1370,7 @@ def compute_prompt_hints(brain, prompt, idx, tag_vocab_map, vocab_terms, skip_pa
         hubs = tag_hubs.get(tag, [])
         if not leaves and not hubs:
             continue
-        if not hubs and len(leaves) > max_df_share * n:
+        if not hubs and len(leaves) > max_df:
             continue
         idf = math.log(1 + n / max(len(leaves), 1))
         # Reinforce any leaf already matched via explicit entity/ID
@@ -1404,8 +1417,14 @@ def build_entity_lexicon(brain, idx=None):
         is_project = rel.startswith("projects/") and (
             (rel.count("/") == 2 and rel.endswith("/README.md")) or (rel.count("/") == 1 and rel.endswith(".md"))
         )
-        is_area_leaf = rel.startswith("areas/") and rel.endswith(".md") and not rel.endswith("/README.md")
-        if not (is_person or is_project or is_area_leaf):
+        is_knowledge_leaf = (
+            is_user_knowledge_rel(rel)
+            and not rel.startswith(("people/", "projects/", "howto/", "self/", "coach/"))
+            and "/files/" not in rel
+            and rel.endswith(".md")
+            and not is_folder_hub(rel)
+        )
+        if not (is_person or is_project or is_knowledge_leaf):
             continue
 
         surface_forms = []
@@ -1475,9 +1494,8 @@ def scan_retroactive_links(brain, idx=None, db_path=None):
     mentions = {}       # src_rel -> list of {"start", "end", "matched", "dst", "line", "snippet", "has_body", "has_related"}
     journal_paths = {}  # j_rel -> list of {"start", "end", "raw", "label", "dst", "href", "line"}
 
-    scan_prefixes = ("areas/", "people/", "projects/", "howto/", "self/", "journal/")
     for src_rel in sorted(known_md):
-        if not src_rel.startswith(scan_prefixes) or is_folder_hub(src_rel):
+        if not (is_user_knowledge_rel(src_rel) or src_rel.startswith("journal/")) or is_folder_hub(src_rel):
             continue
         full = os.path.join(brain, src_rel)
         try:
@@ -2044,7 +2062,8 @@ def validate_and_analyze_brain(brain, root, rels_map, idx=None, db_path=None):
 
     isolated = sorted(
         r for r in idx
-        if r.startswith(("areas/", "people/", "projects/", "howto/"))
+        if is_user_knowledge_rel(r)
+        and not r.startswith(("self/", "coach/"))
         and not is_folder_hub(r)
         and r not in horiz_nodes
     )

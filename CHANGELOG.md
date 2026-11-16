@@ -2,6 +2,15 @@
 
 Written for users: `/atlas-update` shows the sections between the installed and the new version.
 
+## [1.3.3] - 2026-11-16
+
+- **Universal Brain Layouts & Small-Brain Recall (`graph_engine.py`, `atlas_hook.py`, `atlas.py`):**
+  - **Fresh / Small-Brain DF Floor (`max_df >= 3`):** Ensures newly initialized or compact brains (`< 25` pages) never drop contract IDs, alphanumeric tickers, or unhubbed domain tags due to relative document-frequency thresholds (`max(3, ceil(max_df_share * n))`).
+  - **Custom Top-Level Folders & Flat `areas/*.md` Support:** Replaces hardcoded top-level folder whitelists in `_vocab()`, `compute_prompt_hints()`, `build_entity_lexicon()`, `scan_retroactive_links()`, `atlas.py where`, and `atlas.py check` with `is_user_knowledge_rel()`, giving custom user directories (`brain/notes/`, `brain/work/`, `brain/study/`, etc.) and flat `areas/<topic>.md` setups first-class entity recall, hub routing, journal auto-linking, and health validation out of the box.
+- **Native Windows & PowerShell `Stop`-Hook Hardening (`atlas_hook.py`, `calendar.md`, `mail.md`, `calendar.html`):**
+  - **Windows / PowerShell Read-Only Command Recognition:** `_is_readonly_shell_cmd()` now recognizes Windows `python.exe` / `py -3` launchers (including quoted paths with spaces like `"C:\Users\...\python.exe"`), PowerShell/`cmd.exe` read-only commands (`Get-ChildItem`, `Get-Content`, `Select-String`, `Test-Path`, `dir`, `where.exe`, `findstr`), and benign null redirections (`2>$null`, `2>NUL`, `2>/dev/null`), while catching PowerShell write cmdlets (`Set-Content`, `Out-File`, `Remove-Item`, etc.) — preventing false `Stop` nudges on pure read-only turns on Windows.
+  - **Consistent Cross-Platform Python Guidance:** Unifies `python -I` / `python3 -I` guidance across `calendar.md`, `mail.md`, and `calendar.html` clipboard hints so Windows users never hit the Microsoft Store `python3` alias stub.
+
 ## [1.3.2] - 2026-11-16
 
 - **Zero-Friction Domain & Project-Mode Switching (`atlas_hook.py`, `router.md`):**

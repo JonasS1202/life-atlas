@@ -22,7 +22,7 @@ Combines **strict Read-Only inspection by default** (`readonly=True`, `BODY.PEEK
 
 ## 2. Read-Only Commands (`readonly=True` — never alters `\Seen` / unread state)
 
-You can invoke the mail engine either via `atlas.py mail ...` or directly via `atlas_mail.py ...`:
+You can invoke the mail engine either via `atlas.py mail ...` or directly via `atlas_mail.py ...` (on Windows use `python -I` — never `python3`, which triggers the Microsoft Store stub; on Linux/macOS without `python` use `python3 -I`, matching `ROUTER.md`):
 
 1. **Check accounts, connection status & server IMAP capabilities (`MOVE`, `UIDPLUS`, `X-GM-EXT-1`):**
    ```bash
@@ -34,15 +34,15 @@ You can invoke the mail engine either via `atlas.py mail ...` or directly via `a
    ```
 3. **List messages in a folder (fast header-only `BODY.PEEK[HEADER.FIELDS (...)]` by default; pass `--with-body` or `--body-chars 1000` for clean body excerpts in a single IMAP call):**
    ```bash
-   python3 -I "<ROOT>/brain/_atlas/tools/atlas.py" mail list -a <account> -f INBOX -n 50 [--unread] [--flagged] [--since YYYY-MM-DD] [--with-body] [--body-chars 800]
+   python -I "<ROOT>/brain/_atlas/tools/atlas.py" mail list -a <account> -f INBOX -n 50 [--unread] [--flagged] [--since YYYY-MM-DD] [--with-body] [--body-chars 800]
    ```
 4. **Search messages (server-side `UID SEARCH` first with automatic client-side fallback for labels/filenames/UTF-8):**
    ```bash
-   python3 -I "<ROOT>/brain/_atlas/tools/atlas.py" mail search "<query>" -a <account> -f INBOX [--since YYYY-MM-DD]
+   python -I "<ROOT>/brain/_atlas/tools/atlas.py" mail search "<query>" -a <account> -f INBOX [--since YYYY-MM-DD]
    ```
 5. **Read one or multiple messages in full over a single IMAP session (including `FLAGS`, `LABELS` & optional attachment extraction):**
    ```bash
-   python3 -I "<ROOT>/brain/_atlas/tools/atlas.py" mail read <UID> [<UID2> ...] -a <account> -f INBOX [--save-attachments "<dir>"]
+   python -I "<ROOT>/brain/_atlas/tools/atlas.py" mail read <UID> [<UID2> ...] -a <account> -f INBOX [--save-attachments "<dir>"]
    ```
 6. **Full deduplicated mailbox audit (All Mail or INBOX + Sent + Archive):**
    ```bash

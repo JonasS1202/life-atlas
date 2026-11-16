@@ -1885,7 +1885,7 @@ def _vocab(idx, skip_pages):
         derived.setdefault(nl, []).append((dst_rel, cleaned))
 
     for rel, e in idx.items():
-        if rel in skip_pages or not rel.startswith(("people/", "areas/", "howto/", "projects/", "self/")):
+        if rel in skip_pages or not graph_engine.is_user_knowledge_rel(rel):
             continue
         if "/files/" in rel:
             continue
@@ -2408,21 +2408,32 @@ READONLY_AG_TOOLS = {
     "list_dir", "list_resources", "read_resource", "read_url", "read_url_content", "search_web",
     "ask_question", "list_plugin_accounts", "search_marketplace", "manage_task", "manage_subagents",
 }
+_BENIGN_REDIRECT_RX = re.compile(
+    r"(?i)(?:\b\d+>&\d+|\b[12]>\s*(?:/dev/null|\$null|NUL)\b)"
+)
 _MUTATING_SHELL_RX = re.compile(
     r"(?i)(?:>>?|(?<!-)--(?:execute|fix)\b|\btodo\s+(?:done|move|skip|reopen|add)\b|"
     r"\bcoach\s+(?:note|sync|zwo|auth-strava)\b|\bstate\s+--set\b|"
-    r"\bgit\s+(?:commit|push|add|tag|checkout|switch|merge|rebase|reset|stash|clean|rm|mv)\b|"
-    r"\b(?:rm|mv|cp|mkdir|rmdir|touch|chmod|chown|ln|tee|install|dd|truncate)\b|\bsed\s+-i\b|\bpython3?\s+(?:-[A-Za-z]+\s+)*-c\b)"
+    r"\bmail\s+(?:init|ingest|move|copy|trash|delete|flags|labels|mkdir)\b|"
+    r"\bgit(?:\.exe)?\s+(?:commit|push|add|tag|checkout|switch|merge|rebase|reset|stash|clean|rm|mv)\b|"
+    r"\b(?:rm|mv|cp|mkdir|rmdir|touch|chmod|chown|ln|tee|install|dd|truncate|"
+    r"del|erase|ren|copy|move|md|rd|icacls|attrib|"
+    r"Set-Content|Add-Content|Out-File|Remove-Item|Move-Item|Copy-Item|New-Item|Rename-Item|Clear-Content)\b|"
+    r"\bsed\s+-i\b|\b(?:python(?:3(?:\.\d+)?)?|py)(?:\.exe)?\s+(?:-[A-Za-z0-9.]+\s+)*-c\b)"
 )
 _READONLY_CMD_HEAD_RX = re.compile(
-    r"^(?:ls|cat|head|tail|grep|egrep|fgrep|rg|find|wc|stat|file|pwd|whoami|id|uname|date|echo|ps|which|type|true|"
-    r"diff|sort|uniq|cut|tr|git\s+(?:-C\s+\S+\s+)?(?:status|log|diff|show|branch|rev-parse|ls-remote|remote)|"
-    r"(?:/usr/bin/)?python3?(?:\s+-[IB]+)*\s+\S*atlas(?:_mail)?\.py)\b"
+    r"(?i)^(?:ls|dir|cat|head|tail|more|grep|egrep|fgrep|rg|find|findstr|wc|stat|file|pwd|whoami|id|uname|date|echo|ps|"
+    r"which|where(?:\.exe)?|type|true|diff|sort|uniq|cut|tr|"
+    r"Get-ChildItem|Get-Content|Get-Item|Get-ItemProperty|Get-Location|Select-String|Test-Path|"
+    r"Where-Object|Select-Object|Measure-Object|Sort-Object|Format-Table|Format-List|Out-String|Write-Output|"
+    r"git(?:\.exe)?\s+(?:-C\s+(?:\"[^\"]+\"|'[^']+'|\S+)\s+)?(?:status|log|diff|show|branch|rev-parse|ls-remote|remote)|"
+    r"(?:[\"']?(?:[A-Za-z]:[\\/][^\"']+?|/[^\"'\s]+?)[\\/])?(?:python(?:3(?:\.\d+)?)?|py)(?:\.exe)?[\"']?"
+    r"(?:\s+-\d+(?:\.\d+)?)?(?:\s+-[IBu]+)*\s+(?:[\"'][^\"']*atlas(?:_mail)?\.py[\"']|\S*atlas(?:_mail)?\.py))(?=$|\s)"
 )
 
 
 def _is_readonly_shell_cmd(cmd_raw):
-    cmd = str(cmd_raw or "").strip()
+    cmd = _BENIGN_REDIRECT_RX.sub(" ", str(cmd_raw or "")).strip()
     if not cmd:
         return True
     if _MUTATING_SHELL_RX.search(cmd):
@@ -2431,7 +2442,7 @@ def _is_readonly_shell_cmd(cmd_raw):
     if not parts:
         return True
     for seg in parts:
-        seg_clean = re.sub(r"^\d+>&\d+\s*|\s*\d+>/dev/null\s*$", "", seg).strip()
+        seg_clean = seg.strip()
         if not seg_clean:
             continue
         if not _READONLY_CMD_HEAD_RX.match(seg_clean):

@@ -1915,7 +1915,7 @@ function renderGraphSidebar(){
         ${u.context ? `<div class="ctx-snip">${esc(u.context)}</div>` : ''}
       </div>
     </div>
-  `).join('') + `<div class="code-hint" onclick="navigator.clipboard.writeText('python3 -I brain/_atlas/tools/atlas.py link --related --execute');showToast('Befehl in Zwischenablage kopiert')">📋 atlas.py link --related --execute</div>`
+  `).join('') + `<div class="code-hint" onclick="navigator.clipboard.writeText((/Win/i.test(navigator.userAgent)?'python':'python3') + ' -I brain/_atlas/tools/atlas.py link --related --execute');showToast('Befehl in Zwischenablage kopiert')">📋 atlas.py link --related --execute</div>`
   : `<div class="empty-box">Keine unverlinkten Text-Erwähnungen dieser Entität im Brain.</div>`;
 }
 

@@ -803,6 +803,26 @@ def cmd_where(args):
             ar_sum = (idx.get(ar_readme, {}).get("summary") or "").strip()
             cnt = sum(1 for r in idx if r.startswith(f"areas/{ad}/") and r != ar_readme)
             say(f"  - areas/{ad}/ ({cnt} pages; hub: {ar_readme})" + (f" — {ar_sum}" if ar_sum else ""))
+        flat_areas = sum(
+            1 for r in idx
+            if r.startswith("areas/") and r.count("/") == 1 and r != "areas/README.md"
+        )
+        if flat_areas or not area_subs:
+            say(f"  - areas/<topic>.md ({flat_areas} flat pages; hub: areas/README.md)")
+    std_top = {
+        "areas", "people", "projects", "howto", "skills", "calendar", "self", "coach",
+        "journal", "inbox", "_atlas", "_secrets", "_archive",
+    }
+    custom_tops = sorted(
+        d for d in os.listdir(brain)
+        if os.path.isdir(os.path.join(brain, d)) and not d.startswith((".", "_")) and d not in std_top
+    )
+    for cd in custom_tops:
+        cd_readme = f"{cd}/README.md"
+        cd_sum = (idx.get(cd_readme, {}).get("summary") or "").strip()
+        cnt = sum(1 for r in idx if r.startswith(f"{cd}/") and r != cd_readme)
+        say(f"  - {cd}/ ({cnt} pages; custom folder" + (f", hub: {cd_readme}" if cd_readme in idx else "") + ")"
+            + (f" — {cd_sum}" if cd_sum else ""))
     say("  - people/<first-last>.md (hub: people/README.md) — one page per person")
     say("  - projects/<slug>/README.md (hub: projects/README.md) — undertakings with a goal or code repos")
     say("  - howto/<topic>.md (hub: howto/README.md; scripts: howto/scripts/) — rules, workflows, lessons, user scripts")
@@ -1134,7 +1154,7 @@ def cmd_check(args):
     # Tags and summaries (D22): every content page carries `summary:` and `tags:` from brain/tags.md.
     vocab = hk.tag_vocab()
     canon = {s: t for t, syns in vocab.items() for s in syns}
-    content = [r for r in idx if r.startswith(("areas/", "people/", "projects/", "howto/", "self/", "coach/"))
+    content = [r for r in idx if graph_engine.is_user_knowledge_rel(r)
                and not r.endswith("README.md")]
     no_sum = [r for r in content if not idx[r].get("summary")]
     no_tag = [r for r in content if not idx[r].get("tags")]

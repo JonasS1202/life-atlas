@@ -1910,6 +1910,99 @@ class UiReleaseV11(AtlasCase):
         ns_ls = p_mail.parse_args(["list", "-a", "WORK", "--body-chars", "900"])
         self.assertEqual(ns_ls.body_chars, 900)
 
+    def test_v133_small_brain_custom_folders_flat_areas_and_windows_readonly(self):
+        self.wire_both()
+
+        # 1. Fresh tiny brain (< 10 pages total) with flat `areas/car.md` (no subfolder hub!) + custom top-level `notes/`
+        self.page("tags.md", (
+            "# Tags\n\n| Tag | Meaning | Synonyms |\n|---|---|---|\n"
+            "| **mobility** | Mobility & vehicles | car, vehicle, insurance |\n"
+            "| **study** | Study notes | math, university |\n"
+        ))
+        self.page("areas/car.md", (
+            "---\nsummary: Flat car policy page without subfolder hub\ntags: [mobility]\n---\n"
+            "# Family Car\n\nPolicy number `9876543210`.\n"
+        ))
+        self.page("notes/README.md", (
+            "---\nsummary: Custom top-level study notes hub\ntags: [study]\n---\n"
+            "# Study Notes\n\n- [Linear Algebra](linear-algebra.md)\n"
+        ))
+        self.page("notes/linear-algebra.md", (
+            "---\nsummary: Eigenvalues, SVD, and spectral theorem\ntags: [study]\n---\n"
+            "# Linear Algebra\n\nNotes on matrix eigenvalues.\n"
+        ))
+        self.atlas("index")
+
+        # Tiny brain (< 12 pages): ID `9876543210` and unhubbed tag `vehicle` (#mobility) must NOT be dropped by 0.12*n < 1
+        h_id = self.hook("antigravity", "prompt", {
+            "conversationId": "v133-id",
+            "invocationNum": 0,
+            "lastUserInput": "What is contract 9876543210?",
+            "workspacePaths": [fwd(self.root)],
+        })
+        self.assertIn("areas/car.md", h_id)
+
+        h_flat_tag = self.hook("antigravity", "prompt", {
+            "conversationId": "v133-tag",
+            "invocationNum": 0,
+            "lastUserInput": "Check my vehicle insurance details",
+            "workspacePaths": [fwd(self.root)],
+        })
+        self.assertIn("areas/car.md", h_flat_tag)
+
+        # Custom top-level folder `notes/linear-algebra.md` matched directly in PreInvocation + `atlas.py where`
+        h_custom = self.hook("antigravity", "prompt", {
+            "conversationId": "v133-custom",
+            "invocationNum": 0,
+            "lastUserInput": "Explain my Linear Algebra summary",
+            "workspacePaths": [fwd(self.root)],
+        })
+        self.assertIn("notes/linear-algebra.md", h_custom)
+
+        wh_out = self.atlas("where", "eigenvalues").stdout
+        self.assertIn("notes/linear-algebra.md", wh_out)
+        self.assertIn("notes/ (1 pages; custom folder, hub: notes/README.md)", wh_out)
+        self.assertIn("areas/<topic>.md (1 flat pages", wh_out)
+
+        # Retroactive journal linking works for custom top-level folders (`brain/notes/linear-algebra.md`)
+        import datetime as dt
+        today = dt.date.today().isoformat()
+        j_rel = f"journal/{today[:4]}/{today}.md"
+        self.page(j_rel, f"# {today}\n\n- 12:00 · — · updated brain/notes/linear-algebra.md\n")
+        self.atlas("link", "--journals", "--execute")
+        j_linked = self.read(os.path.join(self.brain, j_rel))
+        self.assertIn("[brain/notes/linear-algebra.md](../../notes/linear-algebra.md)", j_linked)
+
+        # 2. Native Windows (`python.exe`, `py -3`, quoted paths with spaces, PowerShell read-only vs write cmdlets)
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "atlas_hook_v133", os.path.join(REPO, "core", "hooks", "atlas_hook.py")
+        )
+        hk_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(hk_mod)
+
+        readonly_cmds = [
+            r'"C:\Users\Alex Morgan\AppData\Local\Programs\Python\Python312\python.exe" -I "C:\Users\Alex Morgan\Atlas\brain\_atlas\tools\atlas.py" find Matrix',
+            r'py -3 -I C:\Atlas\brain\_atlas\tools\atlas.py mail list -a WORK 2>$null',
+            r'Get-ChildItem C:\Atlas\brain | Select-String "Matrix"',
+            r'git.exe -C "C:\Users\Alex Morgan\Atlas\brain" status --short',
+            r'dir C:\Atlas\brain && where.exe python',
+            r'python3 -I brain/_atlas/tools/atlas.py check 2>/dev/null',
+        ]
+        for c in readonly_cmds:
+            self.assertTrue(hk_mod._is_readonly_shell_cmd(c), f"Expected read-only True for: {c}")
+
+        mutating_cmds = [
+            r'Set-Content -Path C:\Atlas\brain\notes\x.md -Value "hi"',
+            r'Get-ChildItem | Out-File C:\Atlas\out.txt',
+            r'Remove-Item C:\Atlas\brain\notes\x.md',
+            r'python -I C:\Atlas\brain\_atlas\tools\atlas.py todo add "Task" --to tomorrow',
+            r'python -I C:\Atlas\brain\_atlas\tools\atlas.py mail move 42 --to Archive -a WORK --yes',
+            r'echo test > C:\Atlas\out.txt',
+        ]
+        for c in mutating_cmds:
+            self.assertFalse(hk_mod._is_readonly_shell_cmd(c), f"Expected mutating False for: {c}")
+
 
 if __name__ == "__main__":
     os.makedirs(BASE_DIR, exist_ok=True)
