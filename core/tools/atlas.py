@@ -775,8 +775,9 @@ def cmd_where(args):
     terms = [t for t in (args.terms or []) if str(t).strip()]
 
     if terms:
+        hub_skip = {r for r in idx if graph_engine.is_folder_hub(r)}
         ranked, neighbors = graph_engine.search_pages(
-            brain, terms, idx=idx, tag_vocab_map=vocab, limit=6, text_search=True, db_path=hk.CACHE
+            brain, terms, idx=idx, tag_vocab_map=vocab, skip_pages=hub_skip, limit=6, text_search=True, db_path=hk.CACHE
         )
         say("=== 1. EXISTING CANDIDATE PAGES (extend an existing page before creating a new one!) ===")
         if ranked:
@@ -3880,7 +3881,7 @@ def _core_apply(args, root, brain, src, plan, ups, values):
             os.remove(os.path.join(base_dir, rel))
     if up_block and "ROUTER.md core block" not in unresolved:
         write(os.path.join(base_dir, ROUTER_BASE), up_block + "\n")
-    set_state(brain, version=plan["v_new"])
+    set_state(brain, version=plan["v_new"], last_update_check=now_iso())
     dump_json(os.path.join(rdir, "applied.json"), {"source": fwd(src), "from": plan["v_old"], "to": plan["v_new"],
                                                    "result": result, "notes": notes})
     # Re-wire with the NEW tool and probe every wired agent; any failure rolls everything back.

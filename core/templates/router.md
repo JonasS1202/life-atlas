@@ -21,7 +21,7 @@ Every request goes to one of three places:
   agent in that repository: absolute paths, run commands inside its folder, follow its conventions. Do not consult the
   rest of Atlas unless the task needs something outside the project. Stay in the project until the user moves on.
 - **The user's life** (people, money, contracts, health, home, plans, ideas): look up what you do not already know in
-  this chat via `atlas.py find <words>` (FTS5 + 1-hop graph), `atlas.py context <page>`, or header grep (`^summary:`/`^tags:`), and open only what fits. Hook hints are surgical entity leads; pull deeper context on demand and verify before you claim.
+  this chat via `atlas.py find <words>` (FTS5 + 1-hop graph), `atlas.py context <page>`, or `.md` header grep (`^summary:`/`^tags:`, never `_atlas/` or `files/`), and open only what fits. Hook hints are surgical entity leads; pull deeper context on demand and verify before you claim.
 - **Neither** (general question): just answer.
 If a project name is ambiguous, ask which one.
 
@@ -41,7 +41,7 @@ If a project name is ambiguous, ask which one.
   Never open credential stores (browser passwords, keychains, private keys) on your own.
 - Write content in {{LANGUAGE}}; core folder names stay English.
 - Skills: `/atlas-brief` · `/atlas-calendar` · `/atlas-coach` · `/atlas-mail` · `/atlas-sort` · `/atlas-learn` · `/atlas-interview` · `/atlas-deep` ·
-  `/atlas-maintain` · `/atlas-check` · `/atlas-update` · `/atlas-adopt-repo`. Tool: `python -I brain/_atlas/tools/atlas.py`.
+  `/atlas-maintain` · `/atlas-check` · `/atlas-update` · `/atlas-adopt-repo`. Tool: `python3 -I brain/_atlas/tools/atlas.py` (Windows: `python -I`).
 
 <!-- atlas:core:end -->
 

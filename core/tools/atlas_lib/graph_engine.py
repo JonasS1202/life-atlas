@@ -1087,13 +1087,75 @@ def expand_1hop_neighbors(brain, seed_rels, skip_pages=None, max_neighbors=3, in
         conn.close()
 
 
+def _tokenize_search_terms(terms):
+    """Split multi-word queries and compounds into atomic search tokens while preserving phrase candidates."""
+    raw_inputs = [str(w).strip() for w in (terms or []) if str(w).strip()]
+    if not raw_inputs:
+        return [], []
+    phrases = []
+    for item in raw_inputs:
+        if " " in item and len(item) >= 4:
+            phrases.append(item)
+    if len(raw_inputs) >= 2 and all(" " not in x for x in raw_inputs):
+        joined = " ".join(raw_inputs)
+        if len(joined) >= 4:
+            phrases.append(joined)
+
+    split_all = []
+    for item in raw_inputs:
+        for tok in re.split(r"\s+", item):
+            cl = tok.strip(".,;:!?()[]\"'`«»„“”")
+            if cl:
+                split_all.append(cl)
+
+    multi = len(split_all) > 1
+    words = []
+    seen = set()
+
+    def _push(tok):
+        kl = tok.lower()
+        if kl and kl not in seen:
+            seen.add(kl)
+            words.append(tok)
+
+    for i, tok in enumerate(split_all):
+        low_t = tok.lower()
+        norm_t = norm_text(low_t)
+        # Preserve model/grade bigrams like "Model Y", "Gr 56", "Pro X"
+        if i + 1 < len(split_all):
+            nxt = split_all[i + 1]
+            if len(nxt) <= 3 and re.match(r"^[A-Za-z0-9]+$", nxt) and low_t not in PROMPT_STOPWORDS and norm_t not in PROMPT_STOPWORDS:
+                phrases.append(f"{tok} {nxt}")
+        if multi and (low_t in PROMPT_STOPWORDS or norm_t in PROMPT_STOPWORDS or len(tok) < 2):
+            continue
+        _push(tok)
+        # Decompose hyphenated/slashed compounds (e.g. "Kfz-Versicherung" -> "Kfz", "Versicherung")
+        if "-" in tok or "/" in tok:
+            for sub in re.split(r"[-/]+", tok):
+                sub_l = sub.lower()
+                if len(sub) >= 3 and sub.isalpha() and sub_l not in PROMPT_STOPWORDS and norm_text(sub_l) not in PROMPT_STOPWORDS:
+                    _push(sub)
+
+    if not words:
+        for tok in split_all:
+            _push(tok)
+    dedup_phrases = []
+    seen_p = set()
+    for p in phrases:
+        pl = p.lower()
+        if pl not in seen_p:
+            seen_p.add(pl)
+            dedup_phrases.append(p)
+    return words, dedup_phrases
+
+
 def search_pages(brain, terms, idx=None, tag_vocab_map=None, skip_pages=None, limit=12, text_search=True, db_path=None):
     """Ranked search combining frontmatter/tag-synonym boosts with SQLite FTS5 BM25 + Trigram fallback."""
     if idx is None:
         idx = sync_index(brain, db_path=db_path)
     vocab = tag_vocab_map or {}
     skip = set(skip_pages or ()) | {"tags.md", "settings.md"}
-    words = [str(w).strip() for w in (terms or []) if str(w).strip()]
+    words, phrases = _tokenize_search_terms(terms)
     if not words:
         return [], []
 
@@ -1110,6 +1172,19 @@ def search_pages(brain, terms, idx=None, tag_vocab_map=None, skip_pages=None, li
         hay_sum = (e.get("summary") or "").lower()
         aliases = [a.lower() for a in e.get("aliases", [])]
         page_tags = {canon.get(t.lower(), t.lower()) for t in e.get("tags", [])}
+        for ph in phrases:
+            pl = ph.lower()
+            pf = norm_text(pl)
+            p_pts = 0.0
+            if any(pl in a or pf in norm_text(a) for a in aliases):
+                p_pts += 7.0
+            if pl in hay_title or pf in norm_text(hay_title):
+                p_pts += 6.0
+            if pl in hay_sum or pf in norm_text(hay_sum):
+                p_pts += 3.5
+            if p_pts > 0:
+                scores[rel] = scores.get(rel, 0.0) + p_pts
+                why.setdefault(rel, set()).add(pl)
         for raw_w in words:
             w = raw_w.lower()
             wf = norm_text(w)
@@ -1143,12 +1218,18 @@ def search_pages(brain, terms, idx=None, tag_vocab_map=None, skip_pages=None, li
         finally:
             conn.close()
 
-    ranked = sorted(scores, key=lambda r: (-len(why[r]), -scores[r], r))[:limit]
+    ranked = sorted(scores, key=lambda r: (-(scores[r] + 5.0 * len(why[r])), -len(why[r]), r))[:limit]
     neighbors = expand_1hop_neighbors(brain, ranked[:3], skip_pages=skip | set(ranked), max_neighbors=3, db_path=db_path) if text_search and ranked else []
     return ranked, neighbors
 
 
-def compute_prompt_hints(brain, prompt, idx, tag_vocab_map, vocab_terms, skip_pages, max_hints=5, max_df_share=0.6, db_path=None):
+_PROMPT_UNIT_RE = re.compile(
+    r"^\d+(?:[.,]\d+)?(?:ms|s|m|h|d|w|mo|yr|j|px|pt|em|rem|vh|vw|gb|mb|kb|tb|hz|khz|mhz|ghz|fps|nm|mm|cm|km|kg|g|mg|ml|l|kw|kwh|wh|mah|bar|psi|rpm|v|a|c|k|x|eur|usd|chf|gbp|st|nd|rd|th)$",
+    re.IGNORECASE,
+)
+
+
+def compute_prompt_hints(brain, prompt, idx, tag_vocab_map, vocab_terms, skip_pages, max_hints=3, max_df_share=0.6, db_path=None):
     """Surgical, zero-noise prompt lead detector (`PreInvocation` / `UserPromptSubmit`).
 
     Matches ONLY explicit named entities (`people/`, titles, `aliases:`, glossary), alphanumeric IDs/tickers,
@@ -1183,10 +1264,24 @@ def compute_prompt_hints(brain, prompt, idx, tag_vocab_map, vocab_terms, skip_pa
         elif len(re.sub(r"[^a-z0-9]", "", tl)) >= 6 and re.sub(r"[^a-z0-9]", "", tl) in comp:
             cands[t] = True
 
-    # 2. Alphanumeric IDs (contract numbers, tickers like DBX0AN, C24, IB-88663)
-    for m in re.finditer(r"\b(?=[A-Za-z0-9./-]*\d)[A-Za-z0-9][A-Za-z0-9./-]{1,}[A-Za-z0-9]\b", prompt):
+    # 2. Alphanumeric IDs & >=6-digit numeric contract/policy IDs (e.g. DBX0AN, C24, IB-88663, K52-2683649, OE-LJ111E, 1520815831)
+    for m in re.finditer(r"\b(?=[A-Za-z0-9./:-]*\d)[A-Za-z0-9][A-Za-z0-9./:-]{1,}[A-Za-z0-9]\b", prompt):
         tok = m.group(0)
-        if not re.match(r"^\d{1,2}$", tok) and not re.match(r"^20\d{2}(?:-\d{2}-\d{2})?$", tok):
+        # Skip ISO & localized dates (2027-01-01, 01.01.2027, 01.01.27, 11/2026, 2027)
+        if re.match(r"^(?:19|20)\d{2}(?:[-./]\d{1,2}(?:[-./]\d{1,2})?)?$", tok):
+            continue
+        if re.match(r"^\d{1,2}[./-]\d{1,2}(?:[./-](?:\d{2}|\d{4}))?$", tok):
+            continue
+        # Skip formatted prices / decimals / thousands (e.g. 8.499, 1.498,76, 4,90)
+        if re.match(r"^\d{1,3}(?:[.,]\d{3})+(?:[.,]\d{1,2})?$", tok) or re.match(r"^\d+[.,]\d+$", tok):
+            continue
+        has_alpha = bool(re.search(r"[A-Za-z]", tok))
+        digits_only = re.sub(r"\D", "", tok)
+        if has_alpha:
+            if _PROMPT_UNIT_RE.match(tok):
+                continue
+            cands.setdefault(tok, False)
+        elif tok.isdigit() and len(digits_only) >= 6:
             cands.setdefault(tok, False)
 
     # 3. Concrete domain tag & tag-synonym hits (skip structural/meta tags handled by dedicated routers)
@@ -1195,7 +1290,7 @@ def compute_prompt_hints(brain, prompt, idx, tag_vocab_map, vocab_terms, skip_pa
         "wissen", "calendar", "kalender", "mail", "sport", "coach",
     }
     canon = {s.lower(): t.lower() for t, syns in (tag_vocab_map or {}).items() for s in syns}
-    tag_pages = {}
+    tag_leaves, tag_hubs = {}, {}
     for tag, syns in (tag_vocab_map or {}).items():
         if tag.lower() in tag_ignore:
             continue
@@ -1209,26 +1304,24 @@ def compute_prompt_hints(brain, prompt, idx, tag_vocab_map, vocab_terms, skip_pa
                 r"(?<![\w-])" + re.escape(nw) + r"(?![\w-])"
             )
             if re.search(tag_pat, low):
-                tag_pages[tag] = [
+                tag_leaves[tag] = [
                     r for r, e in idx.items()
                     if r not in skip and not r.startswith("_") and not is_folder_hub(r)
                     and tag in {canon.get(t, t) for t in e.get("tags", [])}
                 ]
+                tag_hubs[tag] = [
+                    r for r, e in idx.items()
+                    if r not in skip and r.startswith("areas/") and r.count("/") == 2 and r.endswith("/README.md")
+                    and tag in {canon.get(t, t) for t in e.get("tags", [])}
+                ]
                 break
 
-    if not cands and not tag_pages:
+    if not cands and not tag_leaves and not tag_hubs:
         return [], []
 
     n = max(len(idx), 1)
     scores, hits = {}, {}
     canonical_prefixes = ("areas/", "projects/", "people/", "howto/", "self/", "calendar/", "coach/", "glossary.md")
-
-    for tag, pages in tag_pages.items():
-        if pages and len(pages) <= max_df_share * n:
-            idf = math.log(1 + n / len(pages))
-            for rel in pages:
-                scores[rel] = scores.get(rel, 0.0) + 1.5 * idf
-                hits.setdefault(rel, set()).add("#" + tag)
 
     if cands:
         conn = open_graph_db(brain, db_path)
@@ -1259,6 +1352,32 @@ def compute_prompt_hints(brain, prompt, idx, tag_vocab_map, vocab_terms, skip_pa
                     hits.setdefault(rel, set()).add(term)
         finally:
             conn.close()
+
+    for tag, leaves in tag_leaves.items():
+        hubs = tag_hubs.get(tag, [])
+        if not leaves and not hubs:
+            continue
+        if not hubs and len(leaves) > max_df_share * n:
+            continue
+        idf = math.log(1 + n / max(len(leaves), 1))
+        # Reinforce any leaf already matched via explicit entity/ID
+        matched_any_leaf = False
+        for rel in leaves:
+            if rel in scores:
+                scores[rel] += 1.0 * idf
+                hits.setdefault(rel, set()).add("#" + tag)
+                matched_any_leaf = True
+        if matched_any_leaf:
+            continue
+        # Broad domain query (>= 3 leaves under this tag) -> route to canonical Area Hub README instead of alphabetical leaf lottery
+        if len(leaves) >= 3 and hubs:
+            for h_rel in hubs:
+                scores[h_rel] = scores.get(h_rel, 0.0) + 2.5 * idf
+                hits.setdefault(h_rel, set()).add("#" + tag)
+        else:
+            for rel in leaves:
+                scores[rel] = scores.get(rel, 0.0) + 1.5 * idf
+                hits.setdefault(rel, set()).add("#" + tag)
 
     ranked = sorted(scores, key=lambda r: (-scores[r], r))[:max_hints]
     direct = [(rel, idx.get(rel, {}).get("summary", ""), sorted(hits[rel], key=str.lower)[:4]) for rel in ranked]

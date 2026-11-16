@@ -2,6 +2,19 @@
 
 Written for users: `/atlas-update` shows the sections between the installed and the new version.
 
+## [1.3.1] - 2026-11-16
+
+- **Zero-Turn-Waste Python Command & Anti-Cache-Grep Guard (`atlas_hook.py`, `router.md`, `atlas-search.md`, `atlas.py`):**
+  - **Auto-Detected `python3 -I` vs. `python -I`:** `_py_cmd()` in `atlas_hook.py` emits `python3 -I` on POSIX systems where `python` is absent, and `ROUTER.md` documents `python3 -I` (Windows: `python -I`), eliminating wasted `python: command not found` tool roundtrips on Turn 1.
+  - **Markdown-Only Header Grep Guard:** Clarifies in `ROUTER.md` and `atlas-search.md` never to raw-grep `_atlas/` (`calendar.html`) or `files/` attachment directories.
+  - **`core-apply` Updates `last_update_check`:** Running `/atlas-update` (`core-apply --execute`) now stamps `last_update_check` in `_atlas/state.json` so subsequent sessions do not create a redundant empty `atlas: update-check` commit.
+- **Niche Entity Recall, Strict Numeric/Date Filtering & Area Hub Routing (`atlas_hook.py`, `graph_engine.py`):**
+  - **Unaliased Niche Entity Recall (`_vocab`):** Extracts clean title heads (stripping `(...)` and `—` subtitles, legal suffixes like `e.V.`/`GmbH`/`GbR`, `: `/`&` sub-phrases), 2-word non-generic stem prefixes, and unambiguous `>= 6`-char stem nouns, while giving dedicated canonical pages priority over `glossary.md`.
+  - **Strict ID vs. Date/Currency/Unit Filter:** Prevents localized dates (`01.01.2027`, `11/2026`), formatted amounts (`8.499`, `4,90`), units (`145fps`, `14d`), and `< 6`-digit numbers (`145` EUR) from triggering false-positive ID leads, while preserving alphanumeric tickers/plates (`DBX0AN`, `C24`, `IB-88663`) and `>= 6`-digit contract/policy IDs; caps prompt leads at `MAX_HINTS = 3`.
+  - **Area Hub Routing on Broad Domain Queries:** When a domain tag (`#finanzen`, etc.) spans `>= 3` leaf pages without a specific leaf entity match, `compute_prompt_hints` surfaces the canonical `areas/<group>/README.md` hub instead of arbitrary alphabetical leaves.
+- **Multi-Word Phrase & Compound Tokenization in `atlas.py where` & `atlas.py find` (`graph_engine.py`, `atlas.py`):**
+  - **`_tokenize_search_terms`:** Splits quoted multi-word queries (`atlas.py where "Kfz-Versicherung Polestar 2"`) and hyphenated compounds into atomic non-stopword tokens while preserving exact phrase and model-bigram (`Polestar 2`, `Model Y`) boosts, and excludes structural folder hubs from `where` Section 1 candidate pages.
+
 ## [1.3.0] - 2026-11-16
 
 - **Surgical Push + Agentic Pull Architecture (`atlas_hook.py`, `graph_engine.py`, `router.md`, Core Skills):**

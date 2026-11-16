@@ -26,6 +26,7 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -49,7 +50,7 @@ MAX_ERR_LOG_BYTES = 50_000
 SKIP_DIRS = {".git", "_secrets", "_archive", "_atlas", "node_modules", "__pycache__", ".obsidian", ".trash"}
 TEXT_EXTS = {".md", ".txt"}
 CANONICAL = ("areas/", "projects/", "people/", "howto/", "self/", "calendar/", "coach/", "glossary.md", "INDEX.md")
-MAX_HINTS = 5
+MAX_HINTS = 3
 MAX_ROUTES = 3
 INDEX_BUDGET_S = 2.5   # hooks parse at most this long per call; `atlas.py index` builds the full cache
 MAX_DF_SHARE = 0.6
@@ -1661,10 +1662,11 @@ def session_text(cwd, session, skip_pull=False):
                 t_lines.append(f"  {t['num']}. [{t['badge']}] {k_tag}{t['what']}  [{loc}]")
             extra_note = f" (+{len(tasks) - len(top_tasks)} more open)" if len(tasks) > len(top_tasks) else ""
             tools_py = _show("_atlas/tools/atlas.py", cwd)
+            py = _py_cmd()
             parts.append(
                 f"Task check-in{extra_note} (once today — list numbered in the user's language and offer quick triage: "
                 f"check off [abhaken/done], reschedule [verschieben/move], or tackle now [jetzt angehen]; "
-                f"apply replies via `python -I {tools_py} todo done|move|skip ...`):\n"
+                f"apply replies via `{py} -I {tools_py} todo done|move|skip ...`):\n"
                 + "\n".join(t_lines)
             )
         cal_upcoming = []
@@ -1841,20 +1843,89 @@ def route(prompt, cwd, idx):
 
 # ---------------------------------------------------------------- prompt: knowledge hints
 
+_GENERIC_STEM_HEADS = {
+    "allgemein", "alltag", "analyse", "archiv", "archive", "area", "bereich", "business", "businessplan",
+    "checkliste", "coaching", "custom", "datums", "der", "die", "das", "dokumente", "dossier", "entscheidungsanalyse",
+    "experimente", "files", "financial", "finanzen", "fuhrpark", "funktionsspezifikation", "gaming", "gemeinsam",
+    "geometrie", "gesundheit", "gruendungsleitfaden", "guide", "hausrat", "howto", "hund", "ideale", "ideen",
+    "index", "insights", "karriere", "kognitive", "konten", "laufende", "laufwerke", "leitfaden", "leistungsnachweis",
+    "master", "masterplan", "mentale", "mental", "misc", "model", "modelle", "muster", "notes", "offene",
+    "optimierung", "overview", "people", "peripherie", "person", "persoenlicher", "philosophie", "physiologie",
+    "plan", "planung", "playbook", "privat", "project", "projects", "projekt", "projekte", "protokoll",
+    "psychometrie", "psychometrisches", "radsport", "readme", "rechnungsaufstellung", "referenzen", "regeln",
+    "reibung", "report", "roadmap", "router", "settings", "simulation", "sonstiges", "spiele", "steuern",
+    "strategische", "system", "tagesrhythmus", "technik", "template", "training", "uebersicht", "umfassende",
+    "unterlagen", "unternehmertum", "vergleich", "versicherungen", "vertraege", "vorlage", "werte", "wissen",
+    "wissensdatenbank", "wohnen", "wohnung", "zeitformate", "ziele",
+}
+
+
+def _py_cmd():
+    if os.name != "nt" and shutil.which("python3") and not shutil.which("python"):
+        return "python3"
+    return "python"
+
+
 def _vocab(idx, skip_pages):
     terms = {}
-    for t in idx.get("glossary.md", {}).get("glossary", []):
-        terms[t] = "glossary.md"
+    derived = {}  # norm_term -> list of (rel, raw_term)
+
+    def _add_derived(raw_t, dst_rel):
+        cleaned = re.sub(r"\s+", " ", str(raw_t or "")).strip(" -–—:·,;/|")
+        nl = graph_engine.norm_text(cleaned).strip()
+        if not nl or len(nl) < 4 or len(nl) > 60:
+            return
+        if nl in graph_engine.PROMPT_STOPWORDS or nl in _GENERIC_STEM_HEADS:
+            return
+        if re.match(r"^(?:\d+|\d{4}-\d{2}-\d{2})$", nl):
+            return
+        derived.setdefault(nl, []).append((dst_rel, cleaned))
+
     for rel, e in idx.items():
         if rel in skip_pages or not rel.startswith(("people/", "areas/", "howto/", "projects/", "self/")):
             continue
+        if "/files/" in rel:
+            continue
         title = e.get("title", "")
-        if 3 <= len(title) <= 60 and not rel.endswith("README.md"):
+        is_hub = rel.endswith("README.md") and not (rel.startswith("projects/") and rel.count("/") == 2)
+        if 3 <= len(title) <= 70 and not is_hub:
             terms.setdefault(title, rel)
-        if not rel.endswith("README.md"):
-            stem = os.path.splitext(os.path.basename(rel))[0].replace("-", " ").replace("_", " ").strip()
+        if not is_hub:
+            # Clean title without parentheticals or dash subtitles (e.g. "VeloClub e.V. (Charter)" -> "VeloClub e.V.")
+            base_title = re.sub(r"^[^\wA-Za-zÄÖÜäöüß]+", "", title)
+            base_title = re.sub(r"(?i)^(?:project|projekt|person|area|bereich)\s*:\s*", "", base_title).strip()
+            base_title = re.split(r"\s+[—–]\s+|\s+-\s+(?=[A-ZÄÖÜ])", base_title)[0]
+            base_title = re.sub(r"\s*\([^)]*\)\s*", " ", base_title)
+            base_title = re.sub(r"\s+", " ", base_title).strip()
+            if 4 <= len(base_title) <= 60 and base_title != title:
+                _add_derived(base_title, rel)
+            # Strip legal suffixes (e.g. "VeloClub e.V." -> "VeloClub")
+            org_base = re.sub(r"(?i)\s+(?:e\.?\s*v\.?|gmbh|gbr|ag|ug|se|kg|inc\.?|llc)$", "", base_title).strip()
+            if 4 <= len(org_base) <= 50 and org_base != base_title:
+                _add_derived(org_base, rel)
+            # Sub-phrases split by `: `, ` & `, ` / `, ` · ` (e.g. "Business Plan: vello.io", "Solar Roof & Battery")
+            for part in re.split(r"\s*(?::|&|\+|/|·)\s*", base_title):
+                part = part.strip()
+                p_words = [graph_engine.norm_text(w) for w in re.findall(r"[\w.-]+", part)]
+                if part and not all(w in _GENERIC_STEM_HEADS or w in graph_engine.PROMPT_STOPWORDS for w in p_words):
+                    _add_derived(part, rel)
+            # Stem & stem prefixes (e.g. "trek-madone-sl7" -> "trek madone", "hund-planung-pudel" -> "pudel")
+            raw_stem = os.path.splitext(os.path.basename(rel))[0]
+            stem = raw_stem.replace("-", " ").replace("_", " ").strip()
             if 4 <= len(stem) <= 60 and stem.lower() not in ("index", "readme") and not re.match(r"^\d{4}", stem):
                 terms.setdefault(stem, rel)
+                for chunk in re.split(r"\s+(?:und|and|vs|oder|mit)\s+", stem, flags=re.IGNORECASE):
+                    c_words = [graph_engine.norm_text(w) for w in chunk.split() if w]
+                    if c_words and not all(w in _GENERIC_STEM_HEADS or w in graph_engine.PROMPT_STOPWORDS for w in c_words):
+                        _add_derived(chunk, rel)
+                s_words = stem.split()
+                if len(s_words) >= 3 and graph_engine.norm_text(s_words[0]) not in _GENERIC_STEM_HEADS and graph_engine.norm_text(s_words[0]) not in graph_engine.PROMPT_STOPWORDS:
+                    if graph_engine.norm_text(s_words[1]) not in ("und", "and", "mit", "fuer", "fur", "von", "im", "in"):
+                        _add_derived(f"{s_words[0]} {s_words[1]}", rel)
+                for sw in s_words:
+                    nsw = graph_engine.norm_text(sw)
+                    if len(nsw) >= 6 and nsw.isalpha() and nsw not in _GENERIC_STEM_HEADS and nsw not in graph_engine.PROMPT_STOPWORDS:
+                        _add_derived(sw, rel)
         if rel.startswith("people/") and title:
             words = title.split()
             if len(words) >= 2 and len(words[-1]) >= 4:
@@ -1863,6 +1934,22 @@ def _vocab(idx, skip_pages):
                 terms.setdefault(words[0], rel)
         for a in e.get("aliases", []):
             terms.setdefault(a, rel)
+
+    existing_norm = {graph_engine.norm_text(k).strip() for k in terms}
+    for nl, entries in derived.items():
+        if nl in existing_norm:
+            continue
+        rels = sorted({r for r, _raw in entries}, key=lambda r: (len(r), r))
+        # Accept if unambiguous, or if all candidate pages live in the exact same parent folder (pick shortest canonical path)
+        parents = {os.path.dirname(r) for r in rels}
+        if len(rels) == 1 or len(parents) == 1:
+            chosen_rel = rels[0]
+            disp = next(raw for r, raw in entries if r == chosen_rel)
+            terms.setdefault(disp, chosen_rel)
+            existing_norm.add(nl)
+    for t in idx.get("glossary.md", {}).get("glossary", []):
+        if graph_engine.norm_text(t).strip() not in existing_norm:
+            terms.setdefault(t, "glossary.md")
     return terms
 
 
@@ -2022,6 +2109,7 @@ def prompt_text(prompt, cwd, session):
 
     # 3. Domain & user-extension routers (Coach, Mail, Tasks/Calendar, Custom Skills — only outside code-project mode)
     tools_py = _show("_atlas/tools/atlas.py", cwd)
+    py = _py_cmd()
     if not in_project and not routes:
         coach_enabled = (
             "coach" in st.get("modules", [])
@@ -2037,7 +2125,7 @@ def prompt_text(prompt, cwd, session):
                     stale_note = f" Macro plan is STALE ({c_macro.get('stale_reason')}) -> update brain/coach/macro-plan.md FIRST before writing 14d workouts."
                 depth_flag = " --depth pro" if (c_mode == "dna" or coach_engine.PRO_QUERY_RX.search(prompt)) else ""
                 lines.append(
-                    f"Atlas coach -> mode '{c_mode}' ({c_why}). Run `python -I {tools_py} coach context --mode {c_mode}{depth_flag}` "
+                    f"Atlas coach -> mode '{c_mode}' ({c_why}). Run `{py} -I {tools_py} coach context --mode {c_mode}{depth_flag}` "
                     f"and follow {_show('_atlas/procedures/coach.md', cwd)}.{stale_note}"
                 )
                 sess["coach_mode"] = c_mode
@@ -2046,14 +2134,14 @@ def prompt_text(prompt, cwd, session):
             user_mail_sk = os.path.join(BRAIN, "skills", "atlas-mail", "SKILL.md")
             overlay_bit = f" + {_show('skills/atlas-mail/SKILL.md', cwd)}" if os.path.isfile(user_mail_sk) else ""
             lines.append(
-                f"Atlas mail -> Run `python -I {tools_py} mail accounts|list|search|read ...` and follow {mail_proc}{overlay_bit}."
+                f"Atlas mail -> Run `{py} -I {tools_py} mail accounts|list|search|read ...` and follow {mail_proc}{overlay_bit}."
             )
         if not c_mode and TODO_RX.search(prompt):
             lines.append(
-                f"Atlas tasks/calendar -> Use `python -I {tools_py} todo` (`list|done|move|skip|add`) or `python -I {tools_py} calendar`."
+                f"Atlas tasks/calendar -> Use `{py} -I {tools_py} todo` (`list|done|move|skip|add`) or `{py} -I {tools_py} calendar`."
             )
         for ext_name, ext_rel, ext_cmd in _detect_user_extensions(prompt)[:2]:
-            cli_bit = f"; CLI: `python -I {tools_py} {ext_cmd} ...`" if ext_cmd else ""
+            cli_bit = f"; CLI: `{py} -I {tools_py} {ext_cmd} ...`" if ext_cmd else ""
             lines.append(f"Atlas user extension -> skill '{ext_name}' ({_show(ext_rel, cwd)}){cli_bit}.")
 
     # 4. Capture-first signals (explicit "remember", corrections, and substantive new facts/dates/amounts)
@@ -2082,7 +2170,7 @@ def prompt_text(prompt, cwd, session):
         else:
             found = []
         if found:
-            lines.append("Atlas entity leads (use `atlas.py find <words>` if you need broader search):")
+            lines.append(f"Atlas entity leads (use `{py} -I {tools_py} find <words>` if you need broader search):")
             for rel, summary, terms in found:
                 lines.append(f"- {_show(rel, cwd)}" + (f" — {summary}" if summary else "") + f" [{', '.join(terms)}]")
     _save_state(st)

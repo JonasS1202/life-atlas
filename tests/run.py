@@ -1745,6 +1745,90 @@ class UiReleaseV11(AtlasCase):
         self.assertNotIn("ERROR", chk_final, chk_final)
         self.assertNotIn("exceeds 2400", chk_final, chk_final)
 
+    def test_v131_niche_entity_recall_numeric_filter_where_phrases_and_py_cmd(self):
+        # 1. Niche leaf pages WITHOUT explicit `aliases:` (long titles with subtitles/parens, stem prefixes, org suffixes)
+        self.page("tags.md", (
+            "# Tags\n\n| Tag | Meaning | Synonyms |\n|---|---|---|\n"
+            "| **finanzen** | Money | budget, haushaltsbudget, cashflow, konto |\n"
+            "| **versicherung** | Insurance | police, kasko |\n"
+            "| **mobilitaet** | Vehicles | auto, fahrzeug |\n"
+            "| **technik** | Tech | hardware, gpu |\n"
+        ))
+        self.page("glossary.md", "---\nsummary: Glossary\ntags: [atlas]\n---\n# Glossary\n- **VeloClub**: Local cycling club\n")
+        self.page("areas/sport/trek-madone-sl7.md", (
+            "---\nsummary: Trek Madone SL7 (7.90 kg scale weight) build dossier\ntags: [technik]\n---\n"
+            "# Trek Madone SL7 (2024) Custom Race Build — Master Dossier\n\nScale weight: 7.90 kg.\n"
+        ))
+        self.page("areas/sport/veloclub-ev.md", (
+            "---\nsummary: Club charter and registration\ntags: [technik]\n---\n"
+            "# VeloClub e.V. (Founding & Charter)\n\nRegistration notes.\n"
+        ))
+        self.page("areas/technik/gpu-benchmark.md", (
+            "---\nsummary: GPU benchmark at 145 FPS target for 01.01.2027\ntags: [technik]\n---\n"
+            "# GPU Upgrade Analysis (2026)\n\nTarget: 145 FPS by 01.01.2027 for 8.499 points.\n"
+        ))
+        self.page("areas/wohnen/versicherungen.md", (
+            "---\nsummary: All policies including Car Insurance for Polestar 2\ntags: [versicherung, finanzen]\n"
+            "aliases: [Kfz-Versicherung, Versicherungen]\n---\n# Versicherungen (Privat)\n\nPolestar 2 policy: 980 EUR/yr.\n"
+        ))
+        self.page("areas/wohnen/fuhrpark-polestar.md", (
+            "---\nsummary: Polestar 2 Long Range (VIN PS99887766) fleet & charging\ntags: [mobilitaet, finanzen]\n"
+            "aliases: [Polestar, Polestar 2]\n---\n# Fuhrpark: Polestar 2\n\nInsurance linked to versicherungen.md.\n"
+        ))
+        # Create >= 3 finance leaves + an Area Hub README to verify Area Hub routing on broad domain queries
+        self.page("areas/finanzen/README.md", "---\nsummary: Household finances hub\ntags: [finanzen]\n---\n# Finanzen\n")
+        for i, slug in enumerate(("konto-a", "depot-b", "steuern-c"), 1):
+            self.page(f"areas/finanzen/{slug}.md", f"---\nsummary: Finance leaf {i} (99001122{i})\ntags: [finanzen]\n---\n# Leaf {i}\nRef 01.01.2027 and 99001122{i}.\n")
+        self.atlas("index")
+
+        # 2. Niche recall: "Trek Madone" (2-word stem/title prefix without SL7) & "VeloClub" (canonical page beats glossary.md)
+        h_niche = self.hook("antigravity", "prompt", {
+            "conversationId": "v131-niche",
+            "invocationNum": 0,
+            "lastUserInput": "Ich brauche kurz für mich selbst eine Antwort: Was wiegt mein Trek Madone und was ist bei VeloClub offen?",
+            "workspacePaths": [fwd(self.root)],
+        })
+        self.assertIn("areas/sport/trek-madone-sl7.md", h_niche)
+        self.assertIn("areas/sport/veloclub-ev.md", h_niche)
+        self.assertNotIn("glossary.md", h_niche)
+
+        # 3. Numeric/date false-positive filter + Area Hub preference on broad domain queries
+        h_budget = self.hook("antigravity", "prompt", {
+            "conversationId": "v131-budget",
+            "invocationNum": 0,
+            "lastUserInput": "Rein hypothetisch (off the record): Wenn ab 01.01.2027 145 € für ein Rad abgingen, was macht das mit dem Haushaltsbudget für 8.499 €?",
+            "workspacePaths": [fwd(self.root)],
+        })
+        self.assertIn("Atlas privacy guard (do-not-store)", h_budget)
+        self.assertNotIn("gpu-benchmark.md", h_budget)
+        self.assertIn("areas/finanzen/README.md", h_budget)
+        # Meanwhile >=6-digit contract IDs still resolve directly to the exact leaf page
+        h_id = self.hook("antigravity", "prompt", {
+            "conversationId": "v131-id",
+            "invocationNum": 0,
+            "lastUserInput": "Prüfe Vertrag 990011222",
+            "workspacePaths": [fwd(self.root)],
+        })
+        self.assertIn("areas/finanzen/depot-b.md", h_id)
+
+        # 4. `atlas.py where "<multi-word phrase>"` tokenizes phrases & compounds and skips structural hubs in Section 1
+        w_out = self.atlas("where", "Kfz-Versicherung Polestar 2").stdout
+        self.assertNotIn("(no existing page matched", w_out)
+        sec1 = w_out.split("=== 2. BRAIN GROUPS")[0]
+        self.assertIn("areas/wohnen/versicherungen.md", sec1)
+        self.assertIn("areas/wohnen/fuhrpark-polestar.md", sec1)
+        self.assertNotIn("areas/finanzen/README.md", sec1)
+
+        # 5. `core-apply --execute` records `last_update_check` in `state.json`
+        up_repo = os.path.join(self.tmp, "up_131")
+        shutil.copytree(REPO, up_repo, ignore=shutil.ignore_patterns(".git", "__pycache__", "_atlas"))
+        with open(os.path.join(up_repo, "core", "VERSION"), "w", encoding="utf-8") as fh:
+            fh.write("9.9.9\n")
+        self.wire_both()
+        self.atlas("core-apply", "--source", up_repo, "--execute")
+        st = json.loads(self.read(os.path.join(self.brain, "_atlas", "state.json")))
+        self.assertTrue(bool(st.get("last_update_check")))
+
 
 if __name__ == "__main__":
     os.makedirs(BASE_DIR, exist_ok=True)
