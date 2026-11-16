@@ -1553,6 +1553,13 @@ def foreign_items(root, user_home=None):
             and not (i["global"] and os.path.normcase(i["path"]) in snapshot)]
 
 
+def ensure_calendar_ready(idx=None, start_server=False):
+    """Render `CAL_HTML` only when stale/missing or on day rollover; always ensure loopback server when requested."""
+    if _calendar_needs_render():
+        return render_calendar_html(idx=idx, start_server=start_server)
+    return _ensure_calendar_server(os.path.dirname(CAL_HTML), start_server=start_server)
+
+
 def session_warmup(cwd, session):
     """Warm up git remote, SQLite index & loopback calendar server on Antigravity `SessionStart` without burning daily state."""
     st = _state()
@@ -1566,7 +1573,7 @@ def session_warmup(cwd, session):
         st["pending_pull_msg"] = (prev + "\n" + msg).strip() if prev and msg not in prev else (msg or prev)
     idx = load_index(budget=INDEX_BUDGET_S)
     try:
-        render_calendar_html(idx, start_server=True)
+        ensure_calendar_ready(idx, start_server=True)
     except Exception as exc:
         _log_hook_error("warmup.render_calendar", exc)
     if session:
@@ -1646,7 +1653,7 @@ def session_text(cwd, session, skip_pull=False):
             parts.append("Calendar & deadlines:\n" + "\n".join(cal_upcoming))
         if not PROBE:
             try:
-                cal_uri = render_calendar_html(idx, start_server=True)
+                cal_uri = ensure_calendar_ready(idx, start_server=True)
                 parts.append(f"Visual calendar: [📅 Kalender öffnen]({cal_uri}) (include this clickable link in the briefing)")
             except Exception as exc:
                 _log_hook_error("session.render_calendar", exc)
@@ -1706,7 +1713,7 @@ def session_text(cwd, session, skip_pull=False):
     else:
         if not PROBE:
             try:
-                render_calendar_html(idx, start_server=True)
+                ensure_calendar_ready(idx, start_server=True)
             except Exception as exc:
                 _log_hook_error("session.render_calendar", exc)
         urgent = [d for d in due if d[1] <= 0]
@@ -2106,11 +2113,13 @@ def _decide(session, marker_seen, did_work):
 
 
 def _calendar_needs_render():
-    """Return True only when `CAL_HTML` is missing or relevant calendar/coach/due sources are newer than `CAL_HTML`."""
+    """Return True only when `CAL_HTML` is missing, from a prior day, or relevant calendar/coach/due sources are newer."""
     try:
         if not os.path.isfile(CAL_HTML):
             return True
         cal_mtime = os.path.getmtime(CAL_HTML)
+        if dt.date.fromtimestamp(cal_mtime) != dt.date.today():
+            return True
     except OSError:
         return True
     for single in (os.path.join(BRAIN, "settings.md"), os.path.join(BRAIN, "_secrets", "strava.env")):
@@ -2230,9 +2239,9 @@ def main():
             need_session = (not session) or (sess_pre.get("session_injected") != today)
             s_out = ""
             if need_session:
-                warmed = sess_pre.get("warmed_at", "")
-                skip_pull = bool(warmed and ((_age_days(warmed) or 1.0) * 86400 < 120))
-                s_out = session_text(cwd, session, skip_pull=skip_pull)
+                # `SessionStart` (`session_warmup`) owns git pull in Antigravity so `PreInvocation` stays <300 ms
+                # and never collides with a concurrent `SessionStart` on `.git/index.lock`.
+                s_out = session_text(cwd, session, skip_pull=True)
             p_out = prompt_text(prompt, cwd, session)
             emit_context(agent, event, "\n".join(x for x in (s_out, p_out) if x))
             return

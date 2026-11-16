@@ -24,7 +24,7 @@ EDGE_WEIGHTS = {
     "tree": 0.0,
 }
 
-LINK_RX = re.compile(r"(?<!!)\[([^\]]*)\]\(([^)\s]+)\)")
+LINK_RX = re.compile(r"(?<!!)\[([^\]\r\n]*)\]\(([^)\s]+)\)")
 WIKILINK_RX = re.compile(r"(?<!!)\[\[([^\[\]\r\n]+?)\]\]")
 TICK_RX = re.compile(
     r"`((?:brain/)?(?:areas|projects|people|howto|journal|inbox|self|skills|calendar|coach|_atlas)/[^`\s]+\.md)`"
@@ -33,7 +33,8 @@ BRAIN_PATH_RX = re.compile(
     r"(`?)((?:brain/)?(?:areas|projects|people|howto|journal|inbox|self|skills|calendar|coach)/"
     r"[^\s`()\[\]<>\"',;:]+?\.md)\1"
 )
-HEADING_RX = re.compile(r"(?m)^(#{1,6})\s+(.+?)\s*#*\s*$")
+HEADING_RX = re.compile(r"(?m)^(#{1,6})[ \t]+([^\r\n]+?)[ \t]*#*[ \t]*$")
+_H1_RX = re.compile(r"(?m)^#[ \t]+([^\r\n]+?)[ \t]*#*[ \t]*$")
 LOCAL_EXT_RX = re.compile(
     r"(?i)\.(?:pdf|png|jpe?g|webp|gif|svg|txt|md|csv|tsv|json|ya?ml|xml|ics|eml|msg|docx?|xlsx?|pptx?|zip|html?)$"
 )
@@ -233,30 +234,78 @@ def mask_fenced_and_fm(text):
     return "".join(out)
 
 
-INLINE_CODE_RX = re.compile(r"(`+)([^`\n]|(?!\1)`)+?\1")
+def _mask_inline_code_line(line):
+    """Linear-time CommonMark single-line backtick span masker (`O(L)`, zero regex backtracking)."""
+    if "`" not in line:
+        return line
+    n = len(line)
+    chars = list(line)
+    i = 0
+    while i < n:
+        if chars[i] != "`":
+            i += 1
+            continue
+        j = i
+        while j < n and chars[j] == "`":
+            j += 1
+        run_len = j - i
+        k = j
+        closed_end = -1
+        while k < n:
+            if chars[k] != "`":
+                if chars[k] in ("\r", "\n"):
+                    break
+                k += 1
+                continue
+            m_end = k
+            while m_end < n and chars[m_end] == "`":
+                m_end += 1
+            if (m_end - k) == run_len:
+                closed_end = m_end
+                break
+            k = m_end
+        if closed_end > 0:
+            for p in range(i, closed_end):
+                if chars[p] not in ("\r", "\n"):
+                    chars[p] = " "
+            i = closed_end
+        else:
+            i = j
+    return "".join(chars)
 
 
 def mask_all_code(text):
     """Blank YAML frontmatter, fenced code blocks, and inline code spans (`...`), preserving exact string offsets."""
     masked = mask_fenced_and_fm(text)
-    return INLINE_CODE_RX.sub(lambda m: _blank_keep_nl(m.group(0)), masked)
+    if "`" not in masked:
+        return masked
+    return "".join(_mask_inline_code_line(ln) for ln in masked.splitlines(keepends=True))
+
+
+_PROSE_MASK_PATTERNS = (
+    re.compile(r"(?m)^#{1,6}[ \t]+[^\r\n]*$"),
+    re.compile(r"!?\[[^\]\r\n]*\]\([^)\r\n]*\)"),
+    re.compile(r"!?\[[^\]\r\n]*\]\[[^\]\r\n]*\]"),
+    re.compile(r"!?\[\[[^\[\]\r\n]+\]\]"),
+    re.compile(r"(?:(?:https?|file)://|mailto:)[^\s<>)\]]+"),
+    re.compile(r"<[^>\r\n]+>"),
+)
 
 
 def mask_prose_for_mentions(text, mask_inline_code=True):
     """Blank frontmatter, code, headings, existing links/wikilinks, URLs, HTML tags, and table separator lines."""
     masked = mask_all_code(text) if mask_inline_code else mask_fenced_and_fm(text)
-    patterns = (
-        r"(?m)^#{1,6}\s+.*$",
-        r"!?\[[^\]]*\]\([^)]*\)",
-        r"!?\[[^\]]*\]\[[^\]]*\]",
-        r"!?\[\[[^\[\]\r\n]+\]\]",
-        r"(?:(?:https?|file)://|mailto:)[^\s<>)\]]+",
-        r"<[^>]+>",
-        r"(?m)^\s*\|?[\s:-]+\|[\s|:-]*$",
-    )
-    for pat in patterns:
-        masked = re.sub(pat, lambda m: _blank_keep_nl(m.group(0)), masked)
-    return masked
+    for rx in _PROSE_MASK_PATTERNS:
+        masked = rx.sub(lambda m: _blank_keep_nl(m.group(0)), masked)
+    out_lines = []
+    for ln in masked.splitlines(keepends=True):
+        if "|" in ln and "-" in ln:
+            s = ln.strip()
+            if s and all(c in "|-: \t" for c in s):
+                out_lines.append(_blank_keep_nl(ln))
+                continue
+        out_lines.append(ln)
+    return "".join(out_lines)
 
 
 # ---------------------------------------------------------------- parsing & link resolution
@@ -314,10 +363,10 @@ def _parse_page_file(full_path, rel):
     masked_fenced = mask_fenced_and_fm(text)
 
     headings = extract_headings(text, masked_code)
-    m_h1 = re.search(r"(?m)^#\s+(.+?)\s*#*\s*$", masked_code)
+    m_h1 = _H1_RX.search(masked_code)
     if m_h1:
         raw_h1 = text[m_h1.start():m_h1.end()]
-        hm1 = re.match(r"^#\s+(.+?)\s*#*\s*$", raw_h1)
+        hm1 = _H1_RX.match(raw_h1)
         title = re.sub(r"[`*_]", "", hm1.group(1) if hm1 else m_h1.group(1)).strip()
     else:
         title = ""

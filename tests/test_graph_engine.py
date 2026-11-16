@@ -150,6 +150,25 @@ class GraphEngineUnit(unittest.TestCase):
         self.assertIn("areas/finanzen/depot.md", n_rels)
         self.assertGreater(neighbors[0][1], neighbors[1][1])
 
+    def test_linear_time_prose_masking_on_large_fenced_blocks_and_unclosed_backticks(self):
+        import time
+        # 75 KB page with 40 KB of fenced code blocks (blanked into whitespace + colons/dashes) + unclosed backticks:
+        # previously triggered O(N^3) catastrophic regex backtracking (>180s CPU hang) in `mask_prose_for_mentions`.
+        big_code = "```yaml\n" + ("  key_name: value-item-123\n" * 1600) + "```\n"
+        unclosed_ticks = "``unclosed double tick " + ("`single` " * 400) + "\n"
+        table_block = "| Col A | Col B |\n| :--- | ---: |\n| Erika Muster | 100 |\n"
+        doc = "---\nsummary: Spec\ntags: [work]\n---\n# Große Spezifikation\n\n" + big_code + unclosed_ticks + table_block
+        self.assertGreater(len(doc), 45_000)
+
+        t0 = time.monotonic()
+        masked = graph_engine.mask_prose_for_mentions(doc, mask_inline_code=True)
+        elapsed = time.monotonic() - t0
+        self.assertLess(elapsed, 0.25, f"mask_prose_for_mentions took {elapsed:.3f}s (expected <0.25s linear time)")
+        self.assertEqual(len(masked), len(doc))
+        self.assertIn("Erika Muster", masked)
+        self.assertNotIn(":---", masked)
+        self.assertNotIn("key_name", masked)
+
 
 if __name__ == "__main__":
     unittest.main()

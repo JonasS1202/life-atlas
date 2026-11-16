@@ -2,6 +2,12 @@
 
 Written for users: `/atlas-update` shows the sections between the installed and the new version.
 
+## [1.2.1] - 2026-11-16
+
+- **Critical Hook Performance Fix — Eliminate Catastrophic Regex Backtracking (`graph_engine.py`, `atlas_hook.py`, `atlas.py`):**
+  - **`O(N)` Linear-Time Prose & Code Masking (`mask_prose_for_mentions`, `mask_all_code`):** Replaced the multiline table-separator regex (`r"(?m)^\s*\|?[\s:-]+\|[\s|:-]*$"` — where `\s` matched across `\n` inside large blanked fenced code blocks and caused multi-minute `O(N³)` CPU hangs exceeding the 10s/15s hook timeout) and backtracking backtick regexes with pre-compiled single-line patterns and deterministic linear-time scanners (`>200 s` hang $\rightarrow$ `36 ms` across 100+ pages).
+  - **Conditional `calendar.html` Rendering & Lock-Free `PreInvocation`:** `session_warmup()` and `session_text()` now skip rebuilding `calendar.html` when already fresh today (`ensure_calendar_ready`, `<2 ms`), and Antigravity `PreInvocation` never runs a second concurrent `git pull` alongside `SessionStart` (raising `PreInvocation` timeout to `15 s`).
+
 ## [1.2.0] - 2026-11-16
 
 - **Reliable Antigravity 2.0 Hook Delivery (`atlas_hook.py`, `adapters.md`):**

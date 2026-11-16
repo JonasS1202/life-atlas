@@ -545,7 +545,7 @@ def _wire_antigravity(args, root, brain, user_home, python, remove, t):
             "SessionStart": [{"type": "command", "command": _hook_cmd(brain, python, "antigravity", "session"),
                               "timeout": 15}],
             "PreInvocation": [{"type": "command", "command": _hook_cmd(brain, python, "antigravity", "prompt"),
-                               "timeout": 10}],
+                               "timeout": 15}],
             "Stop": [{"type": "command", "command": _hook_cmd(brain, python, "antigravity", "stop"), "timeout": 30}],
         }
     if json.dumps(hooks, sort_keys=True) != before:
