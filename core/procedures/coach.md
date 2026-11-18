@@ -99,3 +99,15 @@ All credentials stay local in `brain/_secrets/*.env` (`chmod 600`):
    - **`GELB-B` Rule (Subjective Peripheral Overrides HRV!):** If autonomic `HRV`/`RHR` is green, yet local leg pain is high ("Beine wie Beton") or yesterday's `Q_Strain` spiked, peripheral Type-II / intramyofibrillar glycogen stores are depleted -> **postpone HIIT 24–48 h**!
    - When anchors are missing/stale, schedule standardized tests via `atlas.py coach field-test --unit 1|2|preload|lsct --date YYYY-MM-DD --execute`.
    - Always include the exact Dashboard URL printed by `atlas.py coach context` (fallback: `[📅 Coach Dashboard öffnen](http://127.0.0.1:8765/calendar.html?view=coach)`) when plans, workouts, or telemetry are discussed.
+
+---
+
+## 6. Exact File & DSL Schemas (Zero Source-Code Archaeology!)
+
+Do **NOT** `grep` or read `_atlas/tools/*.py` or `_atlas/hooks/*.py` to check parser formats — use these exact canonical schemas directly (and remember `atlas.py coach context` already includes `profile.md` & `playbook.md`, so do not re-read them unless editing):
+
+- **Calendar Workout Line (`brain/calendar/README.md` under `## Timeline`):**
+  `- [ ] YYYY-MM-DD HH:MM [workout:cycling|running|strength] Title (75m | 15m WU 52-68%, 4x 8m@102% / 4m@55%, 20m Z2@68%, 8m CD 62-48%)`
+  *(Supported cycling DSL tokens inside `(<total>m | ...)`: `15m WU 52-70%`, `5x 30s@125% / 15s@50%`, `4x 8m@102% / 4m@55%`, `35m Z2@68%`, `12m ramp 70-95%`, `15m free`, `10m CD 62-48%`. Keep `>= 6h` separation between `[workout:running|cycling]` and `[workout:strength]` to avoid `AMPK/mTORC1` interference!)*
+- **`brain/coach/macro-plan.md`:** Frontmatter must include `updated: YYYY-MM-DD`, `active_phase: <Phase>`, `goals_hash: <current_goals_hash>`; weekly table columns: `| KW | Monday | Phase | Target Volume | Cycling Focus | Running / Strength Focus | Blockers & Notes |`.
+- **`brain/coach/dna.md`:** Frontmatter must include `updated: YYYY-MM-DD`, `archetype: ...`, `primary_limiter: ...`, `confidence: ...`, plus a trailing fenced `json` statcard block: `{"updated": "YYYY-MM-DD", "archetype": "...", "primary_limiter": "...", "confidence": "...", "scores": {"peak_shape": 0-100, "freshness": 0-100, "durability": 0-100, "trajectory": 0-100}}`.

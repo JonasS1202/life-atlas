@@ -3072,6 +3072,7 @@ def _coach_context(
             f"`goals_hash: {macro['current_goals_hash']}`) BEFORE writing 14-day workouts in `brain/calendar/README.md`!")
     cal_url_ctx = hk.render_calendar_html(idx, start_server=True)
     base_url_ctx = cal_url_ctx.rsplit("/", 1)[0]
+    say(f"  Dashboard URL: [📅 Coach Dashboard öffnen]({cal_url_ctx}?view=coach)")
     if c_state["strava_connected"]:
         say(f"  Strava: connected ({len(c_state['activities'])} cached activities)")
     else:
@@ -3110,30 +3111,37 @@ def _coach_context(
         say("\n" + coach_engine.format_pro_telemetry_block(telemetry))
     say("\n" + coach_engine.format_seven_pillar_blocks(telemetry))
 
+    def _strip_fm(md_s: str) -> str:
+        return re.sub(r"^---\s*\n.*?\n---\s*\n+", "", md_s or "", count=1, flags=re.S).strip()
+
     if pb_text.strip():
         say("\n=== 2A. ATHLETE PLAYBOOK & FEELINGS-FILE (brain/coach/playbook.md) ===")
-        say(pb_text.strip()[:6000])
+        say(_strip_fm(pb_text)[:6000])
 
     say("\n=== 2. ATHLETE PROFILE & THRESHOLDS (brain/coach/profile.md) ===")
     if prof_text:
-        say(prof_text.strip())
+        say(_strip_fm(prof_text))
 
     say("\n=== 3. MACRO PERIODIZATION (brain/coach/macro-plan.md) ===")
     macro_path = os.path.join(brain, "coach", "macro-plan.md")
     if os.path.isfile(macro_path):
         if eff_mode == "macro" or macro["stale"]:
-            say(read(macro_path).strip())
+            say(_strip_fm(read(macro_path)))
         else:
             say(f"Active Phase: {macro['active_phase']} (updated {macro['updated']})")
-            for w in macro.get("weeks", [])[:8]:
+            wks = macro.get("weeks", [])
+            cur_w = macro.get("current_week")
+            start_idx = next((idx_w for idx_w, w_item in enumerate(wks) if cur_w and w_item.get("monday") == cur_w.get("monday")), 0)
+            horizon_n = 4 if eff_mode in ("daily", "checkin") else 8
+            for w in wks[start_idx:start_idx + horizon_n]:
                 say(f"  KW {w['kw']} ({w['monday']}): Phase={w['phase']} | Vol={w['hours']} | "
                     f"Cycling={w['cycling']} | Run/Strength={w['running_strength']} | Notes={w['notes']}")
 
-    if eff_mode in ("plan-14d", "macro") or depth == "pro":
+    if eff_mode in ("plan-14d", "macro", "dna"):
         say("\n=== 4. 3-EPOCH POWER & PACE CURVE (brain/coach/power-curve.md) ===")
         pc_path = os.path.join(brain, "coach", "power-curve.md")
         if os.path.isfile(pc_path):
-            say(read(pc_path).strip())
+            say(_strip_fm(read(pc_path)))
 
     say("\n=== 5. CALENDAR HORIZON (brain/calendar/README.md) ===")
     goals = [i for i in all_cal if i["kind"] == "goal" and i["delta"] >= 0 and i["status"] == "open"]
@@ -3161,14 +3169,16 @@ def _coach_context(
     if not workouts:
         say("  (none)")
 
-    say("\n=== 6. ACTIVITY & FEEDBACK LOG (brain/coach/activities.md) ===")
+    say("\n=== 6. ACTIVITY & FEEDBACK LOG (brain/coach/activities.md — Tier 1 Recent; run `atlas.py coach history` for >21d sessions) ===")
     act_md_path = os.path.join(brain, "coach", "activities.md")
     if os.path.isfile(act_md_path):
-        act_text = read(act_md_path).strip()
-        if eff_mode in ("daily", "checkin") and "## Tier 2" in act_text:
-            say(act_text[:act_text.index("## Tier 2")].strip())
-        elif eff_mode == "plan-14d" and "## Tier 3" in act_text:
-            say(act_text[:act_text.index("## Tier 3")].strip())
+        act_text = _strip_fm(read(act_md_path))
+        if "## Tier 2" in act_text:
+            tier1_part = act_text[:act_text.index("## Tier 2")].strip()
+            if eff_mode in ("macro", "plan-14d") and "## Tier 3" in act_text:
+                say(tier1_part + "\n\n" + act_text[act_text.index("## Tier 3"):].strip())
+            else:
+                say(tier1_part)
         else:
             say(act_text)
 

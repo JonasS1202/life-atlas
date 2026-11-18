@@ -2,6 +2,12 @@
 
 Written for users: `/atlas-update` shows the sections between the installed and the new version.
 
+## [1.4.3] - 2026-11-18
+
+- **Zero-Truncation Progressive Context & Canonical File Schemas (`atlas.py`, `coach.md`):**
+  - **Untruncated Core Context Slice:** `atlas.py coach context` now prints the live `Dashboard URL` explicitly and omits the verbose 65-row Tier-2 Meso walk/ride table across all modes (keeping Tier-1 last 21 days + Tier-3 monthly totals while delegating `> 21d` session lookups to `atlas.py coach history`), cutting output size by >50 % so tool calls never hit truncation limits.
+  - **Inline File & DSL Schemas in `coach.md`:** Documents exact `macro-plan.md`, `dna.md` (`statcard` JSON), and `[workout:...]` interval DSL schemas directly in `coach.md` so the Coach agent writes valid files immediately without inspecting `_atlas/tools/*.py`.
+
 ## [1.4.2] - 2026-11-18
 
 - **Broadened Natural-Language Coach Routing & Full Playbook Context (`atlas_hook.py`, `atlas.py`, `coach.md`):**
