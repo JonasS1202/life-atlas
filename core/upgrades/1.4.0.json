@@ -1,0 +1,8 @@
+{
+  "skeleton_add": [
+    "coach/playbook.md"
+  ],
+  "notes": [
+    "Atlas Coach v2 (`1.4.0`) adds the 7-Pillar Biophysical Engine (Mader MLSS/shuttle, Chorley bi-exponential W'bal, Myotype Z-score, intensity-weighted durability, 4-stage readiness `GRÜN/GELB-A/GELB-B/ROT`, zero-fallback missing-input gate), autonomous `macro-plan.md`/`dna.md` upkeep, the personal `coach/playbook.md` feelings-file, Plan-vs-Actual interval auditing, `.fit` binary generation, and Hammerhead Karoo / Garmin Connect / Intervals.icu connectors (`atlas.py coach push|history|compare|inspect|field-test`)."
+  ]
+}

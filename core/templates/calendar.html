@@ -811,9 +811,18 @@ function renderCoachRibbon(coach){
       <div class="macro-badges">
         <span class="tag ${mp.stale?'med':'ok'}">${mp.stale?'⚠ Makroplan fällig ('+esc(mp.stale_reason)+')':'✓ Makroplan aktuell'}</span>
         ${coach.strava_connected
-          ? `<span class="tag ok">✓ Strava verbunden (${coach.activities_count||0} Aktivitäten)</span><a href="/strava-sync" class="tag" style="background:rgba(56,189,248,0.14);color:var(--accent);border:1px solid rgba(56,189,248,0.35);text-decoration:none;cursor:pointer;font-weight:700">🔄 Strava Sync</a>`
+          ? `<span class="tag ok">✓ Strava verbunden (${coach.activities_count||0} Aktivitäten)</span><a href="/strava-sync" class="tag" style="background:rgba(56,189,248,0.14);color:var(--accent);border:1px solid rgba(56,189,248,0.35);text-decoration:none;cursor:pointer;font-weight:700">🔄 Sync</a>`
           : `<a href="/strava-connect" class="tag" style="background:rgba(252,76,2,0.18);color:#fdba74;border:1px solid rgba(252,76,2,0.45);text-decoration:none;cursor:pointer;font-weight:700">🧡 Mit Strava verbinden (1-Klick)</a>`
         }
+        ${(coach.connectors&&coach.connectors.hammerhead_connected)
+          ? `<span class="tag ok">✓ Karoo verbunden</span>`
+          : `<a href="/hammerhead-connect" class="tag" style="background:rgba(250,204,21,0.16);color:#fde047;border:1px solid rgba(250,204,21,0.4);text-decoration:none;cursor:pointer;font-weight:700">💛 Karoo verbinden</a>`
+        }
+        ${(coach.connectors&&coach.connectors.garmin_connected)
+          ? `<span class="tag ok">✓ Garmin Wellness &amp; Watch</span>`
+          : ``
+        }
+        <a href="/coach-push" class="tag" style="background:rgba(16,185,129,0.15);color:#6ee7b7;border:1px solid rgba(16,185,129,0.35);text-decoration:none;cursor:pointer;font-weight:700">📲 Workouts pushen (.zwo/.fit)</a>
         ${fbPend?`<span class="tag med">💬 ${fbPend} Check-in(s) offen</span>`:''}
       </div>
     </div>

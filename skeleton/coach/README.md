@@ -11,7 +11,8 @@ Stand: {{DATE}}. Central coaching hub for **{{USER_NAME}}** (Cycling, Running & 
 
 | Page | Purpose |
 |---|---|
-| [profile.md](profile.md) | Coaching depth (`auto \| simple \| standard \| pro`), biometrics, thresholds & zones (`FTP`, `CP/W'`, `CS/D'`, `LTHR`), typology, weekly schedule & bio-rules |
+| [profile.md](profile.md) | Coaching depth (`auto \| simple \| standard \| pro`), biometrics (`KFA %`, `FFM`), thresholds & zones (`CP/W'`, `CS/D'`, `LTHR`), typology, weekly schedule & bio-rules |
+| [playbook.md](playbook.md) | Personal athlete playbook & feelings-file: motivation, lifestyle constraints, gut/fueling habits, indoor/sensor setup & empirical dose-response rules |
 | [macro-plan.md](macro-plan.md) | Active season macro periodization table by ISO calendar week (`Base`, `Build`, `Peak`, `Taper`, `Deload`) |
 | [power-curve.md](power-curve.md) | 3-Epoch Peak Matrix (`42d` · `90d` · `365d`), PDC Fiber Typology, Multi-Tier Durability (`15/25/35 kJ/kg` + `>CP`), Running Splits |
 | [activities.md](activities.md) | 3-Tier training history with `W'bal`, torque/cadence, CHO oxidation, steady `Pw:Hr`, and subjective athlete feedback |

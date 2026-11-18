@@ -59,7 +59,7 @@ DEFAULT_UPSTREAM = "https://github.com/JonasS1202/life-atlas.git"
 TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if TOOLS_DIR not in sys.path:
     sys.path.insert(0, TOOLS_DIR)
-from atlas_lib import cal_engine, coach_engine, graph_engine
+from atlas_lib import cal_engine, coach_connectors, coach_engine, fit_writer, graph_engine
 
 INSTALLED_BRAIN = os.path.normpath(os.path.join(TOOLS_DIR, "..", ".."))
 HOOK_FILE = os.path.normpath(os.path.join(TOOLS_DIR, "..", "hooks", "atlas_hook.py"))
@@ -1739,6 +1739,7 @@ Stand: {{DATE}}. Native training and physiology hub for {{USER_NAME}} (Cycling, 
 | Page | Purpose |
 |---|---|
 | [profile.md](profile.md) | Coaching depth (`auto \\| simple \\| standard \\| pro`), biometrics, cycling & running thresholds (`FTP`, `CP/W'`, `CS/D'`), weekly time budget, bio-rules |
+| [playbook.md](playbook.md) | Personal coach notebook & feelings-file: athlete motivation, gut/fueling reality, indoor/sensor setup, empirical dose-response rules & open discovery |
 | [macro-plan.md](macro-plan.md) | Season macro periodization (Base, Build, Peak, Taper, Deload) anchored to `[goal]` and `[blocked]` in [../calendar/README.md](../calendar/README.md) |
 | [power-curve.md](power-curve.md) | 3-Epoch Mean Maximal Power (`42d` · `90d` · `365d`), PDC Fiber Typology, Multi-Tier Durability (`15/25/35 kJ/kg` + `>CP`) & Running Splits |
 | [activities.md](activities.md) | 3-Tier Strava activity log, `W'bal`, torque/cadence, CHO burn, steady `Pw:Hr`, and subjective athlete feedback (`RPE` / feel) |
@@ -1896,6 +1897,35 @@ Stand: {{DATE}}. Part of [Sport-Coach Hub](README.md). Updated deterministically
 |---|---|---|---|---|---|---|---|---|---|---|
 """
 
+COACH_DEFAULT_PLAYBOOK = """---
+summary: Personal athlete playbook & feelings-file: motivation, lifestyle constraints, gut tolerance, indoor setup, empirical rules & coach discovery
+tags: [sport, self]
+aliases: [Coach Playbook, Feelings-File, Trainer-Notizbuch, Athleten-Wissensbasis]
+updated: {{DATE}}
+---
+# Athlete Playbook & Feelings-File
+
+Stand: {{DATE}}. Living personal coaching dossier for {{USER_NAME}}, maintained autonomously by [Sport-Coach Hub](README.md). Stores qualitative context, empirical dose-response learnings, and answered discovery questions so generic physiology turns into a 1-of-1 individual model.
+
+## 1. Athlete Identity, Motivation & Coaching Contract
+
+- **Why & Inner Drive:** _(open — coach will ask organically)_
+- **Preferred Coaching Tone:** Direct, honest, high-accountability (praise clean execution; call out skipped sessions or Zone-2 ego surges clearly).
+
+## 2. Real-World Life, Recovery & Setup Context
+
+- **Sleep & Chronotype Reality:** _(open)_
+- **Typical Schedule Saboteurs:** _(open)_
+- **Gut Tolerance & Fueling Habits:** _(open)_
+- **Indoor Setup, Cooling & Power Sensors:** _(open)_
+- **Orthopedic History & Strength Access:** _(open)_
+- **Pacing & Race Habits:** _(open)_
+
+## 3. Distilled Empirical Rules & Feelings-File Patterns
+
+<!-- Updated after microcycles/blocks with verified date stamps `(Stand: YYYY-MM-DD)` -->
+"""
+
 
 def _strava_env_path(brain):
     return os.path.join(brain, "_secrets", "strava.env")
@@ -1936,32 +1966,37 @@ def _save_strava_env(brain, env_dict):
 
 
 def _ensure_coach_readiness_link(brain, execute=True):
-    """Ensure brain/coach/README.md links readiness.md whenever coach/readiness.md exists (prevents check orphan)."""
-    rdy_path = os.path.join(brain, "coach", "readiness.md")
+    """Ensure brain/coach/README.md links readiness.md and playbook.md whenever they exist (prevents check orphan)."""
     readme_path = os.path.join(brain, "coach", "README.md")
-    if not os.path.isfile(rdy_path) or not os.path.isfile(readme_path):
+    if not os.path.isfile(readme_path):
         return False
     txt = read(readme_path)
-    if "readiness.md" in txt:
-        return False
-    if execute:
-        row = "| [readiness.md](readiness.md) | Daily readiness log (`RHR`, sleep, soreness, `RPE`) & longitudinal `CTL/ATL/TSB/ACWR` |\n"
-        if "| [activities.md](activities.md)" in txt:
-            txt = txt.replace("| [activities.md](activities.md)", row + "| [activities.md](activities.md)", 1)
-        elif "| [power-curve.md](power-curve.md)" in txt:
-            lines = txt.splitlines(keepends=True)
-            out_l = []
-            inserted = False
-            for ln in lines:
-                out_l.append(ln)
-                if not inserted and "[power-curve.md](power-curve.md)" in ln:
-                    out_l.append(row)
-                    inserted = True
-            txt = "".join(out_l)
-        else:
-            txt = txt.rstrip("\n") + "\n- [readiness.md](readiness.md)\n"
+    changed = False
+    for fname, desc in (
+        ("readiness.md", "Daily readiness log (`RHR`, `HRV`, sleep, soreness, `RPE`) & longitudinal `CTL/ATL/TSB/ACWR`"),
+        ("playbook.md", "Personal athlete playbook & feelings-file (motivation, lifestyle, empirical dose-response rules)"),
+    ):
+        fpath = os.path.join(brain, "coach", fname)
+        if os.path.isfile(fpath) and fname not in txt:
+            changed = True
+            row = f"| [{fname}]({fname}) | {desc} |\n"
+            if "| [activities.md](activities.md)" in txt:
+                txt = txt.replace("| [activities.md](activities.md)", row + "| [activities.md](activities.md)", 1)
+            elif "| [power-curve.md](power-curve.md)" in txt:
+                lines = txt.splitlines(keepends=True)
+                out_l = []
+                inserted = False
+                for ln in lines:
+                    out_l.append(ln)
+                    if not inserted and "[power-curve.md](power-curve.md)" in ln:
+                        out_l.append(row)
+                        inserted = True
+                txt = "".join(out_l)
+            else:
+                txt = txt.rstrip("\n") + f"\n- [{fname}]({fname})\n"
+    if changed and execute:
         write(readme_path, txt)
-    return True
+    return changed
 
 
 def _coach_init(root, brain, hk, execute=True, quiet=False, preserve_existing_profile=False):
@@ -2002,6 +2037,7 @@ def _coach_init(root, brain, hk, execute=True, quiet=False, preserve_existing_pr
     files = [
         ("coach/README.md", render(COACH_DEFAULT_README, values)),
         ("coach/profile.md", prof_filled),
+        ("coach/playbook.md", render(COACH_DEFAULT_PLAYBOOK, values)),
         ("coach/macro-plan.md", macro_filled),
         ("coach/power-curve.md", render(COACH_DEFAULT_PCURVE, values)),
         ("coach/readiness.md", render(COACH_DEFAULT_READINESS, values)),
@@ -2084,8 +2120,12 @@ def _rebuild_coach_markdown_files(brain, activities, ftp_watts=275, weight_kg=67
     )
     prof_path = os.path.join(brain, "coach", "profile.md")
     rdy_path = os.path.join(brain, "coach", "readiness.md")
+    pb_path = os.path.join(brain, "coach", "playbook.md")
+    dna_path = os.path.join(brain, "coach", "dna.md")
     prof_text = read(prof_path) if os.path.isfile(prof_path) else ""
     rdy_text = read(rdy_path) if os.path.isfile(rdy_path) else ""
+    pb_text = read(pb_path) if os.path.isfile(pb_path) else ""
+    dna_text = read(dna_path) if os.path.isfile(dna_path) else ""
 
     telemetry = coach_engine.build_coach_telemetry(
         profile_text=prof_text,
@@ -2095,6 +2135,8 @@ def _rebuild_coach_markdown_files(brain, activities, ftp_watts=275, weight_kg=67
         fallback_ftp=ftp_watts,
         fallback_weight=weight_kg,
         today=today,
+        dna_text=dna_text,
+        playbook_text=pb_text,
     )
     curves = telemetry["curves"]
     fresh_ep = curves["fresh"]
@@ -2295,6 +2337,12 @@ def _rebuild_coach_markdown_files(brain, activities, ftp_watts=275, weight_kg=67
                 act_lines.append(f"- **Split Paces:** {bp_s}")
         if a.get("laps"):
             act_lines.append("- **Laps:** " + " | ".join(str(lp) for lp in a["laps"][:8]))
+        if isinstance(a.get("execution"), dict) and a["execution"].get("planned_title"):
+            ex = a["execution"]
+            ex_bits = [f"Score {ex.get('execution_score', 100)}% vs '{ex.get('planned_title')}'"]
+            ex_bits += [f"⚠ {br}" for br in (ex.get("breaches") or [])]
+            ex_bits += [f"✓ {pr}" for pr in (ex.get("praise") or [])]
+            act_lines.append("- **Plan vs. Actual:** " + " · ".join(ex_bits))
         act_lines.append(f"- **Athlete Feedback:** {fb_disp}")
         act_lines.append("")
 
@@ -2407,8 +2455,8 @@ def _strava_refresh_if_needed(brain, env_dict):
     return env_dict["STRAVA_ACCESS_TOKEN"]
 
 
-def _coach_sync(root, brain, hk, days=90, mock_file=None, execute=True, quiet=False):
-    """Sync Strava activities + 1Hz streams (or load mock JSON), compute 3-epoch curves & match calendar workouts."""
+def _coach_sync(root, brain, hk, days=90, mock_file=None, wellness_mock=None, execute=True, quiet=False):
+    """Sync Strava activities + 1Hz streams & Garmin/Intervals wellness, score Plan-vs-Actual execution, & match calendar."""
     _coach_init(root, brain, hk, execute=execute, quiet=True)
     ftp_w, weight_kg = _extract_profile_numbers(brain, hk)
     prof_path = os.path.join(brain, "coach", "profile.md")
@@ -2433,16 +2481,20 @@ def _coach_sync(root, brain, hk, days=90, mock_file=None, execute=True, quiet=Fa
     else:
         env_dict = _load_strava_env(brain)
         if not env_dict.get("STRAVA_ACCESS_TOKEN") and not env_dict.get("STRAVA_REFRESH_TOKEN"):
-            if not quiet:
-                say("strava sync: not connected yet (brain/_secrets/strava.env missing). Run `atlas.py coach auth-strava`.")
-            return 0
-        import urllib.request
-        token = _strava_refresh_if_needed(brain, env_dict)
-        after_ts = int((dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)).timestamp())
-        url = f"https://www.strava.com/api/v3/athlete/activities?after={after_ts}&per_page=100"
-        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            raw_activities = json.loads(resp.read().decode("utf-8", errors="replace"))
+            if wellness_mock or coach_connectors.connector_status_summary(brain).get("garmin_connected") or coach_connectors.connector_status_summary(brain).get("intervals_connected"):
+                raw_activities = []
+            else:
+                if not quiet:
+                    say("strava sync: not connected yet (brain/_secrets/strava.env missing). Run `atlas.py coach auth-strava`.")
+                return 0
+        else:
+            import urllib.request
+            token = _strava_refresh_if_needed(brain, env_dict)
+            after_ts = int((dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)).timestamp())
+            url = f"https://www.strava.com/api/v3/athlete/activities?after={after_ts}&per_page=100"
+            req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                raw_activities = json.loads(resp.read().decode("utf-8", errors="replace"))
 
     today = dt.date.today()
     stream_cache_dir = os.path.join(brain, "_atlas", "cache", "strava", "streams")
@@ -2606,12 +2658,72 @@ def _coach_sync(root, brain, hk, days=90, mock_file=None, execute=True, quiet=Fa
                     device_watts=a.get("device_watts"),
                 ))
 
+    # Score Plan-vs-Actual Interval Execution & Z2 Discipline against scheduled calendar workouts
+    idx_cal = hk.load_index()
+    cal_for_exec = hk.calendar_items(idx_cal, days=30, past_days=min(max(days, 30), 180), include_done=True)
+    planned_by_date_sport = {}
+    for ci in cal_for_exec:
+        if ci.get("kind") == "workout" and isinstance(ci.get("start"), dt.date):
+            planned_by_date_sport.setdefault((ci["start"].isoformat(), (ci.get("subkind") or "cycling").lower()), ci)
+
     for a in all_acts:
         sys_tss, tss_m = coach_engine.compute_activity_load(
             a, profile=prof_info, cs_mps=eff_cs_final, cp_watts=eff_cp_final,
         )
         a["systemic_tss"] = sys_tss
         a["tss_method"] = tss_m
+        ad_s = str(a.get("date") or "")[:10]
+        asp = str(a.get("sport") or "cycling").lower()
+        p_item = planned_by_date_sport.get((ad_s, asp))
+        if p_item:
+            p_spec = hk.parse_workout_spec(p_item.get("what") or "", subkind=asp, ftp_watts=int(round(eff_cp_final)))
+            aid = str(a.get("id") or "")
+            s_mem = synced_streams_mem.get(aid)
+            if not s_mem:
+                sf_p = os.path.join(stream_cache_dir, f"{aid}.json")
+                if os.path.isfile(sf_p):
+                    s_mem = load_json(sf_p, None)
+            w_arr = [float(x or 0.0) for x in ((s_mem or {}).get("watts") or [])] if isinstance(s_mem, dict) else None
+            ex_eval = coach_engine.evaluate_workout_execution(
+                a, p_item, p_spec, ftp_watts=int(round(eff_cp_final)), watts_stream=w_arr,
+            )
+            if ex_eval:
+                a["execution"] = ex_eval
+
+    # Pull Garmin / Intervals.icu wellness biometrics (RHR, Sleep, HRV RMSSD, Weight) into readiness.md
+    wellness_rows = coach_connectors.garmin_pull_wellness(brain, days=min(days, 14), mock_file=wellness_mock, today=today)
+    if not wellness_rows and not wellness_mock:
+        wellness_rows = coach_connectors.intervals_pull_wellness(brain, days=min(days, 14), today=today)
+    wellness_imported = 0
+    if wellness_rows and execute:
+        rdy_path = os.path.join(brain, "coach", "readiness.md")
+        rdy_existing = read(rdy_path) if os.path.isfile(rdy_path) else ""
+        r_by_d = {r["date"]: r for r in coach_engine.parse_readiness_log(rdy_existing)}
+        for w_row in wellness_rows:
+            wd = w_row["date"]
+            cur_r = dict(r_by_d.get(wd) or {
+                "date": wd, "rhr": None, "sleep_h": None, "sleep_quality": None, "rpe": None, "soreness": None,
+                "ctl": None, "atl": None, "tsb": None, "acwr": None, "status": "", "notes": "",
+            })
+            for fld in ("rhr", "sleep_h", "sleep_quality", "hrv_rmssd", "weight_kg"):
+                if w_row.get(fld) is not None and cur_r.get(fld) is None:
+                    cur_r[fld] = w_row[fld]
+            if w_row.get("soreness") is not None and cur_r.get("soreness") is None:
+                cur_r["soreness"] = w_row["soreness"]
+            r_by_d[wd] = cur_r
+            wellness_imported += 1
+        merged_w = sorted(r_by_d.values(), key=lambda x: x["date"], reverse=True)
+        pmc_now = coach_engine.compute_pmc_metrics(all_acts, profile=prof_info, cs_mps=eff_cs_final, cp_watts=eff_cp_final, today=today)
+        for wr in merged_w[:7]:
+            d_obj = dt.date.fromisoformat(wr["date"])
+            ev_d = coach_engine.evaluate_readiness_and_guardrails(merged_w, prof_info, pmc_now, all_acts, cal_items=cal_for_exec, today=d_obj)
+            wr["ctl"] = pmc_now["ctl"]
+            wr["atl"] = pmc_now["atl"]
+            wr["tsb"] = pmc_now["tsb"]
+            wr["acwr"] = pmc_now["acwr"]
+            wr["status"] = ev_d["status"]
+        write(rdy_path, coach_engine.render_readiness_markdown(rdy_existing, merged_w, today.isoformat()))
+        _ensure_coach_readiness_link(brain, execute=True)
 
     if execute:
         dump_json(act_json_path, all_acts)
@@ -2624,13 +2736,29 @@ def _coach_sync(root, brain, hk, days=90, mock_file=None, execute=True, quiet=Fa
         matched = 0
     if not quiet:
         pend_cnt = sum(1 for a in all_acts if a.get("feedback") == "pending")
+        w_bit = f", {wellness_imported} wellness day(s) imported" if wellness_imported else ""
         say(f"coach sync ({'applied' if execute else 'dry-run'}): {synced_count} activity/ies processed, "
-            f"{matched} calendar workout(s) marked [x], {pend_cnt} ride check-in(s) pending.")
+            f"{matched} calendar workout(s) marked [x], {pend_cnt} ride check-in(s) pending{w_bit}.")
     return synced_count
 
 
-def _coach_note(root, brain, hk, date_str=None, text=None, rpe=None, rhr=None, sleep_h=None, sleep_quality=None, soreness=None):
-    """Save subjective ride feedback (RPE, feel) and/or daily readiness check-in (RHR, sleep, sleep_quality, soreness)."""
+def _coach_note(
+    root,
+    brain,
+    hk,
+    date_str=None,
+    text=None,
+    rpe=None,
+    rhr=None,
+    sleep_h=None,
+    sleep_quality=None,
+    soreness=None,
+    hrv_rmssd=None,
+    weight_kg_in=None,
+    leg_pain=None,
+    fatigue_7d=None,
+):
+    """Save subjective ride feedback (RPE, feel) and/or daily readiness check-in (RHR, HRV, sleep, soreness, leg_pain, weight)."""
     _coach_init(root, brain, hk, execute=True, quiet=True)
     eff_date = (date_str or dt.date.today().isoformat())[:10]
     ftp_w, weight_kg = _extract_profile_numbers(brain, hk)
@@ -2642,7 +2770,7 @@ def _coach_note(root, brain, hk, date_str=None, text=None, rpe=None, rhr=None, s
     clean_sq = (sleep_quality or "").strip() or None
     if rpe is not None and clean_text:
         note_str = f"RPE {rpe}/10 — {clean_text}"
-    elif rpe is not None and not clean_text and rhr is None and sleep_h is None and clean_sq is None and soreness is None:
+    elif rpe is not None and not clean_text and all(v is None for v in (rhr, sleep_h, clean_sq, soreness, hrv_rmssd, weight_kg_in, leg_pain, fatigue_7d)):
         note_str = f"RPE {rpe}/10"
     else:
         note_str = clean_text
@@ -2652,7 +2780,7 @@ def _coach_note(root, brain, hk, date_str=None, text=None, rpe=None, rhr=None, s
     if not isinstance(acts, list):
         acts = []
 
-    has_readiness_args = any(v is not None for v in (rhr, sleep_h, clean_sq, soreness))
+    has_readiness_args = any(v is not None for v in (rhr, sleep_h, clean_sq, soreness, hrv_rmssd, weight_kg_in, leg_pain, fatigue_7d))
     # Update activity log when workout feedback (`text` or `rpe` without pure morning check-in) is provided
     if note_str or (rpe is not None and not has_readiness_args):
         updated_act = False
@@ -2713,6 +2841,16 @@ def _coach_note(root, brain, hk, date_str=None, text=None, rpe=None, rhr=None, s
             cur_row["rpe"] = float(rpe)
         if soreness is not None:
             cur_row["soreness"] = int(soreness)
+        if hrv_rmssd is not None:
+            cur_row["hrv_rmssd"] = float(hrv_rmssd)
+        if weight_kg_in is not None:
+            cur_row["weight_kg"] = float(weight_kg_in)
+        if leg_pain is not None:
+            cur_row["leg_pain"] = int(leg_pain)
+            if cur_row.get("soreness") is None:
+                cur_row["soreness"] = int(leg_pain)
+        if fatigue_7d is not None:
+            cur_row["fatigue_7d"] = int(fatigue_7d)
         if clean_text:
             cur_row["notes"] = clean_text
         by_date_r[eff_date] = cur_row
@@ -2891,9 +3029,11 @@ def _coach_context(
     prof_path = os.path.join(brain, "coach", "profile.md")
     rdy_path = os.path.join(brain, "coach", "readiness.md")
     dna_path = os.path.join(brain, "coach", "dna.md")
+    pb_path = os.path.join(brain, "coach", "playbook.md")
     prof_text = read(prof_path) if os.path.isfile(prof_path) else ""
     rdy_text = read(rdy_path) if os.path.isfile(rdy_path) else ""
     dna_text = read(dna_path) if os.path.isfile(dna_path) else ""
+    pb_text = read(pb_path) if os.path.isfile(pb_path) else ""
 
     telemetry = coach_engine.build_coach_telemetry(
         profile_text=prof_text,
@@ -2904,6 +3044,8 @@ def _coach_context(
         explicit_depth=depth_override if depth_override and depth_override != "auto" else None,
         query_text=query_text or "",
         dna_text=dna_text,
+        playbook_text=pb_text,
+        macro_info=macro,
     )
     depth = telemetry["depth"]
 
@@ -2920,6 +3062,7 @@ def _coach_context(
         return
 
     # STANDARD & PRO TIERS
+    conn = coach_connectors.connector_status_summary(brain)
     say(f"=== 1. ATLAS SPORT-COACH CONTEXT (mode: {eff_mode}, depth: {depth}) ===")
     say(f"  Macro Plan: active_phase='{macro['active_phase']}', updated='{macro['updated'] or 'never'}', "
         f"goals_hash='{macro['goals_hash']} -> {macro['current_goals_hash']}', stale={macro['stale']}"
@@ -2940,6 +3083,15 @@ def _coach_context(
         say("  Strava: NOT CONNECTED. Give the user this direct 1-Click link in your reply (no API keys or setup needed — clicking connects & syncs automatically):")
         say(f"    [🧡 Jetzt mit Strava verbinden (1-Klick)]({connect_url})")
         say(f"    Direct OAuth URL: {auth_url}")
+    say(
+        f"  Devices & Wellness: Hammerhead Karoo={'connected' if conn['hammerhead_connected'] else 'not connected (`atlas.py coach auth-hammerhead`)'} | "
+        f"Garmin Connect={'connected' if conn['garmin_connected'] else 'not connected (`atlas.py coach auth-garmin` + `.fit` ready)'} | "
+        f"Intervals.icu={'connected' if conn['intervals_connected'] else 'optional'}"
+    )
+    say("  On-Demand Pull CLI (call when user asks about >21d history, past blocks, or a specific session):")
+    say("    - `atlas.py coach history --months 6 [--sport cycling|running]`")
+    say("    - `atlas.py coach compare --epoch-a YYYY-MM-DD..YYYY-MM-DD --epoch-b YYYY-MM-DD..YYYY-MM-DD`")
+    say("    - `atlas.py coach inspect --date YYYY-MM-DD` | `atlas.py coach push --execute` | `atlas.py coach field-test --unit 1|2|preload|lsct --date YYYY-MM-DD --execute`")
 
     pend = c_state.get("pending_feedback", [])
     if pend:
@@ -2951,6 +3103,11 @@ def _coach_context(
 
     if depth == "pro":
         say("\n" + coach_engine.format_pro_telemetry_block(telemetry))
+    say("\n" + coach_engine.format_seven_pillar_blocks(telemetry))
+
+    if pb_text.strip():
+        say("\n=== 2A. ATHLETE PLAYBOOK & FEELINGS-FILE (brain/coach/playbook.md) ===")
+        say(pb_text.strip()[:2200])
 
     say("\n=== 2. ATHLETE PROFILE & THRESHOLDS (brain/coach/profile.md) ===")
     if prof_text:
@@ -3030,6 +3187,178 @@ def _coach_context(
         _open_visual_calendar(hk, idx, open_now=True)
 
 
+def _coach_auth_hammerhead(root, brain, hk, args):
+    """Connect Hammerhead Karoo via 1-Click loopback OAuth or explicit tokens (`_secrets/hammerhead.env`)."""
+    env = coach_connectors.load_secret_env(brain, "hammerhead")
+    if getattr(args, "client_id", None):
+        env["HAMMERHEAD_CLIENT_ID"] = args.client_id.strip()
+    if getattr(args, "client_secret", None):
+        env["HAMMERHEAD_CLIENT_SECRET"] = args.client_secret.strip()
+    if getattr(args, "access_token", None):
+        env["HAMMERHEAD_ACCESS_TOKEN"] = args.access_token.strip()
+    if getattr(args, "refresh_token", None):
+        env["HAMMERHEAD_REFRESH_TOKEN"] = args.refresh_token.strip()
+    if env:
+        coach_connectors.save_secret_env(brain, "hammerhead", env)
+
+    if getattr(args, "access_token", None) and not getattr(args, "code", None):
+        say(f"hammerhead auth: saved credentials to {fwd(coach_connectors.secret_env_path(brain, 'hammerhead'))}.")
+        return
+
+    cal_url = hk.render_calendar_html(hk.load_index(), start_server=True)
+    base_url = cal_url.rsplit("/", 1)[0]
+    redirect_uri = f"{base_url}/hammerhead-callback"
+    connect_url = f"{base_url}/hammerhead-connect"
+
+    code = getattr(args, "code", None)
+    if not code:
+        cid = env.get("HAMMERHEAD_CLIENT_ID") or os.environ.get("ATLAS_HAMMERHEAD_CLIENT_ID") or ""
+        say("=== Hammerhead Karoo 1-Click Connect ===")
+        say(f"Open this link to connect Hammerhead Karoo (or enter Developer Client ID/Secret once in the browser):\n  [💛 Hammerhead Karoo verbinden]({connect_url})")
+        if cid:
+            say(f"Direct Hammerhead OAuth URL:\n  {coach_connectors.build_hammerhead_authorize_url(cid, redirect_uri)}")
+        return
+
+    ok, msg = coach_connectors.hammerhead_exchange_code(
+        brain, code=code, redirect_uri=redirect_uri,
+        client_id=getattr(args, "client_id", None),
+        client_secret=getattr(args, "client_secret", None),
+    )
+    if not ok:
+        sys.exit(f"hammerhead auth failed: {msg}")
+    say(f"hammerhead auth: connected -> {fwd(msg)}")
+
+
+def _coach_auth_garmin(brain, args):
+    """Connect Garmin Connect (discards plaintext password immediately, stores session tokens in `_secrets/garmin.env`)."""
+    ok, msg = coach_connectors.garmin_authenticate(
+        brain,
+        email=getattr(args, "email", None) or "",
+        password=getattr(args, "password", None) or "",
+        mfa_code=getattr(args, "mfa_code", None) or "",
+        tokens_json=getattr(args, "tokens_json", None) or "",
+    )
+    if not ok:
+        say(f"garmin auth: {msg}")
+        return
+    say(f"garmin auth: {msg}")
+
+
+def _coach_auth_intervals(brain, args):
+    """Connect Intervals.icu pure-stdlib REST bridge (`_secrets/intervals.env`)."""
+    env = coach_connectors.load_secret_env(brain, "intervals")
+    if getattr(args, "athlete_id", None):
+        env["INTERVALS_ATHLETE_ID"] = args.athlete_id.strip()
+    if getattr(args, "api_key", None):
+        env["INTERVALS_API_KEY"] = args.api_key.strip()
+    if not (env.get("INTERVALS_ATHLETE_ID") and env.get("INTERVALS_API_KEY")):
+        say("intervals auth: pass `--athlete-id <i12345>` and `--api-key <API_KEY>` (saved locally to `brain/_secrets/intervals.env`).")
+        return
+    p = coach_connectors.save_secret_env(brain, "intervals", env)
+    say(f"intervals auth: saved Intervals.icu credentials -> {fwd(p)}")
+
+
+def _coach_push(root, brain, hk, days=14, execute=True, mock_dir=None):
+    """Compile `.zwo` + `.fit` files and push/update/delete idempotently on Hammerhead Karoo & Garmin Connect."""
+    _coach_init(root, brain, hk, execute=execute, quiet=True)
+    ftp_w, weight_kg = _extract_profile_numbers(brain, hk)
+    prof_path = os.path.join(brain, "coach", "profile.md")
+    prof_info = coach_engine.parse_athlete_profile(
+        read(prof_path) if os.path.isfile(prof_path) else "",
+        fallback_ftp=ftp_w,
+        fallback_weight=weight_kg,
+    )
+    c_state = hk.load_coach_state()
+    curves = coach_engine.aggregate_epoch_curves(c_state.get("activities", []))
+    cp_sol = coach_engine.solve_cp_w_prime({lbl: curves["fresh"][lbl]["90d"] for lbl, _ in COACH_DURATIONS if curves["fresh"][lbl].get("90d")})
+    run_90d = {d: {"sec_per_km": curves["run_splits"][d]["90d"][0], "fmt": curves["run_splits"][d]["90d"][1]}
+               for d in ("1km", "3km", "5km", "10km") if curves["run_splits"][d].get("90d")}
+    cs_sol = coach_engine.solve_cs_d_prime(run_90d)
+    eff_ftp = int(cp_sol["cp_w"]) if (cp_sol["valid"] and cp_sol["cp_w"]) else ftp_w
+    eff_cs = float(cs_sol["cs_mps"]) if (cs_sol["valid"] and cs_sol["cs_mps"]) else prof_info.get("cs_mps")
+
+    idx = hk.load_index()
+    cal_items = hk.calendar_items(idx, days=max(days, 30), past_days=7, include_done=True)
+    res = coach_connectors.sync_calendar_workouts_to_devices(
+        brain=brain,
+        cal_items=cal_items,
+        parse_workout_spec_fn=hk.parse_workout_spec,
+        compile_zwo_xml_fn=hk.compile_zwo_xml,
+        ftp_watts=eff_ftp,
+        cs_mps=eff_cs,
+        days=days,
+        execute=execute,
+        mock_dir=mock_dir,
+    )
+    if execute:
+        hk.render_calendar_html(idx, start_server=False)
+    say(f"coach push ({'applied' if execute else 'dry-run'}): {len(res['zwo_files'])} .zwo file(s), "
+        f"{len(res['fit_files'])} .fit file(s), {len(res['device_actions'])} remote sync op(s) (anchor={eff_ftp}W).")
+    for act_msg in res["device_actions"]:
+        say(f"  - {act_msg}")
+    return res
+
+
+def _coach_compare_epochs(brain, hk, epoch_a, epoch_b):
+    """Compare the 7-Pillar Biophysical State Vector across two historical date ranges (`YYYY-MM-DD..YYYY-MM-DD`)."""
+    def _parse_range(spec_s):
+        s = str(spec_s or "").strip()
+        if ".." in s:
+            a, b = s.split("..", 1)
+            return a.strip()[:10], b.strip()[:10]
+        # Allow `YYYY-MM` shorthand
+        if re.match(r"^\d{4}-\d{2}$", s):
+            return f"{s}-01", f"{s}-31"
+        return s[:10], s[:10]
+
+    a_lo, a_hi = _parse_range(epoch_a)
+    b_lo, b_hi = _parse_range(epoch_b)
+    c_state = hk.load_coach_state()
+    acts = c_state.get("activities", [])
+    prof_p = os.path.join(brain, "coach", "profile.md")
+    prof_txt = read(prof_p) if os.path.isfile(prof_p) else ""
+
+    acts_a = [a for a in acts if isinstance(a, dict) and a_lo <= str(a.get("date", ""))[:10] <= a_hi]
+    acts_b = [a for a in acts if isinstance(a, dict) and b_lo <= str(a.get("date", ""))[:10] <= b_hi]
+    ref_a = dt.date.fromisoformat(a_hi if re.match(r"^\d{4}-\d{2}-\d{2}$", a_hi) and a_hi[-2:] <= "28" else a_lo)
+    ref_b = dt.date.fromisoformat(b_hi if re.match(r"^\d{4}-\d{2}-\d{2}$", b_hi) and b_hi[-2:] <= "28" else b_lo)
+
+    tel_a = coach_engine.build_coach_telemetry(prof_txt, acts_a, today=ref_a)
+    tel_b = coach_engine.build_coach_telemetry(prof_txt, acts_b, today=ref_b)
+    say(f"=== COACH 7-PILLAR EPOCH COMPARISON ({epoch_a} [{len(acts_a)} acts] vs {epoch_b} [{len(acts_b)} acts]) ===")
+    say(f"\n--- Epoch A ({epoch_a}) ---\n" + coach_engine.format_seven_pillar_blocks(tel_a))
+    say(f"\n--- Epoch B ({epoch_b}) ---\n" + coach_engine.format_seven_pillar_blocks(tel_b))
+
+
+def _coach_field_test(root, brain, hk, unit, date_str=None, execute=True):
+    """Schedule a standardized 7-Pillar field test (Unit 1, Unit 2, Durability Preload, or LSCT) into calendar/README.md."""
+    _coach_init(root, brain, hk, execute=execute, quiet=True)
+    d_iso = (date_str or (dt.date.today() + dt.timedelta(days=1)).isoformat())[:10]
+    templates = {
+        "1": f"- [ ] {d_iso} 17:30 [workout:cycling] Field-Test Unit 1: Sprint, C_max & W'-Reconstitution (65m | 15m WU 55-75%, 1x 15s@200% / 5m@50%, 20m Z1@52%, 1x 3m@135% / 2m@50%, 1x 3m@130% / 10m@50%, 10m CD 60-45%)",
+        "2": f"- [ ] {d_iso} 17:30 [workout:cycling] Field-Test Unit 2: Aerobic Roof & CP Anchor 5m+12m (75m | 15m WU 55-75%, 1x 5m@122% / 32m@52%, 1x 12m@105% / 5m@50%, 6m CD 60-45%)",
+        "preload": f"- [ ] {d_iso} 10:00 [workout:cycling] Field-Test Unit 3: Durability Preload 25kJ/kg + 5m All-Out (165m | 20m WU 55-72%, 60m Z2@68%, 3x 8m@103% / 4m@55%, 34m Z2@68%, 1x 5m@120% / 10m@50%)",
+        "lsct": f"- [ ] {d_iso} 17:30 [workout:cycling] LSCT Submaximal Monitoring + Base (60m | 6m@58%, 6m@78%, 3m@92%, 2m@40%, 35m Z2@68%, 8m CD 60-45%)",
+    }
+    u_key = str(unit or "1").lower()
+    if u_key not in templates:
+        sys.exit("coach field-test requires `--unit 1|2|preload|lsct`")
+    line = templates[u_key]
+    cal_path = os.path.join(brain, "calendar", "README.md")
+    if execute and os.path.isfile(cal_path):
+        txt = read(cal_path)
+        if "## Timeline" in txt:
+            idx_t = txt.index("## Timeline") + len("## Timeline")
+            nl = txt.find("\n", idx_t)
+            ins_at = nl + 1 if nl >= 0 else len(txt)
+            txt = txt[:ins_at] + "\n" + line + "\n" + txt[ins_at:].lstrip("\n")
+        else:
+            txt = txt.rstrip() + f"\n\n## Timeline\n\n{line}\n"
+        write(cal_path, txt)
+        _coach_push(root, brain, hk, days=21, execute=True)
+    say(f"coach field-test ({'scheduled' if execute else 'dry-run'}): {line}")
+
+
 def cmd_coach(args):
     root, brain = paths(args)
     hk = hook_module(brain)
@@ -3041,6 +3370,7 @@ def cmd_coach(args):
         _coach_init(root, brain, hk, execute=False, quiet=True)
         c_state = hk.load_coach_state()
         macro = hk.parse_macro_plan()
+        conn = coach_connectors.connector_status_summary(brain)
         prof_p = os.path.join(brain, "coach", "profile.md")
         rdy_p = os.path.join(brain, "coach", "readiness.md")
         tel = coach_engine.build_coach_telemetry(
@@ -3051,21 +3381,33 @@ def cmd_coach(args):
             explicit_depth=getattr(args, "depth", None),
         )
         say(f"coach status: module={'coach' in get_state(brain).get('modules', [])}, "
-            f"depth={tel['depth']}, readiness={tel['readiness']['status']}, "
+            f"depth={tel['depth']}, readiness={tel['readiness']['status']} ({tel['readiness'].get('flag_4stage')}), "
             f"ctl={tel['pmc']['ctl']:.1f}, tsb={tel['pmc']['tsb']:+.1f}, "
             f"strava_connected={c_state['strava_connected']}, "
+            f"hammerhead_connected={conn['hammerhead_connected']}, garmin_connected={conn['garmin_connected']}, "
             f"activities={len(c_state['activities'])}, "
             f"pending_feedback={len(c_state['pending_feedback'])}, "
             f"macro_phase='{macro['active_phase']}', macro_stale={macro['stale']} ({macro['stale_reason']})")
     elif action == "auth-strava":
         _coach_auth_strava(root, brain, args)
+    elif action == "auth-hammerhead":
+        _coach_auth_hammerhead(root, brain, hk, args)
+    elif action == "auth-garmin":
+        _coach_auth_garmin(brain, args)
+    elif action == "auth-intervals":
+        _coach_auth_intervals(brain, args)
     elif action == "sync":
         eff_days = args.days if getattr(args, "days", None) not in (None, 14) else 90
-        _coach_sync(root, brain, hk, days=eff_days, mock_file=args.mock_file, execute=args.execute, quiet=False)
+        _coach_sync(
+            root, brain, hk, days=eff_days, mock_file=args.mock_file,
+            wellness_mock=getattr(args, "wellness_mock", None), execute=args.execute, quiet=False,
+        )
     elif action == "note":
-        has_rdy = any(getattr(args, k, None) is not None for k in ("rhr", "sleep", "sleep_quality", "soreness", "rpe"))
+        has_rdy = any(getattr(args, k, None) is not None for k in (
+            "rhr", "sleep", "sleep_quality", "soreness", "rpe", "hrv", "weight", "leg_pain", "fatigue_7d"
+        ))
         if not args.text and not has_rdy:
-            sys.exit("coach note requires --text \"...\" and/or readiness flags (--rhr, --sleep, --sleep-quality, --soreness, --rpe)")
+            sys.exit("coach note requires --text \"...\" and/or readiness flags (--rhr, --hrv, --sleep, --soreness, --leg-pain, --rpe)")
         if args.text and not args.date and not has_rdy:
             sys.exit("coach note requires --date YYYY-MM-DD when logging workout text without readiness flags")
         _coach_note(
@@ -3079,9 +3421,39 @@ def cmd_coach(args):
             sleep_h=getattr(args, "sleep", None),
             sleep_quality=getattr(args, "sleep_quality", None),
             soreness=getattr(args, "soreness", None),
+            hrv_rmssd=getattr(args, "hrv", None),
+            weight_kg_in=getattr(args, "weight", None),
+            leg_pain=getattr(args, "leg_pain", None),
+            fatigue_7d=getattr(args, "fatigue_7d", None),
         )
     elif action == "zwo":
         _coach_zwo(root, brain, hk, date_str=args.date, days=args.days)
+    elif action in ("push", "fit"):
+        _coach_push(root, brain, hk, days=args.days, execute=args.execute, mock_dir=getattr(args, "mock_dir", None))
+    elif action == "history":
+        c_state = hk.load_coach_state()
+        say(coach_engine.query_coach_history(
+            c_state.get("activities", []),
+            date_from=getattr(args, "from_date", None),
+            date_to=getattr(args, "to_date", None),
+            months=getattr(args, "months", 6),
+            sport_filter=getattr(args, "sport", None),
+        ))
+    elif action == "inspect":
+        target_d = getattr(args, "date", None) or getattr(args, "deep_dive", None)
+        if not target_d:
+            sys.exit("coach inspect requires `--date YYYY-MM-DD`")
+        c_state = hk.load_coach_state()
+        matches = [a for a in c_state.get("activities", []) if str(a.get("date", ""))[:10] == target_d[:10] or str(a.get("id", "")) == target_d]
+        say(f"=== COACH ACTIVITY INSPECT ({target_d} | {len(matches)} match(es)) ===")
+        for ma in matches:
+            say(json.dumps(ma, indent=2, ensure_ascii=False))
+    elif action == "compare":
+        if not (getattr(args, "epoch_a", None) and getattr(args, "epoch_b", None)):
+            sys.exit("coach compare requires `--epoch-a YYYY-MM-DD..YYYY-MM-DD --epoch-b YYYY-MM-DD..YYYY-MM-DD`")
+        _coach_compare_epochs(brain, hk, args.epoch_a, args.epoch_b)
+    elif action == "field-test":
+        _coach_field_test(root, brain, hk, unit=getattr(args, "unit", "1"), date_str=args.date, execute=args.execute)
     else:
         _coach_context(
             root,
@@ -3641,9 +4013,15 @@ def _apply_upgrade(brain, src, values, data, dry):
                 acts.append("INDEX.md: link `coach/README.md`")
     readme_coach = os.path.join(brain, "coach", "README.md")
     rdy_coach = os.path.join(brain, "coach", "readiness.md")
-    if os.path.isfile(readme_coach) and "readiness.md" not in read(readme_coach):
-        if os.path.isfile(rdy_coach) or "coach/readiness.md" in data.get("skeleton_add", []):
-            acts.append("coach/README.md: link `readiness.md`")
+    pb_coach = os.path.join(brain, "coach", "playbook.md")
+    if os.path.isfile(readme_coach):
+        rc_txt = read(readme_coach)
+        need_link = (
+            ("readiness.md" not in rc_txt and (os.path.isfile(rdy_coach) or "coach/readiness.md" in data.get("skeleton_add", [])))
+            or ("playbook.md" not in rc_txt and (os.path.isfile(pb_coach) or "coach/playbook.md" in data.get("skeleton_add", [])))
+        )
+        if need_link:
+            acts.append("coach/README.md: link `readiness.md` / `playbook.md`")
             if not dry:
                 _ensure_coach_readiness_link(brain, execute=True)
     sp = os.path.join(brain, "settings.md")
@@ -4583,9 +4961,16 @@ def main():
     p.add_argument("--execute", action="store_true", help="accepted for CLI consistency")
 
     p = sub.add_parser("coach")
-    p.add_argument("action", nargs="?", default="context",
-                   choices=("context", "status", "auth-strava", "sync", "note", "zwo"),
-                   help="coach action (default: context)")
+    p.add_argument(
+        "action",
+        nargs="?",
+        default="context",
+        choices=(
+            "context", "status", "auth-strava", "auth-hammerhead", "auth-garmin", "auth-intervals",
+            "sync", "note", "zwo", "fit", "push", "history", "inspect", "compare", "field-test",
+        ),
+        help="coach action (default: context)",
+    )
     p.add_argument("--init", action="store_true", help="scaffold brain/coach/ and harvest existing athlete thresholds")
     p.add_argument("--mode", choices=("auto", "daily", "checkin", "plan-14d", "macro", "dna"), default="auto",
                    help="context slicing mode (default: auto)")
@@ -4593,21 +4978,40 @@ def main():
                    help="coaching depth override (default: auto from coach/profile.md & streams)")
     p.add_argument("--query", help="optional natural-language user prompt for auto depth escalation")
     p.add_argument("--deep-dive", help="date (YYYY-MM-DD) for full activity stream/lap telemetry")
-    p.add_argument("--date", help="target date (YYYY-MM-DD) for `note` or `zwo`")
+    p.add_argument("--date", help="target date (YYYY-MM-DD) for `note`, `zwo`, `inspect`, or `field-test`")
     p.add_argument("--text", help="athlete feedback note text for `note`")
     p.add_argument("--rpe", type=int, help="optional RPE (1-10) for `note`")
     p.add_argument("--rhr", type=int, help="morning resting heart rate (bpm) for `note` readiness check-in")
+    p.add_argument("--hrv", type=float, help="morning HRV RMSSD (ms) for `note` readiness check-in")
+    p.add_argument("--weight", type=float, help="morning body mass (kg) for `note` readiness check-in")
     p.add_argument("--sleep", type=float, help="sleep duration (hours, e.g. 7.5) for `note` readiness check-in")
     p.add_argument("--sleep-quality", help="sleep quality (e.g. good, fair, poor, or 1-5) for `note` readiness check-in")
     p.add_argument("--soreness", type=int, help="muscle soreness (1-5) for `note` readiness check-in")
-    p.add_argument("--days", type=int, default=14, help="horizon in days for `sync` (default 90) or `zwo` (default 14)")
+    p.add_argument("--leg-pain", type=int, help="peripheral local leg soreness/pain (1-5) for `note` GELB-B detection")
+    p.add_argument("--fatigue-7d", type=int, help="weekly 7-day global fatigue rating (1-5) for `note`")
+    p.add_argument("--days", type=int, default=14, help="horizon in days for `sync` (default 90), `zwo`, or `push` (default 14)")
+    p.add_argument("--months", type=int, default=6, help="lookback months for `history` (default 6)")
+    p.add_argument("--from-date", help="start date YYYY-MM-DD for `history`")
+    p.add_argument("--to-date", help="end date YYYY-MM-DD for `history`")
+    p.add_argument("--sport", help="sport filter (`cycling`, `running`, `strength`) for `history`")
+    p.add_argument("--epoch-a", help="first date window `YYYY-MM-DD..YYYY-MM-DD` for `compare`")
+    p.add_argument("--epoch-b", help="second date window `YYYY-MM-DD..YYYY-MM-DD` for `compare`")
+    p.add_argument("--unit", default="1", help="field-test protocol (`1`, `2`, `preload`, `lsct`) for `field-test`")
     p.add_argument("--all-14d", action="store_true", help="compile all cycling workouts in the next 14 days")
     p.add_argument("--mock-file", help="offline Strava JSON fixture for `sync`")
-    p.add_argument("--client-id", help="Strava API Client ID for `auth-strava`")
-    p.add_argument("--client-secret", help="Strava API Client Secret for `auth-strava`")
-    p.add_argument("--access-token", help="Strava OAuth Access Token for `auth-strava`")
-    p.add_argument("--refresh-token", help="Strava OAuth Refresh Token for `auth-strava`")
-    p.add_argument("--code", help="Strava OAuth authorization code for headless `auth-strava`")
+    p.add_argument("--wellness-mock", help="offline Garmin/Intervals wellness JSON fixture for `sync`")
+    p.add_argument("--mock-dir", help="offline device sync directory for `push`")
+    p.add_argument("--client-id", help="OAuth Client ID for `auth-strava` or `auth-hammerhead`")
+    p.add_argument("--client-secret", help="OAuth Client Secret for `auth-strava` or `auth-hammerhead`")
+    p.add_argument("--access-token", help="OAuth Access Token for `auth-strava` or `auth-hammerhead`")
+    p.add_argument("--refresh-token", help="OAuth Refresh Token for `auth-strava` or `auth-hammerhead`")
+    p.add_argument("--code", help="OAuth authorization code for headless `auth-strava` or `auth-hammerhead`")
+    p.add_argument("--email", help="Garmin Connect email for `auth-garmin`")
+    p.add_argument("--password", help="Garmin Connect password (discarded immediately after token exchange)")
+    p.add_argument("--mfa-code", help="Garmin 6-digit MFA code for `auth-garmin`")
+    p.add_argument("--tokens-json", help="Garmin serialized session tokens JSON for `auth-garmin`")
+    p.add_argument("--athlete-id", help="Intervals.icu athlete ID for `auth-intervals`")
+    p.add_argument("--api-key", help="Intervals.icu API key for `auth-intervals`")
     p.add_argument("--port", type=int, default=8766, help="loopback OAuth callback port (default: 8766)")
     p.add_argument("--open", action="store_true", help="open visual calendar in Coach View")
     p.add_argument("--no-sync", action="store_true", help="skip automatic Strava background sync during `context`")

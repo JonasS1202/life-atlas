@@ -981,6 +981,85 @@ class _QuietHandler(http.server.SimpleHTTPRequestHandler):
             self.send_header("Location", "/calendar.html?view=coach")
             self.end_headers()
             return
+        if parsed.path == "/coach-push":
+            if os.path.isfile(ATLAS_PY):
+                subprocess.run([sys.executable, "-I", "-B", ATLAS_PY, "--root", os.path.dirname(BRAIN_DIR),
+                                "coach", "push", "--days", "14", "--execute"],
+                               capture_output=True, text=True, timeout=60)
+            self.send_response(302)
+            self.send_header("Location", "/calendar.html?view=coach")
+            self.end_headers()
+            return
+        if parsed.path == "/hammerhead-connect":
+            qs = urllib.parse.parse_qs(parsed.query)
+            hh_env = os.path.join(BRAIN_DIR, "_secrets", "hammerhead.env")
+            cid = (qs.get("client_id") or [""])[0].strip()
+            csec = (qs.get("client_secret") or [""])[0].strip()
+            if cid and csec and os.path.isfile(ATLAS_PY):
+                subprocess.run([sys.executable, "-I", "-B", ATLAS_PY, "--root", os.path.dirname(BRAIN_DIR),
+                                "coach", "auth-hammerhead", "--client-id", cid, "--client-secret", csec],
+                               capture_output=True, text=True, timeout=15)
+            if not cid and os.path.isfile(hh_env):
+                try:
+                    with open(hh_env, encoding="utf-8") as fh:
+                        for ln in fh:
+                            if ln.strip().startswith("HAMMERHEAD_CLIENT_ID="):
+                                cid = ln.split("=", 1)[1].strip()
+                except OSError:
+                    pass
+            srv_port = self.server.server_address[1]
+            if cid:
+                redir = urllib.parse.quote(f"http://127.0.0.1:{srv_port}/hammerhead-callback", safe="")
+                url = (f"https://api.hammerhead.io/v1/auth/oauth/authorize?client_id={urllib.parse.quote(cid, safe='')}"
+                       f"&response_type=code&redirect_uri={redir}&scope=workout%3Awrite&state=atlas-coach")
+                self.send_response(302)
+                self.send_header("Location", url)
+                self.end_headers()
+                return
+            form_html = (
+                "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Atlas · Hammerhead Karoo Connect</title></head>"
+                "<body style='font-family:Inter,sans-serif;background:#070a0f;color:#e2e8f0;display:flex;align-items:center;"
+                "justify-content:center;height:100vh;margin:0'><form method='GET' action='/hammerhead-connect' "
+                "style='background:#0d121b;border:1px solid rgba(255,255,255,0.12);padding:32px 36px;border-radius:14px;max-width:460px;width:90%'>"
+                "<h2 style='margin:0 0 10px;color:#facc15'>Hammerhead Karoo verbinden</h2>"
+                "<p style='color:#94a3b8;font-size:13px;line-height:1.5;margin:0 0 16px'>Hinterlege einmalig deine Hammerhead OAuth Client-Daten "
+                "(Redirect-URI: <code>http://127.0.0.1:" + str(srv_port) + "/hammerhead-callback</code>). Lokal gespeichert in <code>_secrets/hammerhead.env</code>.</p>"
+                "<input name='client_id' placeholder='HAMMERHEAD_CLIENT_ID' required style='width:100%;box-sizing:border-box;margin-bottom:10px;padding:10px;border-radius:8px;border:1px solid #334155;background:#070a0f;color:#fff'>"
+                "<input name='client_secret' type='password' placeholder='HAMMERHEAD_CLIENT_SECRET' required style='width:100%;box-sizing:border-box;margin-bottom:16px;padding:10px;border-radius:8px;border:1px solid #334155;background:#070a0f;color:#fff'>"
+                "<button type='submit' style='width:100%;padding:11px;border-radius:8px;border:none;background:#facc15;color:#0f172a;font-weight:700;cursor:pointer'>Mit Hammerhead verbinden &rarr;</button>"
+                "</form></body></html>"
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(form_html)))
+            self.end_headers()
+            self.wfile.write(form_html)
+            return
+        if parsed.path == "/hammerhead-callback":
+            qs = urllib.parse.parse_qs(parsed.query)
+            code = (qs.get("code") or [None])[0]
+            ok = False
+            if code and os.path.isfile(ATLAS_PY):
+                res = subprocess.run([sys.executable, "-I", "-B", ATLAS_PY, "--root", os.path.dirname(BRAIN_DIR),
+                                      "coach", "auth-hammerhead", "--code", code, "--execute"],
+                                     capture_output=True, text=True, timeout=45)
+                ok = res.returncode == 0
+                if ok:
+                    _rerender_calendar()
+            msg = "&#10003; Hammerhead Karoo erfolgreich verbunden!" if ok else "Hammerhead-Verbindung fehlgeschlagen."
+            col = "#facc15" if ok else "#f43f5e"
+            body = (f"<!DOCTYPE html><html><head><meta charset='utf-8'><title>Atlas · Hammerhead</title></head>"
+                    f"<body style='font-family:Inter,sans-serif;background:#070a0f;color:{col};display:flex;align-items:center;"
+                    f"justify-content:center;height:100vh;margin:0'><div style='background:#0d121b;border:1px solid rgba(255,255,255,0.1);"
+                    f"padding:32px 40px;border-radius:14px;text-align:center'><h2>{msg}</h2>"
+                    f"<a href='/calendar.html?view=coach' style='color:#38bdf8;font-weight:600'>Zum Coach Dashboard &rarr;</a>"
+                    f"</div><script>setTimeout(()=>location.href='/calendar.html?view=coach',900);</script></body></html>").encode("utf-8")
+            self.send_response(200 if ok else 400)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         return super().do_GET()
 
     def do_POST(self):

@@ -3,6 +3,8 @@ summary: Athlete profile, coaching depth (auto/simple/standard/pro), thresholds 
 tags: [sport, self]
 aliases: [Athlete Profile, Trainingszonen, Leistungsdaten, Schwellenwerte, Rider Profile]
 depth: auto
+coach_style: direct-demanding
+accountability: strict
 ---
 # Athlete Profile & Thresholds
 

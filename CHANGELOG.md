@@ -2,6 +2,17 @@
 
 Written for users: `/atlas-update` shows the sections between the installed and the new version.
 
+## [1.4.0] - 2026-11-18
+
+- **7-Pillar Biophysical Engine & Zero-Fallback Missing-Data Gate (`pillars_engine.py`, `coach_engine.py`, `atlas.py`):**
+  - **Deterministic 7-Pillar State Vector:** Adds 1Hz powermeter spike filtering (Mateo-March 2025, `> 50` artifact record lock), 7-day smoothed body composition (`FFM`, `M_akt`, individualized lactate distribution space `Vol_rel,ind`), `W'`-cleaned `VO2max_rel_clean` & `VO2max_FFM`, Meixner `vLamax_sprint` with Anchor Decay Guard, Mader-Heck-Hauser MLSS bisection solver + Lactate-Shuttle Efficiency `eta_shuttle`, stoichiometric `CHO/Fat` curves (`P_FatMax`, `MFO`, `P_CarbMax_90`), `CP/W'` OLS `SEE` gating + `MPR` + OmniPD `A`, Chorley dynamic bi-exponential `W'bal` (`tau_FC`, `tau_SC`), non-ERG sprint torque-velocity (`T_max`, `C_opt`) + functional Myotype Z-score `Z_Myo`, intensity-weighted durability (`w_sub <= CP` vs. `w_sup > CP`, cadence fade, Dual-TID), Bassett/measured `CdA` + `Compound Score` + learned `indoor_cp_offset_w` + Townsend altitude + RED-S guard + Minetti/Morin running bridge, and 4-stage readiness (`GRÜN / GELB-A / GELB-B / ROT` where peripheral leg conflict overrides green HRV) with Sanders `Q_Strain` / `Q_RPE:PO` ratios and Readiness TTL expiration.
+  - **Zero Silent Fallbacks & Two-Stage Progressive Context:** `atlas.py coach context` explicitly flags missing biometric/calibration inputs (`weight_kg`, `kfa_pct`, `rhr`, `hr_max`, `age/sex`, `creatine_flag`, stale `15s`/`12m` anchors) with concrete questions instead of silent numeric defaults, while keeping the always-on slice compact and providing on-demand `atlas.py coach history`, `compare`, `inspect`, and `field-test` commands.
+- **Autonomous Coach Agent, Accountability & Personal `playbook.md` (`coach.md`, `skeleton/coach/playbook.md`, `atlas_hook.py`):**
+  - **Self-Driving Coaching Files & Coach Voice:** Audits and autonomously builds/updates stale `macro-plan.md`, `dna.md`, and `< 7d` workout horizons; detects unexcused skipped workouts and Plan-vs-Actual interval/Zone-2 discipline breaches (`evaluate_workout_execution`); pairs praise and blunt accountability (`coach_style`, `accountability`) with the Socratic Question Radar backed by `brain/coach/playbook.md` and empirical dose-response correlation (`compute_individual_response_model`).
+  - **Multi-Turn Hook Continuity & Warmup Sync:** Broadens natural-language coach routing (fatigue, sleep, illness, devices), maintains follow-up context across multi-turn coaching Q&A, adds non-blocking delta sync on `SessionStart`, and surfaces a concise Coach Pulse in the daily briefing.
+- **Hammerhead Karoo, Garmin Connect, Intervals.icu & Pure-Stdlib `.FIT` Sync (`coach_connectors.py`, `fit_writer.py`, `cal_engine.py`, `calendar.html`):**
+  - **Hardware & Biometric Connectors:** Adds pure-stdlib ANT+ `.FIT` binary workout compilation (`fit_writer.py`), Hammerhead Karoo 1-Click OAuth & idempotent `.zwo` calendar CRUD (`POST/PUT/DELETE`), Garmin Connect wellness pull (`RHR`, `HRV RMSSD`, `sleep`, `weight` -> `readiness.md`) + structured watch/Edge workout push, optional Intervals.icu REST bridge, and `atlas.py coach push` / dashboard controls.
+
 ## [1.3.3] - 2026-11-16
 
 - **Universal Brain Layouts & Small-Brain Recall (`graph_engine.py`, `atlas_hook.py`, `atlas.py`):**

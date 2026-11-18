@@ -37,7 +37,7 @@ sys.dont_write_bytecode = True
 _TOOLS_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools"))
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
-from atlas_lib import cal_engine, coach_engine, graph_engine
+from atlas_lib import cal_engine, coach_connectors, coach_engine, graph_engine
 
 BRAIN = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 PROBE = bool(os.environ.get("ATLAS_PROBE"))  # set by `atlas.py probe`: run, but change nothing
@@ -1243,6 +1243,14 @@ def _extract_coach_context(idx, cal_items=None):
                 dna_txt = fh.read(HEAD_BYTES)
         except OSError:
             pass
+    pb_txt = ""
+    pb_full = os.path.join(BRAIN, "coach", "playbook.md")
+    if os.path.isfile(pb_full):
+        try:
+            with open(pb_full, encoding="utf-8", errors="replace") as fh:
+                pb_txt = fh.read(HEAD_BYTES)
+        except OSError:
+            pass
     try:
         tel = coach_engine.build_coach_telemetry(
             profile_text=prof_txt_full,
@@ -1252,6 +1260,8 @@ def _extract_coach_context(idx, cal_items=None):
             strava_connected=c_state["strava_connected"],
             fallback_ftp=ftp_watts,
             dna_text=dna_txt,
+            playbook_text=pb_txt,
+            macro_info=macro,
         )
         tel_compact = {k: v for k, v in tel.items() if k != "curves"}
         raw_pc = c_state["power_curve"]
@@ -1291,6 +1301,7 @@ def _extract_coach_context(idx, cal_items=None):
         "schedule": schedule or "17:00 – 20:00 Uhr",
         "macro": macro,
         "strava_connected": c_state["strava_connected"],
+        "connectors": coach_connectors.connector_status_summary(BRAIN),
         "pending_feedback": c_state["pending_feedback"],
         "power_curve": p_curve,
         "durability_tiers": dur_tiers,
@@ -1451,7 +1462,7 @@ def render_calendar_html(idx=None, start_server=False):
         if day_acts:
             act = day_acts[0]
             it["strava_id"] = act.get("id")
-            for k_act in ("np_w", "avg_hr", "tss", "w_bal_min_pct", "matches_burned", "cho_burn_g"):
+            for k_act in ("np_w", "avg_hr", "tss", "w_bal_min_pct", "matches_burned", "cho_burn_g", "execution"):
                 if act.get(k_act) is not None:
                     it[k_act] = act[k_act]
             if act.get("feedback") and str(act["feedback"]).lower() != "pending":
@@ -1606,6 +1617,20 @@ def session_warmup(cwd, session):
         st["pending_pull_msg"] = (prev + "\n" + msg).strip() if prev and msg not in prev else (msg or prev)
     idx = load_index(budget=INDEX_BUDGET_S)
     try:
+        conn_w = coach_connectors.connector_status_summary(BRAIN)
+        if conn_w.get("strava_connected") or conn_w.get("garmin_connected"):
+            last_s = st.get("last_strava_sync")
+            age_m = ((dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(last_s)).total_seconds() / 60.0) if last_s else 9999
+            if age_m >= 60:
+                atlas_py = os.path.join(_TOOLS_DIR, "atlas.py")
+                subprocess.run(
+                    [sys.executable, "-I", "-B", atlas_py, "--root", _root(), "coach", "sync", "--days", "14", "--execute"],
+                    capture_output=True, text=True, timeout=8,
+                )
+                st = _state()
+    except Exception as exc:
+        _log_hook_error("warmup.coach_sync", exc)
+    try:
         ensure_calendar_ready(idx, start_server=True)
     except Exception as exc:
         _log_hook_error("warmup.render_calendar", exc)
@@ -1694,11 +1719,22 @@ def session_text(cwd, session, skip_pull=False):
         try:
             if "coach" in st.get("modules", []) or os.path.isdir(os.path.join(BRAIN, "coach")):
                 c_state = load_coach_state()
+                c_cal = calendar_items(idx, days=7, past_days=3, include_done=True)
+                today_wo = [w for w in c_cal if w.get("kind") == "workout" and w.get("status") == "open" and w.get("delta") == 0]
+                missed_wo = [w for w in c_cal if w.get("kind") == "workout" and w.get("status") == "open" and -3 <= w.get("delta", 0) < 0]
+                coach_bits = []
+                if today_wo:
+                    coach_bits.append(f"Today's workout: {today_wo[0].get('what', 'Session')}")
+                if missed_wo:
+                    m0 = missed_wo[-1]
+                    coach_bits.append(f"Missed/unmarked workout on {m0['start'].isoformat()} ('{m0.get('what', 'Workout')}') — ask why & adapt")
                 pend = c_state.get("pending_feedback", [])
                 if pend:
                     p0 = pend[0]
                     np_bit = f", NP {p0.get('np_w')}W" if p0.get("np_w") else ""
-                    parts.append(f"Coach check-in: Session '{p0.get('name', 'Workout')}' on {p0.get('date')} ({p0.get('duration_min', 0)}m{np_bit}) has no feedback note yet. Ask 1 short question how it felt and save via `atlas.py coach note --date {p0.get('date')} --text \"...\"`.")
+                    coach_bits.append(f"Session '{p0.get('name', 'Workout')}' on {p0.get('date')} ({p0.get('duration_min', 0)}m{np_bit}) has no feedback note yet -> ask 1 short question & save via `atlas.py coach note --date {p0.get('date')} --text \"...\"`")
+                if coach_bits:
+                    parts.append("Coach pulse: " + " | ".join(coach_bits) + ".")
         except Exception as exc:
             _log_hook_error("session.coach", exc)
         try:
@@ -2002,14 +2038,17 @@ COACH_RX_DNA = re.compile(
     r"wo\s+stehe\s+ich\s+leistungsm[aä][sß]ig|was\s+ist\s+mein\s+limiter|mein\s+limiter|formanalyse|leistungsprofil\s+analys\w*)\b"
 )
 COACH_RX_CHECKIN = re.compile(
-    r"(?i)\b(?:rpe\s*\d|beine\s+waren|puls\s+war|ruhepuls\s+\d|rhr\s+\d|strava\s+sync\w*|"
+    r"(?i)\b(?:rpe\s*\d|beine\s+(?:waren|sind|schwer|wie\s+beton|leer|frisch)|puls\s+war|ruhepuls\s+\d|rhr\s+\d|"
+    r"hrv\s+\d|schlecht\s+geschlafen|nur\s+\d+(?:[.,]\d+)?\s*h\s+geschlafen|halsschmerzen|erk[aä]ltet|krank\s+train\w*|"
+    r"strava\s+sync\w*|garmin\s+(?:sync\w*|verbinden|connect)|hammerhead|karoo\s+(?:sync\w*|verbinden|push)|"
     r"ride\s+check-?in|readiness\s+check|feedback\s+zum\s+(?:ride|training|workout|lauf)|"
-    r"training\s+gestern\s+war|einheit\s+gestern)\b"
+    r"training\s+gestern\s+war|einheit\s+gestern|ausfahrt\s+war)\b"
 )
 COACH_RX_DAILY = re.compile(
     r"(?i)\b(?:mein\s+workout|workout\s+heute|workout\s+morgen|was\s+trainier\w+\s+ich|heutiges?\s+(?:workout|training)|"
-    r"training\s+heute|training\s+morgen|intervall-?training|\.zwo\b|karoo\s+workout|ftp\s+test|sweet\s*spot\s+workout|"
-    r"tagesform\s+training|readiness\s+heute)\b"
+    r"training\s+heute|training\s+morgen|soll\s+ich\s+(?:heute\s+)?(?:trainieren|fahren|laufen|auf\s+die\s+rolle)|"
+    r"auf\s+die\s+rolle|intervall-?training|\.zwo\b|\.fit\b|karoo\s+workout|ftp\s+test|feld-?test|lsct\b|"
+    r"sweet\s*spot\s+workout|tagesform\s+training|readiness\s+heute|7-?s[aä]ulen)\b"
 )
 
 
@@ -2140,6 +2179,12 @@ def prompt_text(prompt, cwd, session):
                     f"and follow {_show('_atlas/procedures/coach.md', cwd)}.{stale_note}"
                 )
                 sess["coach_mode"] = c_mode
+            elif sess.get("coach_mode") and not MAIL_RX.search(prompt) and not TODO_RX.search(prompt):
+                lines.append(
+                    f"Atlas coach (active session follow-up): Persist any athlete answers/biometrics immediately in "
+                    f"`brain/coach/{{profile,playbook}}.md` or via `{py} -I {tools_py} coach note ... --execute`; "
+                    f"use `{py} -I {tools_py} coach history|compare|inspect|push` on demand and keep asking 1-2 sharp coach questions."
+                )
         if not c_mode and MAIL_RX.search(prompt):
             mail_proc = _show("_atlas/procedures/mail.md", cwd)
             user_mail_sk = os.path.join(BRAIN, "skills", "atlas-mail", "SKILL.md")

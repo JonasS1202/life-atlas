@@ -684,9 +684,62 @@ class Coach(AtlasCase):
         self.atlas("core-apply", "--source", REPO, "--execute", tool=SRC_TOOL)
         self.assertEqual(self.read(prof_path), custom_casual_profile)
         self.assertTrue(os.path.isfile(os.path.join(self.brain, "coach", "readiness.md")))
+        self.assertTrue(os.path.isfile(os.path.join(self.brain, "coach", "playbook.md")))
         self.assertIn("[readiness.md](readiness.md)", self.read(coach_readme))
+        self.assertIn("[playbook.md](playbook.md)", self.read(coach_readme))
 
-        # 6. Verify atlas.py check passes with 0 errors, 0 orphans, and within skill description budget
+        # 6. Coach v2: .FIT + Hammerhead/Garmin mock push/update/delete, Garmin wellness sync, & history/compare
+        with open(prof_path, "w", encoding="utf-8") as fh:
+            fh.write(
+                "---\nsummary: Pro Profile\ntags: [self, sport]\ndepth: pro\nsex: male\nage: 26\ncreatine: yes\n---\n"
+                "# Athlete Profile\n\n"
+                "| Metric | Value |\n|---|---|\n"
+                "| **Biometrie** | 184 cm · 74.0 kg · 11.5 % KFA |\n"
+                "| **FTP (Cycling)** | 300 W |\n"
+                "| **Max HR / Rest HR** | 198 bpm / 46 bpm |\n"
+            )
+        mock_dev_dir = os.path.join(self.tmp, "device_mock")
+        push_out1 = self.atlas("coach", "push", "--days", "14", "--mock-dir", mock_dev_dir, "--execute").stdout
+        self.assertIn("1 .zwo file(s)", push_out1)
+        self.assertIn("1 .fit file(s)", push_out1)
+        self.assertIn("Hammerhead mock POST", push_out1)
+        self.assertIn("Garmin mock PUSH", push_out1)
+        fit_path = os.path.join(self.brain, "coach", "workouts", f"{d_tmrw}_threshold-4x8m.fit")
+        self.assertTrue(os.path.isfile(fit_path))
+        with open(fit_path, "rb") as fh:
+            fit_raw = fh.read()
+        self.assertEqual(fit_raw[8:12], b".FIT")
+
+        # Mark tomorrow's workout skipped `[-]` -> `coach push` must DELETE remote Karoo & Garmin workouts!
+        cal_cur = self.read(cal_path).replace(f"- [ ] {d_tmrw} 17:30 [workout:cycling]", f"- [-] {d_tmrw} 17:30 [workout:cycling]")
+        with open(cal_path, "w", encoding="utf-8") as fh:
+            fh.write(cal_cur)
+        push_out2 = self.atlas("coach", "push", "--days", "14", "--mock-dir", mock_dev_dir, "--execute").stdout
+        self.assertIn("Hammerhead mock DELETE", push_out2)
+        self.assertIn("Garmin mock DELETE", push_out2)
+
+        # Wellness mock sync (RHR + HRV + Sleep + Weight) + On-Demand history & field-test
+        w_mock = os.path.join(self.tmp, "garmin_wellness.json")
+        with open(w_mock, "w", encoding="utf-8") as fh:
+            json.dump([{"date": today.isoformat(), "rhr": 46, "sleep_h": 7.9, "sleep_score": 86, "hrv_rmssd": 74.0, "weight_kg": 73.8}], fh)
+        w_sync_out = self.atlas("coach", "sync", "--wellness-mock", w_mock, "--execute").stdout
+        self.assertIn("1 wellness day(s) imported", w_sync_out)
+        self.assertIn("[hrv:74ms]", self.read(os.path.join(self.brain, "coach", "readiness.md")))
+
+        hist_out = self.atlas("coach", "history", "--months", "6").stdout
+        self.assertIn("COACH ON-DEMAND HISTORY", hist_out)
+        ft_out = self.atlas("coach", "field-test", "--unit", "1", "--date", d_tmrw, "--execute").stdout
+        self.assertIn("Field-Test Unit 1", ft_out)
+
+        # Multi-turn hook continuity on follow-up answer
+        follow_out = self.hook("claude", "prompt", {
+            "prompt": "Ich nehme 5g Kreatin täglich und hatte nur wenig Zeit gestern",
+            "session_id": "coach-sess",
+            "cwd": fwd(self.root),
+        })
+        self.assertIn("Atlas coach (active session follow-up)", follow_out)
+
+        # 7. Verify atlas.py check passes with 0 errors, 0 orphans, and within skill description budget
         self.wire_both()
         chk = self.atlas("check", check=False).stdout
         self.assertNotIn("ERROR", chk, chk)

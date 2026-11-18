@@ -9,8 +9,9 @@ For endurance and hybrid athletes (cycling, running, strength). Installed with `
 | Skill `/atlas-coach` | `brain/_atlas/skills/atlas-coach/` | Trigger for the coach mode (also triggered by natural language via `atlas_hook.py`) |
 | Procedure `coach` | `brain/_atlas/procedures/coach.md` | Workflow for Strava onboarding, 3-tier context loading, ride feedback check-ins, macro periodization, 14-day workout planning, and `.zwo` compilation |
 | Coach Hub | `brain/coach/README.md` | Entry point to the athlete's profile, daily readiness, macro plan, 3-epoch power/pace curves, activity log, and `.zwo` workouts |
-| Athlete Profile | `brain/coach/profile.md` | Adaptive depth (`auto \| simple \| standard \| pro`), thresholds & zones, weekly time budget, weekday/weekend windows, bio-rules |
-| Daily Readiness | `brain/coach/readiness.md` | Morning check-in log (`RHR`, sleep hours/quality, soreness `1–5`) driving `GREEN \| AMBER \| RED` gating via `atlas.py coach note` |
+| Athlete Profile | `brain/coach/profile.md` | Adaptive depth (`auto \| simple \| standard \| pro`), `coach_style` & `accountability`, biometrics (`KFA %`, `FFM`), thresholds & zones, weekly time budget, bio-rules |
+| Athlete Playbook | `brain/coach/playbook.md` | Living personal feelings-file & coach notebook: motivation, lifestyle saboteurs, gut/fueling tolerance, indoor/sensor setup, empirical dose-response rules & open discovery |
+| Daily Readiness | `brain/coach/readiness.md` | Morning check-in & Garmin/Intervals wellness log (`RHR`, `HRV RMSSD`, sleep, soreness, `leg_pain`, `GRÜN / GELB-A / GELB-B / ROT`) with Readiness TTL |
 | Macro Plan | `brain/coach/macro-plan.md` | Season periodization table by ISO calendar week (`Base`, `Build`, `Peak`, `Taper`, `Deload`) with `updated:` staleness tracking (>14 days or new goals/blockers) |
 | Power & Pace Curves | `brain/coach/power-curve.md` | 3-Epoch peak matrix (`42d` · `90d` · `365d`), calibrated `CP/W'` & `CS/D'`, multi-tier `kJ/kg` durability, fiber typology, and running splits |
 | Activity & Feedback Log | `brain/coach/activities.md` | 3-Tier training history (`W'bal`, `matches`, torque/`F_opt`, steady-state `Pw:Hr`, CHO `g/h`, cross-sport PMC load) + athlete feedback |

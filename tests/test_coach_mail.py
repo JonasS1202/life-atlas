@@ -518,6 +518,97 @@ class CoachMailUnit(unittest.TestCase):
         self.assertEqual(mode, "dna")
         self.assertIn("DNA", why)
 
+    def test_seven_pillars_diesel_vs_puncheur_ttl_gelbb_and_missing_gate(self):
+        today = dt.date(2026, 11, 18)
+
+        # 1. Spike filter clamps 1s telemetry glitch and locks >50-spike sessions from record curves
+        raw_w = [250.0] * 20 + [3400.0] + [250.0] * 20
+        cleaned_w, meta_ok = ce.filter_power_spikes(raw_w)
+        self.assertEqual(meta_ok["spike_count"], 1)
+        self.assertFalse(meta_ok["locked_for_records"])
+        self.assertEqual(cleaned_w[20], 250.0)
+        corrupt_w = [200.0, 2900.0] * 55
+        _, meta_bad = ce.filter_power_spikes(corrupt_w)
+        self.assertTrue(meta_bad["locked_for_records"])
+
+        # 2. Identical 20m power (~316W -> naive FTP_20 = 300W) at 75 kg, 11.0% KFA:
+        #    Athlete A (Diesel) vs Athlete B (Puncheur) must separate cleanly across Pillars 1-4!
+        prof_full = (
+            "---\nsummary: Profile\ntags: [self, sport]\ndepth: pro\nsex: male\nage: 28\ncreatine: no\n---\n# Profile\n\n"
+            "| Metric | Value |\n|---|---|\n"
+            "| **Biometrie** | 180 cm · 75.0 kg · 11.0 % KFA |\n"
+            "| **Max HR / Rest HR** | 195 bpm / 47 bpm |\n"
+            "| **Radgewicht** | 8.1 kg |\n"
+        )
+        diesel_acts = [{
+            "id": "A1", "date": (today - dt.timedelta(days=5)).isoformat(), "sport": "cycling", "device_watts": True,
+            "duration_min": 90, "np_w": 280, "work_kj": 1500, "kj_above_cp": 25.0,
+            "peaks_fresh": {"5s": 760, "15s": 720, "3m": 369, "5m": 344, "12m": 322, "20m": 316, "60m": 302},
+            "c_opt_sprint_rpm": 111.0, "t_max_nm": 156.0,
+        }]
+        punch_acts = [{
+            "id": "B1", "date": (today - dt.timedelta(days=5)).isoformat(), "sport": "cycling", "device_watts": True,
+            "duration_min": 90, "np_w": 280, "work_kj": 1500, "kj_above_cp": 120.0,
+            "peaks_fresh": {"5s": 1120, "15s": 960, "3m": 430, "5m": 374, "12m": 325, "20m": 311, "60m": 276},
+            "c_opt_sprint_rpm": 131.0, "t_max_nm": 192.0,
+        }]
+        tel_diesel = ce.build_coach_telemetry(prof_full, diesel_acts, today=today)
+        tel_punch = ce.build_coach_telemetry(prof_full, punch_acts, today=today)
+
+        sp_d = tel_diesel["seven_pillars"]
+        sp_p = tel_punch["seven_pillars"]
+        self.assertTrue(sp_d["body"]["kfa_calibrated"])
+        self.assertAlmostEqual(sp_d["body"]["ffm_kg"], 66.75, places=1)
+        self.assertEqual(tel_diesel["coach_audit"]["missing_critical"], [])
+
+        # True CP separates: Diesel CP > 304W, Puncheur CP <= 293W despite identical 316W 20m!
+        self.assertGreater(tel_diesel["cp_model"]["cp_w"], 304)
+        self.assertLessEqual(tel_punch["cp_model"]["cp_w"], 293)
+        # vLamax & Z_Myo separate Slow vs Fast Myotype
+        self.assertLess(sp_d["pillar2_metabolic"]["vlamax_sprint_proxy"], 0.45)
+        self.assertGreater(sp_p["pillar2_metabolic"]["vlamax_sprint_proxy"], 0.65)
+        self.assertEqual(sp_d["pillar4_myotype"]["myotype_class"], "Slow Myotype")
+        self.assertEqual(sp_p["pillar4_myotype"]["myotype_class"], "Fast Myotype")
+        self.assertIn("30/15", sp_p["pillar4_myotype"]["recommended_vo2_protocol"])
+        self.assertGreater(sp_p["pillar3_kinetics"]["omni_decay_a_w"], sp_d["pillar3_kinetics"]["omni_decay_a_w"])
+
+        # 3. Readiness TTL (3-day-old RED sleep expires!) + GELB-B (Peripheral leg pain overrides Green HRV!)
+        stale_rdy = ce.render_readiness_markdown(
+            "",
+            [{"date": (today - dt.timedelta(days=3)).isoformat(), "rhr": 52, "sleep_h": 4.0, "sleep_quality": "poor", "soreness": 4, "status": "RED"}],
+            today.isoformat(),
+        )
+        tel_ttl = ce.build_coach_telemetry(prof_full, punch_acts, readiness_text=stale_rdy, today=today)
+        self.assertEqual(tel_ttl["readiness"]["status"], "GREEN")
+        self.assertFalse(tel_ttl["readiness"]["today_logged"])
+
+        gelbb_rdy = ce.render_readiness_markdown(
+            "",
+            [
+                {"date": today.isoformat(), "rhr": 47, "hrv_rmssd": 74.0, "sleep_h": 7.8, "soreness": 2, "leg_pain": 4, "notes": "Beine wie Beton"},
+                {"date": (today - dt.timedelta(days=1)).isoformat(), "rhr": 47, "hrv_rmssd": 72.0, "sleep_h": 7.6, "soreness": 1},
+                {"date": (today - dt.timedelta(days=2)).isoformat(), "rhr": 48, "hrv_rmssd": 73.0, "sleep_h": 7.7, "soreness": 1},
+            ],
+            today.isoformat(),
+        )
+        tel_gelbb = ce.build_coach_telemetry(prof_full, punch_acts, readiness_text=gelbb_rdy, today=today)
+        self.assertEqual(tel_gelbb["readiness"]["status"], "GREEN")  # Autonomic green
+        self.assertEqual(tel_gelbb["readiness"]["flag_4stage"], "GELB-B")  # Peripheral override!
+
+        # 4. Missing-Data Gate flags unprovided KFA, RHR, creatine without silent precision
+        prof_incomplete = "---\ndepth: pro\n---\n# Profile\n| Metric | Value |\n|---|---|\n| **Biometrie** | 75 kg |\n"
+        tel_miss = ce.build_coach_telemetry(prof_incomplete, punch_acts, today=today)
+        miss_fields = {m["field"] for m in tel_miss["coach_audit"]["missing_critical"]}
+        self.assertIn("kfa_pct", miss_fields)
+        self.assertIn("rhr", miss_fields)
+        self.assertIn("creatine_flag", miss_fields)
+
+        # 5. Minetti cost & Morin leg spring stiffness
+        self.assertAlmostEqual(ce.minetti_running_cost_j_kg_m(0.0), 3.6, places=2)
+        k_leg = ce.compute_morin_leg_stiffness(mass_kg=75.0, height_cm=186.0, vel_mps=4.2, contact_time_s=0.22, flight_time_s=0.11)
+        self.assertIsNotNone(k_leg)
+        self.assertGreater(k_leg, 8.0)
+
 
 if __name__ == "__main__":
     unittest.main()

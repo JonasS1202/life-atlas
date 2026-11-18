@@ -15,6 +15,18 @@ import re
 import statistics
 from typing import Any
 
+from . import pillars_engine
+from .pillars_engine import (  # noqa: F401
+    compute_chorley_w_bal,
+    compute_individual_response_model,
+    compute_morin_leg_stiffness,
+    evaluate_workout_execution,
+    filter_power_spikes,
+    format_seven_pillar_blocks,
+    minetti_running_cost_j_kg_m,
+    query_coach_history,
+)
+
 COACH_DURATIONS: tuple[tuple[str, int], ...] = (
     ("5s", 5),
     ("15s", 15),
@@ -48,11 +60,12 @@ DURABILITY_TIERS: tuple[tuple[str, str], ...] = (
 )
 
 PRO_QUERY_RX = re.compile(
-    r"(?i)\b(?:cp\b|w['’]|wbal|w['’]?bal|skiba|vlamax|glykoly\w*|vo2\s*max|vdot|fatmax|"
+    r"(?i)\b(?:cp\b|w['’]|wbal|w['’]?bal|skiba|chorley|omnipd|vlamax|mader|shuttle|glykoly\w*|vo2\s*max|vdot|fatmax|"
     r"ctl\b|atl\b|tsb\b|acwr\b|monoton\w*|trimp\b|rtss\b|hrtss\b|srpe\b|"
-    r"typolog\w*|muskelfaser\w*|fiber\s+type|pdc\b|torque|drehmoment|quadrant\w*|"
+    r"typolog\w*|myotyp\w*|z_myo|muskelfaser\w*|fiber\s+type|pdc\b|torque|drehmoment|quadrant\w*|"
     r"durability|erm[uü]dungswiderstand|pw\s*:\s*hr|decoupling|entkopplung|"
-    r"ampk|mtor\w*|bosquet|peronnet|hypoxi\w*|rider\s*dna|athlete\s*dna|athleten-?dna|limiter)\b"
+    r"ampk|mtor\w*|bosquet|peronnet|hypoxi\w*|rider\s*dna|athlete\s*dna|athleten-?dna|limiter|"
+    r"kfa\b|ffm\b|compound\s*score|lsct\b|rmssd\b|hrv\b|red-?s\b|beinfeder\w*|minetti)\b"
 )
 
 
@@ -127,6 +140,7 @@ def is_untouched_skeleton_profile(text: str) -> bool:
 
 def parse_athlete_profile(profile_text: str, fallback_ftp: int | None = None, fallback_weight: float | None = None) -> dict[str, Any]:
     """Parse `brain/coach/profile.md` frontmatter and biometrics/thresholds table."""
+    explicit_fields: set[str] = set()
     info: dict[str, Any] = {
         "depth": "auto",
         "is_skeleton": is_untouched_skeleton_profile(profile_text),
@@ -139,8 +153,16 @@ def parse_athlete_profile(profile_text: str, fallback_ftp: int | None = None, fa
         ),
         "weight_kg": fallback_weight,
         "height_cm": None,
+        "kfa_pct": None,
         "age": None,
         "sex": "neutral",
+        "creatine_flag": None,
+        "bike_weight_kg": None,
+        "cda_drops": None,
+        "indoor_cp_offset_w": None,
+        "power_sensor": None,
+        "coach_style": "direct-demanding",
+        "accountability": "strict",
         "ftp_w": fallback_ftp,
         "has_explicit_ftp": False,
         "cp_w": None,
@@ -157,30 +179,66 @@ def parse_athlete_profile(profile_text: str, fallback_ftp: int | None = None, fa
         "weekly_budget": "",
         "schedule": "",
         "bio_rules": [],
+        "explicit_fields": [],
     }
     if not profile_text:
         if info["weight_kg"] is None:
             info["weight_kg"] = 67.0
         return info
 
-    # Parse YAML frontmatter
+    def _parse_kfa_from_str(s: str) -> float | None:
+        m_rng = re.search(r"(\d{1,2}(?:[.,]\d+)?)\s*[–—-]\s*(\d{1,2}(?:[.,]\d+)?)\s*%\s*(?:kfa|body\s*fat|körperfett)?", s, re.I)
+        if m_rng and any(t in s.lower() for t in ("kfa", "body fat", "körperfett", "fat")):
+            a = float(m_rng.group(1).replace(",", "."))
+            b = float(m_rng.group(2).replace(",", "."))
+            return round(0.5 * (a + b), 1)
+        m_single = re.search(r"(\d{1,2}(?:[.,]\d+)?)\s*%\s*(?:kfa|body\s*fat|körperfett)\b", s, re.I)
+        if not m_single and any(t in s.lower() for t in ("kfa", "body fat", "körperfett")):
+            m_single = re.search(r"(\d{1,2}(?:[.,]\d+)?)\s*%", s)
+        if m_single:
+            return round(float(m_single.group(1).replace(",", ".")), 1)
+        return None
+
+    # Parse YAML frontmatter & standalone `key: val` lines
+    fm_scan = profile_text
     if profile_text.startswith("---"):
         end = profile_text.find("\n---", 3)
         if end > 0:
-            fm_block = profile_text[3:end]
-            m_dep = re.search(r"(?im)^depth\s*:\s*([a-z]+)\b", fm_block)
-            if m_dep and m_dep.group(1).lower() in ("auto", "simple", "standard", "pro"):
-                info["depth"] = m_dep.group(1).lower()
-            m_sex = re.search(r"(?im)^(?:sex|gender|geschlecht)\s*:\s*([a-zäöü]+)\b", fm_block)
-            if m_sex:
-                sx = m_sex.group(1).lower()
-                if sx in ("m", "male", "mann", "männlich"):
-                    info["sex"] = "male"
-                elif sx in ("f", "w", "female", "frau", "weiblich"):
-                    info["sex"] = "female"
-            m_age = re.search(r"(?im)^(?:age|alter)\s*:\s*(\d{2})\b", fm_block)
-            if m_age:
-                info["age"] = int(m_age.group(1))
+            fm_scan = profile_text[3:end]
+    m_dep = re.search(r"(?im)^depth\s*:\s*([a-z]+)\b", fm_scan)
+    if m_dep and m_dep.group(1).lower() in ("auto", "simple", "standard", "pro"):
+        info["depth"] = m_dep.group(1).lower()
+    m_sex = re.search(r"(?im)^(?:sex|gender|geschlecht)\s*:\s*([a-zäöü]+)\b", profile_text)
+    if m_sex:
+        sx = m_sex.group(1).lower()
+        if sx in ("m", "male", "mann", "männlich"):
+            info["sex"] = "male"
+            explicit_fields.add("sex")
+        elif sx in ("f", "w", "female", "frau", "weiblich"):
+            info["sex"] = "female"
+            explicit_fields.add("sex")
+    m_age_fm = re.search(r"(?im)^(?:age|alter)\s*:\s*(\d{2})\b", profile_text)
+    if m_age_fm:
+        info["age"] = int(m_age_fm.group(1))
+        explicit_fields.add("age")
+    m_wt_kv = re.search(r"(?im)^(?:weight_kg|weight|gewicht)\s*:\s*(\d{2,3}(?:[.,]\d+)?)\b", profile_text)
+    if m_wt_kv:
+        info["weight_kg"] = float(m_wt_kv.group(1).replace(",", "."))
+        explicit_fields.add("weight_kg")
+    m_kfa_kv = re.search(r"(?im)^(?:kfa_pct|kfa|body_fat_pct|body_fat)\s*:\s*(\d{1,2}(?:[.,]\d+)?)\b", profile_text)
+    if m_kfa_kv:
+        info["kfa_pct"] = float(m_kfa_kv.group(1).replace(",", "."))
+        explicit_fields.add("kfa_pct")
+    m_cr_kv = re.search(r"(?im)^(?:creatine|creatine_flag|kreatin)\s*:\s*(true|false|yes|no|ja|nein|1|0)\b", profile_text)
+    if m_cr_kv:
+        info["creatine_flag"] = m_cr_kv.group(1).lower() in ("true", "yes", "ja", "1")
+        explicit_fields.add("creatine_flag")
+    m_style = re.search(r"(?im)^coach_style\s*:\s*([a-z0-9_-]+)\b", profile_text)
+    if m_style:
+        info["coach_style"] = m_style.group(1).lower()
+    m_acc = re.search(r"(?im)^accountability\s*:\s*([a-z0-9_-]+)\b", profile_text)
+    if m_acc:
+        info["accountability"] = m_acc.group(1).lower()
 
     in_rules = False
     for raw_line in profile_text.splitlines():
@@ -216,7 +274,15 @@ def parse_athlete_profile(profile_text: str, fallback_ftp: int | None = None, fa
                     info["schedule"] = m_sch.group(1)
 
         if "|" not in line:
-            # Also detect casual free-text sport cues when user wrote prose instead of a table
+            if line.startswith(("- ", "* ")):
+                m_w_b = re.search(r"(?i)\b(?:weight|gewicht)\b[^0-9]*(\d{2,3}(?:[.,]\d+)?)\s*kg\b", line)
+                if m_w_b:
+                    info["weight_kg"] = float(m_w_b.group(1).replace(",", "."))
+                    explicit_fields.add("weight_kg")
+                kfa_b = _parse_kfa_from_str(line)
+                if kfa_b is not None:
+                    info["kfa_pct"] = kfa_b
+                    explicit_fields.add("kfa_pct")
             if not info["primary_sport"]:
                 if any(w in low for w in ("laufen", "running", "joggen")) and not any(w in low for w in ("cycling", "rennrad", "rad")):
                     info["primary_sport"] = "running"
@@ -228,21 +294,68 @@ def parse_athlete_profile(profile_text: str, fallback_ftp: int | None = None, fa
         k_low = cells[0].lower()
         v_raw = cells[1]
         v_low = v_raw.lower()
+        full_row = " ".join(cells)
 
-        if any(w in k_low for w in ("biometrie", "height", "weight", "körpermaße", "gewicht")):
-            m_cm = re.search(r"(\d{3})\s*cm\b", v_low)
+        if "radgewicht" in k_low or "bike weight" in k_low or "m_bike" in k_low or "systemgewicht" in k_low:
+            m_bk = re.search(r"(?<![0-9.,])(\d{1,2}(?:[.,]\d+)?)\s*kg\b", v_low)
+            if m_bk:
+                info["bike_weight_kg"] = float(m_bk.group(1).replace(",", "."))
+                explicit_fields.add("bike_weight_kg")
+
+        elif any(w in k_low for w in ("biometrie", "height", "weight", "körpermaße", "gewicht", "kfa", "body fat", "körperfett")):
+            m_cm = re.search(r"(?<![0-9.,])(\d{3})\s*cm\b", v_low)
             if m_cm:
                 info["height_cm"] = int(m_cm.group(1))
-            m_kg = re.search(r"(\d{2,3}(?:[.,]\d+)?)\s*kg\b", v_low)
+                explicit_fields.add("height_cm")
+            m_kg = re.search(r"(?<![0-9.,])(\d{2,3}(?:[.,]\d+)?)\s*kg\b", v_low)
             if m_kg:
                 info["weight_kg"] = float(m_kg.group(1).replace(",", "."))
-            m_age = re.search(r"(\d{2})\s*(?:y|yo|jahre|j\.)\b", v_low)
+                explicit_fields.add("weight_kg")
+            kfa_cand = _parse_kfa_from_str(full_row)
+            if kfa_cand is not None:
+                info["kfa_pct"] = kfa_cand
+                explicit_fields.add("kfa_pct")
+            m_age = re.search(r"(\d{2})\s*(?:y|yo|jahre|j\.)\b", full_row.lower())
             if m_age and not info["age"]:
                 info["age"] = int(m_age.group(1))
-            if any(w in v_low for w in ("male", "männlich")) and "female" not in v_low:
+                explicit_fields.add("age")
+            if any(w in full_row.lower() for w in ("male", "männlich")) and "female" not in full_row.lower():
                 info["sex"] = "male"
-            elif any(w in v_low for w in ("female", "weiblich")):
+                explicit_fields.add("sex")
+            elif any(w in full_row.lower() for w in ("female", "weiblich")):
                 info["sex"] = "female"
+                explicit_fields.add("sex")
+
+        elif "kreatin" in k_low or "creatine" in k_low:
+            if any(w in v_low for w in ("ja", "yes", "true", "5g", "5 g", "aktiv", "daily", "täglich")):
+                info["creatine_flag"] = True
+                explicit_fields.add("creatine_flag")
+            elif any(w in v_low for w in ("nein", "no", "false", "kein", "none")):
+                info["creatine_flag"] = False
+                explicit_fields.add("creatine_flag")
+
+        elif "cda" in k_low:
+            m_cda = re.search(r"(0[.,]\d{2,4})\b", v_low)
+            if m_cda:
+                info["cda_drops"] = float(m_cda.group(1).replace(",", "."))
+                explicit_fields.add("cda_drops")
+
+        elif "indoor" in k_low and "offset" in k_low:
+            m_off = re.search(r"([+-]?\d{1,2})\s*w\b", v_low)
+            if m_off:
+                info["indoor_cp_offset_w"] = int(m_off.group(1))
+                explicit_fields.add("indoor_cp_offset_w")
+
+        elif "coach" in k_low and ("stil" in k_low or "style" in k_low or "persona" in k_low or "ton" in k_low):
+            if any(w in v_low for w in ("world-tour", "direkt", "direct", "strict", "fordernd", "hart")):
+                info["coach_style"] = "direct-demanding"
+                info["accountability"] = "strict"
+            elif any(w in v_low for w in ("sanft", "gentle", "supportive", "calm", "empathisch")):
+                info["coach_style"] = "supportive"
+                info["accountability"] = "gentle"
+            else:
+                info["coach_style"] = "analytical"
+                info["accountability"] = "balanced"
 
         elif "primary" in k_low or "hauptsport" in k_low or "sportart" in k_low:
             info["primary_sport"] = re.sub(r"[`*]", "", v_raw).strip()
@@ -256,11 +369,13 @@ def parse_athlete_profile(profile_text: str, fallback_ftp: int | None = None, fa
                 info["ftp_w"] = int(m_w.group(1))
                 if not info["is_skeleton"]:
                     info["has_explicit_ftp"] = True
+                    explicit_fields.add("ftp_w")
 
         elif "cp" in k_low and ("w'" in k_low or "critical power" in k_low or "critical" in v_low):
             m_cp = re.search(r"(?:cp\s*[:=]?\s*)?(\d{2,3})\s*w\b", v_low)
             if m_cp:
                 info["cp_w"] = int(m_cp.group(1))
+                explicit_fields.add("cp_w")
             m_wp = re.search(r"(\d{1,2}(?:[.,]\d+)?)\s*kj\b", v_low)
             if m_wp:
                 info["w_prime_kj"] = float(m_wp.group(1).replace(",", "."))
@@ -283,9 +398,16 @@ def parse_athlete_profile(profile_text: str, fallback_ftp: int | None = None, fa
                 m_max = re.search(r"\b(1[5-9]\d|2[0-2]\d)\s*bpm\b", v_low)
             if m_max:
                 info["hr_max"] = int(m_max.group(1))
+                explicit_fields.add("hr_max")
             m_rhr = re.search(r"(?:rhr|rest(?:ing)?\s*hr|ruhepuls)\s*[:=]?\s*~?(\d{2})\s*bpm", v_low)
+            if not m_rhr:
+                # Also match `~200 bpm / 48 bpm` slash format
+                m_slash = re.search(r"/\s*~?([3-8]\d)\s*bpm", v_low)
+                if m_slash:
+                    m_rhr = m_slash
             if m_rhr:
                 info["rhr"] = int(m_rhr.group(1))
+                explicit_fields.add("rhr")
             m_lthr = re.search(r"lthr\s*[:=]?\s*~?(\d{2,3})\s*bpm", v_low)
             if m_lthr:
                 info["lthr"] = int(m_lthr.group(1))
@@ -312,6 +434,7 @@ def parse_athlete_profile(profile_text: str, fallback_ftp: int | None = None, fa
             elif not info["schedule"]:
                 info["schedule"] = re.sub(r"[`*]", "", v_raw).strip()
 
+    info["explicit_fields"] = sorted(explicit_fields)
     if info["weight_kg"] is None:
         info["weight_kg"] = 67.0
     return info
@@ -1224,6 +1347,11 @@ def compute_stream_metrics(
     out: dict[str, Any] = {}
 
     if watts and valid_cycling_watts:
+        watts, spike_meta = pillars_engine.filter_power_spikes(watts)
+        if spike_meta.get("spike_count"):
+            out["spike_count"] = spike_meta["spike_count"]
+        if spike_meta.get("locked_for_records"):
+            out["locked_for_records"] = True
         n = len(watts)
         joules = sum(max(0.0, w) for w in watts)
         out["work_kj"] = int(round(joules / 1000.0))
@@ -1250,6 +1378,7 @@ def compute_stream_metrics(
             out["tss"] = int(round((n * np_w * if_val) / (ref_thresh * 3600.0) * 100.0))
 
         out["peaks_fresh"] = mmp_from_watts(watts)
+        out["t_alac_s"] = pillars_engine.detect_sprint_t_alac(watts)
 
         # Legacy >1500 kJ fatigued MMP (preserved for backward compatibility)
         cum_j = 0.0
@@ -1266,12 +1395,16 @@ def compute_stream_metrics(
         if dur_tiers:
             out["peaks_durability"] = dur_tiers
 
-        # Skiba W'bal 1Hz ODE
+        # Skiba W'bal + Chorley Dynamic Bi-Exponential W'bal 1Hz ODEs
         wbal = compute_skiba_w_bal(watts, cp_watts=eff_cp, w_prime_j=eff_wp)
+        chorley = pillars_engine.compute_chorley_w_bal(watts, cp_watts=eff_cp, w_prime_j=eff_wp)
         if wbal.get("w_bal_min_pct") is not None:
             out["w_bal_min_pct"] = wbal["w_bal_min_pct"]
             out["matches_burned"] = wbal["matches_burned"]
             out["kj_above_cp"] = wbal["kj_above_cp"]
+        if chorley.get("w_bal_min_pct") is not None:
+            out["w_bal_chorley_min_pct"] = chorley["w_bal_min_pct"]
+            out["kj_sub_cp"] = chorley["kj_sub_cp"]
 
         # Steady-state filtered Pw:Hr decoupling
         if len(hr) == n:
@@ -1280,10 +1413,18 @@ def compute_stream_metrics(
                 out["decoupling_pct"] = ss_dec
                 out["steady_decoupling_pct"] = ss_dec
 
-        # Neuromuscular Torque-Cadence & Q1–Q4
+        # Neuromuscular Torque-Cadence, Q1–Q4, Sprint T(C) Slope (with ERG filter), & Cadence Fade
         if cad:
             tc = compute_torque_cadence_quadrants(watts, cad, cp_watts=eff_cp)
             out.update(tc)
+            stv = pillars_engine.extract_sprint_torque_velocity(watts, cad)
+            if stv:
+                out.update(stv)
+            if len(cad) >= 2400:
+                c_early = [c for w, c in zip(watts[300:1500], cad[300:1500]) if w >= 0.50 * eff_cp and c >= 50.0]
+                c_late = [c for w, c in zip(watts[-1200:], cad[-1200:]) if w >= 0.50 * eff_cp and c >= 50.0]
+                if len(c_early) >= 120 and len(c_late) >= 120:
+                    out["cadence_drop_fatigued_rpm"] = round((sum(c_early) / len(c_early)) - (sum(c_late) / len(c_late)), 1)
 
         # Substrate oxidation & fueling recommendation
         map_5m = float((out["peaks_fresh"] or {}).get("5m") or (eff_cp / 0.83))
@@ -1587,6 +1728,12 @@ def parse_readiness_log(text: str) -> list[dict[str, Any]]:
         slp_val = float(m_slp.group(1).replace(",", ".")) if m_slp else None
         m_sq = re.search(r"\(([^)]+)\)", slp_cell)
         sq_val = m_sq.group(1).strip() if m_sq else None
+        nt_raw = cells[10].strip() if len(cells) > 10 and cells[10].strip() not in ("—", "-") else ""
+
+        m_hrv = re.search(r"\[hrv:(\d+(?:\.\d+)?)ms\]", nt_raw, re.I)
+        m_wt = re.search(r"\[wt:(\d+(?:\.\d+)?)kg\]", nt_raw, re.I)
+        m_lp = re.search(r"\[legs:(\d)\]", nt_raw, re.I)
+        m_f7 = re.search(r"\[fat7d:(\d)\]", nt_raw, re.I)
 
         rows.append({
             "date": cells[0],
@@ -1600,7 +1747,11 @@ def parse_readiness_log(text: str) -> list[dict[str, Any]]:
             "tsb": _num(7),
             "acwr": _num(8),
             "status": cells[9].strip() if len(cells) > 9 and cells[9].strip() not in ("—", "-") else "",
-            "notes": cells[10].strip() if len(cells) > 10 and cells[10].strip() not in ("—", "-") else "",
+            "notes": nt_raw,
+            "hrv_rmssd": float(m_hrv.group(1)) if m_hrv else None,
+            "weight_kg": float(m_wt.group(1)) if m_wt else None,
+            "leg_pain": int(m_lp.group(1)) if m_lp else None,
+            "fatigue_7d": int(m_f7.group(1)) if m_f7 else None,
         })
     rows.sort(key=lambda r: r["date"], reverse=True)
     return rows
@@ -1626,7 +1777,19 @@ def render_readiness_markdown(
         tsb_s = f"{r['tsb']:+.1f}" if r.get("tsb") is not None else "—"
         acw_s = f"{r['acwr']:.2f}" if r.get("acwr") is not None else "—"
         st_s = r.get("status") or "—"
-        nt_s = str(r.get("notes") or "—").replace("|", "/").replace("\n", " ").strip() or "—"
+        nt_clean = str(r.get("notes") or "").replace("|", "/").replace("\n", " ").strip()
+        nt_clean = re.sub(r"\s*\[(?:hrv:[^\]]+|wt:[^\]]+|legs:\d|fat7d:\d)\]", "", nt_clean).strip()
+        meta_tags = []
+        if r.get("hrv_rmssd") is not None:
+            meta_tags.append(f"[hrv:{float(r['hrv_rmssd']):g}ms]")
+        if r.get("weight_kg") is not None:
+            meta_tags.append(f"[wt:{float(r['weight_kg']):g}kg]")
+        if r.get("leg_pain") is not None:
+            meta_tags.append(f"[legs:{int(r['leg_pain'])}]")
+        if r.get("fatigue_7d") is not None:
+            meta_tags.append(f"[fat7d:{int(r['fatigue_7d'])}]")
+        nt_parts = [x for x in (" ".join(meta_tags), nt_clean if nt_clean != "—" else "") if x]
+        nt_s = " ".join(nt_parts) if nt_parts else "—"
         table_lines.append(
             f"| {r['date']} | {rhr_s} | {slp_s} | {rpe_s} | {sor_s} | {ctl_s} | {atl_s} | {tsb_s} | {acw_s} | {st_s} | {nt_s} |"
         )
@@ -1708,10 +1871,17 @@ def evaluate_readiness_and_guardrails(
     ref_today = today or dt.date.today()
     today_iso = ref_today.isoformat()
     cutoff_30d = (ref_today - dt.timedelta(days=30)).isoformat()
-    cutoff_2d = (ref_today - dt.timedelta(days=2)).isoformat()
+    cutoff_1d = (ref_today - dt.timedelta(days=1)).isoformat()
 
-    # Latest readiness check-in (today or yesterday)
-    recent_row = next((r for r in (readiness_rows or []) if r["date"] >= cutoff_2d), None)
+    # Readiness TTL: only today (age 0) or yesterday (age 1, decayed) drives subjective readiness;
+    # entries >=2 days old expire cleanly so an old bad night never pins the athlete on RED!
+    recent_row = next((r for r in (readiness_rows or []) if r["date"] >= cutoff_1d), None)
+    row_age_days = 0
+    if recent_row:
+        try:
+            row_age_days = max(0, (ref_today - dt.date.fromisoformat(str(recent_row["date"])[:10])).days)
+        except ValueError:
+            row_age_days = 0
     rhr_hist = [
         float(r["rhr"])
         for r in (readiness_rows or [])
@@ -1723,19 +1893,21 @@ def evaluate_readiness_and_guardrails(
     amber_reasons: list[str] = []
 
     if recent_row:
+        target_red = amber_reasons if row_age_days >= 1 else red_reasons
+        age_tag = " (yesterday carry-over)" if row_age_days == 1 else ""
         if recent_row.get("rhr") is not None and base_rhr is not None:
             delta_rhr = float(recent_row["rhr"]) - base_rhr
             if delta_rhr >= 7.0:
-                red_reasons.append(f"RHR +{delta_rhr:.0f} bpm vs 30d baseline ({base_rhr:.0f} bpm)")
+                target_red.append(f"RHR +{delta_rhr:.0f} bpm vs 30d baseline ({base_rhr:.0f} bpm){age_tag}")
             elif delta_rhr >= 4.0:
-                amber_reasons.append(f"RHR +{delta_rhr:.0f} bpm vs 30d ({base_rhr:.0f} bpm)")
+                amber_reasons.append(f"RHR +{delta_rhr:.0f} bpm vs 30d ({base_rhr:.0f} bpm){age_tag}")
         if recent_row.get("sleep_h") is not None:
             slp = float(recent_row["sleep_h"])
             if slp < 5.5:
-                red_reasons.append(f"Sleep {slp:.1f}h (<5.5h)")
-            elif slp < 6.5:
+                target_red.append(f"Sleep {slp:.1f}h (<5.5h){age_tag}")
+            elif slp < 6.5 and row_age_days == 0:
                 amber_reasons.append(f"Sleep {slp:.1f}h")
-        if recent_row.get("sleep_quality"):
+        if recent_row.get("sleep_quality") and row_age_days == 0:
             sq_low = str(recent_row["sleep_quality"]).strip().lower()
             if sq_low in ("terrible", "awful", "1", "1/5"):
                 red_reasons.append(f"Poor sleep quality ({recent_row['sleep_quality']})")
@@ -1744,8 +1916,8 @@ def evaluate_readiness_and_guardrails(
         if recent_row.get("soreness") is not None:
             sor = int(recent_row["soreness"])
             if sor >= 5:
-                red_reasons.append(f"Severe soreness ({sor}/5)")
-            elif sor >= 4:
+                target_red.append(f"Severe soreness ({sor}/5){age_tag}")
+            elif sor >= 4 and row_age_days == 0:
                 amber_reasons.append(f"Elevated soreness ({sor}/5)")
 
     tsb = float(pmc.get("tsb") or 0.0)
@@ -1954,7 +2126,7 @@ def aggregate_epoch_curves(
         })
         qb["sessions"] += 1
         qb["hours"] = round(qb["hours"] + float(a.get("duration_min") or 0.0) / 60.0, 1)
-        if is_valid_cycling_power_activity(a):
+        if is_valid_cycling_power_activity(a) and not a.get("locked_for_records"):
             pf_q = a.get("peaks_fresh") or {}
             for k_src, k_dst in (("5s", "cycling_5s"), ("5m", "cycling_5m"), ("20m", "cycling_20m")):
                 v_q = pf_q.get(k_src)
@@ -1969,7 +2141,7 @@ def aggregate_epoch_curves(
         if age > 365:
             continue
 
-        if is_valid_cycling_power_activity(a):
+        if is_valid_cycling_power_activity(a) and not a.get("locked_for_records"):
             pf = a.get("peaks_fresh") or {}
             p_fat = a.get("peaks_fatigued") or {}
             p_dur = a.get("peaks_durability") or {}
@@ -2209,8 +2381,10 @@ def build_coach_telemetry(
     fallback_weight: float | None = None,
     today: dt.date | None = None,
     dna_text: str = "",
+    playbook_text: str = "",
+    macro_info: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build unified Simple/Standard/Pro telemetry snapshot in < 2 ms (0 LLM tokens)."""
+    """Build unified Simple/Standard/Pro + 7-Pillar telemetry snapshot in < 5 ms (0 LLM tokens)."""
     ref_today = today or dt.date.today()
     prof = parse_athlete_profile(profile_text, fallback_ftp=fallback_ftp, fallback_weight=fallback_weight)
     readiness_rows = parse_readiness_log(readiness_text)
@@ -2285,6 +2459,81 @@ def build_coach_telemetry(
         reverse=True,
     )
     last_act = sorted_acts[0] if sorted_acts else None
+    dna_snap = parse_dna_snapshot(dna_text)
+
+    # 7-Pillar Biophysical Vector + Missing Gate + Autonomy + Socratic Question Radar
+    body = pillars_engine.compute_body_composition(prof, readiness_rows, today=ref_today)
+    p1 = pillars_engine.compute_pillar1_oxidative(
+        p_5min_w=float(base_5m) if base_5m else None,
+        w_prime_j=eff_wp_j,
+        mass_kg=body.get("mass_kg_7d"),
+        ffm_kg=body.get("ffm_kg"),
+        kfa_calibrated=bool(body.get("kfa_calibrated")),
+    )
+    t_alac_best = next((float(a["t_alac_s"]) for a in sorted_acts if a.get("t_alac_s")), 3.0)
+    p2 = pillars_engine.compute_pillar2_metabolic_mader(
+        curves=curves,
+        cp_watts=float(eff_cp) if eff_cp else None,
+        vo2max_rel_clean=p1.get("vo2max_rel_clean"),
+        body=body,
+        t_alac_s=t_alac_best,
+        creatine_flag=prof.get("creatine_flag"),
+    )
+    p3 = pillars_engine.compute_cp_see_and_omnipd(mmp_90d, cp_model)
+    p3["tau_fc_50pct_s"] = 22
+    p3["tau_sc_50pct_s"] = 503
+    p4 = pillars_engine.compute_pillar4_myotype(
+        activities=sorted_acts,
+        cp_watts=float(eff_cp) if eff_cp else None,
+        mpr_watts=p3.get("mpr_w"),
+        vlamax_sprint=p2.get("vlamax_sprint_proxy"),
+        mass_kg=body.get("mass_kg_7d"),
+    )
+    p5 = pillars_engine.compute_pillar5_durability_and_tid(
+        activities=sorted_acts,
+        curves=curves,
+        cp_watts=float(eff_cp) if eff_cp else None,
+        mass_kg=body.get("mass_kg_7d"),
+        today=ref_today,
+    )
+    p6 = pillars_engine.compute_pillar6_locomotion_environment(
+        profile=prof,
+        body=body,
+        activities=sorted_acts,
+        curves=curves,
+        cp_watts=float(eff_cp) if eff_cp else None,
+        w_prime_kj=round(eff_wp_j / 1000.0, 1) if eff_wp_j else None,
+        readiness_rows=readiness_rows,
+        today=ref_today,
+    )
+    p7 = pillars_engine.compute_pillar7_and_stage2_readiness(
+        readiness_rows=readiness_rows,
+        activities=sorted_acts,
+        profile=prof,
+        base_readiness=readiness,
+        cp_watts=float(eff_cp) if eff_cp else None,
+        myotype_z=p4.get("myotype_z_score"),
+        today=ref_today,
+    )
+    readiness["flag_4stage"] = p7["readiness_flag_4stage"]
+    readiness["today_logged"] = p7["today_logged"]
+    readiness["coaching_directive"] = p7["coaching_directive"]
+
+    pb_info = pillars_engine.parse_playbook(playbook_text)
+    resp_model = pillars_engine.compute_individual_response_model(sorted_acts, readiness_rows)
+    coach_audit = pillars_engine.audit_missing_inputs_and_questions(
+        profile=prof,
+        body=body,
+        pillar2=p2,
+        cp_model=cp_model,
+        readiness_stage2=p7,
+        playbook_info=pb_info,
+        activities=sorted_acts,
+        cal_items=cal_items or [],
+        macro_info=macro_info,
+        dna_snapshot=dna_snap,
+        today=ref_today,
+    )
 
     return {
         "depth": depth,
@@ -2301,7 +2550,20 @@ def build_coach_telemetry(
         "durability_5m_90d": dur_summary,
         "last_activity": last_act,
         "curves": curves,
-        "dna_snapshot": parse_dna_snapshot(dna_text),
+        "dna_snapshot": dna_snap,
+        "seven_pillars": {
+            "body": body,
+            "pillar1_oxidative": p1,
+            "pillar2_metabolic": p2,
+            "pillar3_kinetics": p3,
+            "pillar4_myotype": p4,
+            "pillar5_durability": p5,
+            "pillar6_locomotion": p6,
+            "pillar7_readiness": p7,
+        },
+        "response_model": resp_model,
+        "playbook": {"exists": pb_info["exists"], "rules": pb_info["rules"]},
+        "coach_audit": coach_audit,
     }
 
 
