@@ -73,8 +73,8 @@ Act like a **real, proactive human head coach** working directly through the ath
 ## 4. Hardware & Biometric Connectors (Pre-Wired for Every User)
 
 All credentials stay local in `brain/_secrets/*.env` (`chmod 600`):
-- **Strava (1-Click OAuth, no keys needed):** `[🧡 Mit Strava verbinden](http://127.0.0.1:8765/strava-connect)` (`atlas.py coach auth-strava`).
-- **Hammerhead Karoo (`.zwo` Calendar Auto-Push/Update/Delete):** `[💛 Karoo verbinden](http://127.0.0.1:8765/hammerhead-connect)` (`atlas.py coach auth-hammerhead`).
+- **Strava (1-Click OAuth, no keys needed):** `[🧡 Mit Strava verbinden (1-Klick)](http://127.0.0.1:8765/strava-connect)` (`atlas.py coach auth-strava`).
+- **Hammerhead Karoo (1-Click OAuth, no keys or developer app needed; `.zwo` Calendar Auto-Push/Update/Delete):** `[💛 Karoo verbinden (1-Klick)](http://127.0.0.1:8765/hammerhead-connect)` (`atlas.py coach auth-hammerhead`). Never ask the athlete for `CLIENT_ID` or `CLIENT_SECRET` — clicking the link redirects straight to Hammerhead consent.
 - **Garmin Connect (Wellness `RHR/HRV/Sleep/Weight` Pull + Watch/Edge Workout Push + `.fit`):** `atlas.py coach auth-garmin --email ... --password ...` (password discarded immediately; offline `.fit` files always compiled into `brain/coach/workouts/`).
 - **Intervals.icu Bridge (Optional):** `atlas.py coach auth-intervals --athlete-id ... --api-key ...`.
 

@@ -3070,21 +3070,26 @@ def _coach_context(
     if macro["stale"] and eff_mode in ("plan-14d", "macro"):
         say("  [!] STALE MACRO PLAN DETECTED: You MUST update `brain/coach/macro-plan.md` (with current `updated:` and "
             f"`goals_hash: {macro['current_goals_hash']}`) BEFORE writing 14-day workouts in `brain/calendar/README.md`!")
+    cal_url_ctx = hk.render_calendar_html(idx, start_server=True)
+    base_url_ctx = cal_url_ctx.rsplit("/", 1)[0]
     if c_state["strava_connected"]:
         say(f"  Strava: connected ({len(c_state['activities'])} cached activities)")
     else:
         import urllib.parse
-        cal_url = hk.render_calendar_html(idx, start_server=True)
-        base_url = cal_url.rsplit("/", 1)[0]
-        connect_url = f"{base_url}/strava-connect"
-        redir = urllib.parse.quote(f"{base_url}/strava-callback", safe="")
+        connect_url = f"{base_url_ctx}/strava-connect"
+        redir = urllib.parse.quote(f"{base_url_ctx}/strava-callback", safe="")
         auth_url = (f"https://www.strava.com/oauth/authorize?client_id={DEFAULT_STRAVA_CLIENT_ID}&response_type=code"
                     f"&redirect_uri={redir}&approval_prompt=force&scope=read,activity:read,activity:read_all,profile:read_all")
         say("  Strava: NOT CONNECTED. Give the user this direct 1-Click link in your reply (no API keys or setup needed — clicking connects & syncs automatically):")
         say(f"    [🧡 Jetzt mit Strava verbinden (1-Klick)]({connect_url})")
         say(f"    Direct OAuth URL: {auth_url}")
+    hh_status_str = (
+        "connected"
+        if conn["hammerhead_connected"]
+        else f"not connected — 1-Click link (NO API keys needed): `[💛 Karoo verbinden (1-Klick)]({base_url_ctx}/hammerhead-connect)`"
+    )
     say(
-        f"  Devices & Wellness: Hammerhead Karoo={'connected' if conn['hammerhead_connected'] else 'not connected (`atlas.py coach auth-hammerhead`)'} | "
+        f"  Devices & Wellness: Hammerhead Karoo={hh_status_str} | "
         f"Garmin Connect={'connected' if conn['garmin_connected'] else 'not connected (`atlas.py coach auth-garmin` + `.fit` ready)'} | "
         f"Intervals.icu={'connected' if conn['intervals_connected'] else 'optional'}"
     )
@@ -3188,7 +3193,7 @@ def _coach_context(
 
 
 def _coach_auth_hammerhead(root, brain, hk, args):
-    """Connect Hammerhead Karoo via 1-Click loopback OAuth or explicit tokens (`_secrets/hammerhead.env`)."""
+    """Zero-friction 1-Click OAuth flow (via background calendar server on 127.0.0.1:8765 or --code exchange) for Hammerhead Karoo."""
     env = coach_connectors.load_secret_env(brain, "hammerhead")
     if getattr(args, "client_id", None):
         env["HAMMERHEAD_CLIENT_ID"] = args.client_id.strip()
@@ -3207,20 +3212,33 @@ def _coach_auth_hammerhead(root, brain, hk, args):
 
     cal_url = hk.render_calendar_html(hk.load_index(), start_server=True)
     base_url = cal_url.rsplit("/", 1)[0]
-    redirect_uri = f"{base_url}/hammerhead-callback"
+    local_cb = f"{base_url}/hammerhead-callback"
     connect_url = f"{base_url}/hammerhead-connect"
+    srv_port = 8765
+    try:
+        srv_port = int(base_url.rsplit(":", 1)[1])
+    except Exception:
+        pass
+    cfg = coach_connectors.hammerhead_oauth_config(brain, local_redirect_uri=local_cb)
 
     code = getattr(args, "code", None)
     if not code:
-        cid = env.get("HAMMERHEAD_CLIENT_ID") or os.environ.get("ATLAS_HAMMERHEAD_CLIENT_ID") or ""
-        say("=== Hammerhead Karoo 1-Click Connect ===")
-        say(f"Open this link to connect Hammerhead Karoo (or enter Developer Client ID/Secret once in the browser):\n  [💛 Hammerhead Karoo verbinden]({connect_url})")
-        if cid:
-            say(f"Direct Hammerhead OAuth URL:\n  {coach_connectors.build_hammerhead_authorize_url(cid, redirect_uri)}")
+        state = coach_connectors.mint_hammerhead_oauth_state(brain, port=srv_port)
+        auth_url = coach_connectors.build_hammerhead_authorize_url(cfg["client_id"], cfg["redirect_uri"], state=state)
+        if not os.environ.get("ATLAS_NO_CAL_SERVER"):
+            try:
+                import webbrowser
+                webbrowser.open(auth_url)
+            except Exception:
+                pass
+        say("=== Hammerhead Karoo 1-Click Connect (Ready) ===")
+        say(f"Click this link to connect Hammerhead Karoo with 1 click (no API keys or developer app needed):\n  [💛 Jetzt mit Hammerhead Karoo verbinden (1-Klick)]({connect_url})")
+        say(f"Direct Hammerhead OAuth URL:\n  {auth_url}")
+        say(f"Visual Coach Dashboard:\n  [📅 Atlas Coach Dashboard]({cal_url}?view=coach)")
         return
 
     ok, msg = coach_connectors.hammerhead_exchange_code(
-        brain, code=code, redirect_uri=redirect_uri,
+        brain, code=code, redirect_uri=cfg["redirect_uri"],
         client_id=getattr(args, "client_id", None),
         client_secret=getattr(args, "client_secret", None),
     )

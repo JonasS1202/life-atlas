@@ -2,6 +2,11 @@
 
 Written for users: `/atlas-update` shows the sections between the installed and the new version.
 
+## [1.4.1] - 2026-11-18
+
+- **True 1-Click Hammerhead Karoo Connect (`coach_connectors.py`, `cal_engine.py`, `atlas.py`, `calendar.html`):**
+  - **Zero Developer-App / API-Key Setup:** Replaces the manual `HAMMERHEAD_CLIENT_ID` / `HAMMERHEAD_CLIENT_SECRET` prompt on `/hammerhead-connect` with a true 1-Click OAuth flow (matching Strava 1-Click) backed by a CSRF-verified loopback state (`atlas:<port>:<nonce>`) and stateless OAuth token broker (`atlas-cal-v4` auto-reloads any running `v3` background calendar server upon `/atlas-update`). Athletes simply click **Karoo verbinden (1-Klick)** -> **Annehmen** on Hammerhead -> connected; tokens remain stored exclusively in local `brain/_secrets/hammerhead.env` (`0o600`), with optional custom app override preserved.
+
 ## [1.4.0] - 2026-11-18
 
 - **7-Pillar Biophysical Engine & Zero-Fallback Missing-Data Gate (`pillars_engine.py`, `coach_engine.py`, `atlas.py`):**

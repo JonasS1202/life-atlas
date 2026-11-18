@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
 import time
@@ -30,6 +31,11 @@ HAMMERHEAD_AUTHORIZE_URL = "https://api.hammerhead.io/v1/auth/oauth/authorize"
 HAMMERHEAD_TOKEN_URL = "https://api.hammerhead.io/v1/auth/oauth/token"
 HAMMERHEAD_WORKOUTS_URL = "https://api.hammerhead.io/v1/api/workouts"
 HAMMERHEAD_SCOPE = "workout:write"
+
+# Default 1-Click OAuth App (stateless loopback relay + token broker; secret stays server-side)
+DEFAULT_HAMMERHEAD_CLIENT_ID = "cddac053-588c-4e3f-90e1-30287f58b544"
+DEFAULT_HAMMERHEAD_REDIRECT_URI = "https://bikecoa.ch/hammerhead-callback"
+DEFAULT_HAMMERHEAD_BROKER_URL = "https://bikecoa.ch/api/atlas/hammerhead/token"
 
 INTERVALS_API_BASE = "https://intervals.icu/api/v1"
 REQUEST_TIMEOUT = 25
@@ -95,15 +101,110 @@ def connector_status_summary(brain: str) -> dict[str, Any]:
     return {
         "strava_connected": bool(strava.get("STRAVA_REFRESH_TOKEN") or strava.get("STRAVA_ACCESS_TOKEN")),
         "hammerhead_connected": bool(hh.get("HAMMERHEAD_REFRESH_TOKEN") or hh.get("HAMMERHEAD_ACCESS_TOKEN")),
-        "hammerhead_configured": bool(hh.get("HAMMERHEAD_CLIENT_ID") or os.environ.get("ATLAS_HAMMERHEAD_CLIENT_ID")),
+        "hammerhead_configured": True,
         "garmin_connected": bool(garmin.get("GARMIN_TOKENS_B64") or garmin.get("GARMIN_ACCESS_TOKEN")),
         "intervals_connected": bool(icu.get("INTERVALS_API_KEY") and icu.get("INTERVALS_ATHLETE_ID")),
     }
 
 
 # ---------------------------------------------------------------------------
-# 2. Hammerhead Karoo Direct Integration (Pure-Stdlib OAuth 2.0 + Multipart)
+# 2. Hammerhead Karoo Direct Integration (Pure-Stdlib 1-Click OAuth + Multipart)
 # ---------------------------------------------------------------------------
+
+def _hh_state_store_path(brain: str) -> str:
+    return os.path.join(brain, "_atlas", "cache", "hh_oauth_states.json")
+
+
+def mint_hammerhead_oauth_state(brain: str, port: int = 8765) -> str:
+    """Mint a CSRF-safe loopback OAuth state (`atlas:<port>:<nonce>`) with 30-min TTL."""
+    eff_port = port if 8760 <= int(port) <= 8799 else 8765
+    state = f"atlas:{eff_port}:{secrets.token_urlsafe(20)}"
+    p = _hh_state_store_path(brain)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    now_ts = int(time.time())
+    store: dict[str, int] = {}
+    if os.path.isfile(p):
+        try:
+            with open(p, encoding="utf-8") as fh:
+                raw = json.load(fh)
+            if isinstance(raw, dict):
+                store = {str(k): int(v) for k, v in raw.items() if now_ts - int(v) < 1800}
+        except Exception:
+            store = {}
+    store[state] = now_ts
+    # Keep at most 12 recent nonces
+    if len(store) > 12:
+        store = dict(sorted(store.items(), key=lambda kv: kv[1])[-12:])
+    fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, json.dumps(store).encode("utf-8"))
+    finally:
+        os.close(fd)
+    return state
+
+
+def verify_hammerhead_oauth_state(brain: str, state: str | None) -> bool:
+    """Verify and consume a previously minted Hammerhead OAuth state nonce."""
+    cand = str(state or "").strip()
+    if not cand:
+        return False
+    p = _hh_state_store_path(brain)
+    if not os.path.isfile(p):
+        return False
+    now_ts = int(time.time())
+    try:
+        with open(p, encoding="utf-8") as fh:
+            raw = json.load(fh)
+        if not isinstance(raw, dict):
+            return False
+    except Exception:
+        return False
+    matched = False
+    remaining: dict[str, int] = {}
+    for k, ts_val in raw.items():
+        try:
+            age = now_ts - int(ts_val)
+        except Exception:
+            continue
+        if age >= 1800:
+            continue
+        if secrets.compare_digest(str(k), cand):
+            matched = True
+        else:
+            remaining[str(k)] = int(ts_val)
+    if matched:
+        try:
+            fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.write(fd, json.dumps(remaining).encode("utf-8"))
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
+    return matched
+
+
+def hammerhead_oauth_config(brain: str, local_redirect_uri: str = "") -> dict[str, Any]:
+    """Resolve effective Hammerhead OAuth configuration (1-Click default or custom developer override)."""
+    env = load_secret_env(brain, "hammerhead")
+    cid_custom = (env.get("HAMMERHEAD_CLIENT_ID") or os.environ.get("ATLAS_HAMMERHEAD_CLIENT_ID") or "").strip()
+    csec_custom = (env.get("HAMMERHEAD_CLIENT_SECRET") or os.environ.get("ATLAS_HAMMERHEAD_CLIENT_SECRET") or "").strip()
+    if cid_custom and csec_custom:
+        return {
+            "custom": True,
+            "client_id": cid_custom,
+            "client_secret": csec_custom,
+            "redirect_uri": (env.get("HAMMERHEAD_REDIRECT_URI") or local_redirect_uri).strip(),
+            "broker_url": "",
+        }
+    return {
+        "custom": False,
+        "client_id": DEFAULT_HAMMERHEAD_CLIENT_ID,
+        "client_secret": "",
+        "redirect_uri": os.environ.get("ATLAS_HAMMERHEAD_REDIRECT_URI") or DEFAULT_HAMMERHEAD_REDIRECT_URI,
+        "broker_url": os.environ.get("ATLAS_HAMMERHEAD_BROKER_URL") or DEFAULT_HAMMERHEAD_BROKER_URL,
+    }
+
 
 def _encode_multipart_file(field_name: str, filename: str, file_bytes: bytes, content_type: str = "application/xml") -> tuple[bytes, str]:
     """Encode a single file as RFC 7578 `multipart/form-data` using Python stdlib only."""
@@ -132,28 +233,45 @@ def build_hammerhead_authorize_url(client_id: str, redirect_uri: str, state: str
 def hammerhead_exchange_code(
     brain: str,
     code: str,
-    redirect_uri: str,
+    redirect_uri: str = "",
     client_id: str | None = None,
     client_secret: str | None = None,
 ) -> tuple[bool, str]:
     env = load_secret_env(brain, "hammerhead")
     cid = (client_id or env.get("HAMMERHEAD_CLIENT_ID") or os.environ.get("ATLAS_HAMMERHEAD_CLIENT_ID") or "").strip()
     csec = (client_secret or env.get("HAMMERHEAD_CLIENT_SECRET") or os.environ.get("ATLAS_HAMMERHEAD_CLIENT_SECRET") or "").strip()
-    if not (cid and csec):
-        return False, "Missing HAMMERHEAD_CLIENT_ID / HAMMERHEAD_CLIENT_SECRET."
-    payload = urllib.parse.urlencode({
-        "grant_type": "authorization_code",
-        "code": code,
-        "client_id": cid,
-        "client_secret": csec,
-        "redirect_uri": redirect_uri,
-    }).encode("utf-8")
-    req = urllib.request.Request(
-        HAMMERHEAD_TOKEN_URL,
-        data=payload,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        method="POST",
-    )
+
+    if cid and csec:
+        eff_redir = redirect_uri or env.get("HAMMERHEAD_REDIRECT_URI") or "http://127.0.0.1:8765/hammerhead-callback"
+        payload = urllib.parse.urlencode({
+            "grant_type": "authorization_code",
+            "code": code,
+            "client_id": cid,
+            "client_secret": csec,
+            "redirect_uri": eff_redir,
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            HAMMERHEAD_TOKEN_URL,
+            data=payload,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        )
+    else:
+        broker_url = os.environ.get("ATLAS_HAMMERHEAD_BROKER_URL") or DEFAULT_HAMMERHEAD_BROKER_URL
+        payload = json.dumps({
+            "grant_type": "authorization_code",
+            "code": code,
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            broker_url,
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "AtlasCoach/1.4",
+            },
+            method="POST",
+        )
+
     try:
         with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="replace"))
@@ -162,12 +280,16 @@ def hammerhead_exchange_code(
     access = str(data.get("access_token") or "").strip()
     if not access:
         return False, "Hammerhead OAuth response did not include access_token."
-    env["HAMMERHEAD_CLIENT_ID"] = cid
-    env["HAMMERHEAD_CLIENT_SECRET"] = csec
+    if cid and csec:
+        env["HAMMERHEAD_CLIENT_ID"] = cid
+        env["HAMMERHEAD_CLIENT_SECRET"] = csec
     env["HAMMERHEAD_ACCESS_TOKEN"] = access
     if data.get("refresh_token"):
         env["HAMMERHEAD_REFRESH_TOKEN"] = str(data["refresh_token"]).strip()
-    env["HAMMERHEAD_EXPIRES_AT"] = str(int(time.time()) + int(data.get("expires_in") or 3600))
+    if data.get("expires_at"):
+        env["HAMMERHEAD_EXPIRES_AT"] = str(int(data["expires_at"]))
+    else:
+        env["HAMMERHEAD_EXPIRES_AT"] = str(int(time.time()) + int(data.get("expires_in") or 3600))
     p = save_secret_env(brain, "hammerhead", env)
     return True, p
 
@@ -177,23 +299,39 @@ def hammerhead_refresh_if_needed(brain: str, env_dict: dict[str, str] | None = N
     exp = int(env.get("HAMMERHEAD_EXPIRES_AT") or 0)
     if env.get("HAMMERHEAD_ACCESS_TOKEN") and (exp == 0 or exp > time.time() + 120):
         return env["HAMMERHEAD_ACCESS_TOKEN"]
-    cid = env.get("HAMMERHEAD_CLIENT_ID") or os.environ.get("ATLAS_HAMMERHEAD_CLIENT_ID") or ""
-    csec = env.get("HAMMERHEAD_CLIENT_SECRET") or os.environ.get("ATLAS_HAMMERHEAD_CLIENT_SECRET") or ""
-    rtok = env.get("HAMMERHEAD_REFRESH_TOKEN") or ""
-    if not (cid and csec and rtok):
+    cid = (env.get("HAMMERHEAD_CLIENT_ID") or os.environ.get("ATLAS_HAMMERHEAD_CLIENT_ID") or "").strip()
+    csec = (env.get("HAMMERHEAD_CLIENT_SECRET") or os.environ.get("ATLAS_HAMMERHEAD_CLIENT_SECRET") or "").strip()
+    rtok = (env.get("HAMMERHEAD_REFRESH_TOKEN") or "").strip()
+    if not rtok:
         return env.get("HAMMERHEAD_ACCESS_TOKEN", "")
-    payload = urllib.parse.urlencode({
-        "grant_type": "refresh_token",
-        "refresh_token": rtok,
-        "client_id": cid,
-        "client_secret": csec,
-    }).encode("utf-8")
-    req = urllib.request.Request(
-        HAMMERHEAD_TOKEN_URL,
-        data=payload,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        method="POST",
-    )
+    if cid and csec:
+        payload = urllib.parse.urlencode({
+            "grant_type": "refresh_token",
+            "refresh_token": rtok,
+            "client_id": cid,
+            "client_secret": csec,
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            HAMMERHEAD_TOKEN_URL,
+            data=payload,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        )
+    else:
+        broker_url = os.environ.get("ATLAS_HAMMERHEAD_BROKER_URL") or DEFAULT_HAMMERHEAD_BROKER_URL
+        payload = json.dumps({
+            "grant_type": "refresh_token",
+            "refresh_token": rtok,
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            broker_url,
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "AtlasCoach/1.4",
+            },
+            method="POST",
+        )
     try:
         with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="replace"))
@@ -201,7 +339,10 @@ def hammerhead_refresh_if_needed(brain: str, env_dict: dict[str, str] | None = N
             env["HAMMERHEAD_ACCESS_TOKEN"] = str(data["access_token"]).strip()
             if data.get("refresh_token"):
                 env["HAMMERHEAD_REFRESH_TOKEN"] = str(data["refresh_token"]).strip()
-            env["HAMMERHEAD_EXPIRES_AT"] = str(int(time.time()) + int(data.get("expires_in") or 3600))
+            if data.get("expires_at"):
+                env["HAMMERHEAD_EXPIRES_AT"] = str(int(data["expires_at"]))
+            else:
+                env["HAMMERHEAD_EXPIRES_AT"] = str(int(time.time()) + int(data.get("expires_in") or 3600))
             save_secret_env(brain, "hammerhead", env)
             return env["HAMMERHEAD_ACCESS_TOKEN"]
     except Exception:

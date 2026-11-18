@@ -609,6 +609,71 @@ class CoachMailUnit(unittest.TestCase):
         self.assertIsNotNone(k_leg)
         self.assertGreater(k_leg, 8.0)
 
+    def test_hammerhead_one_click_oauth_state_and_broker(self):
+        """Hammerhead Karoo works with 1-Click out-of-the-box (no manual Client ID/Secret required)."""
+        import json
+        import subprocess
+        import tempfile
+        from unittest.mock import patch, MagicMock
+        from atlas_lib import coach_connectors as cc
+
+        with tempfile.TemporaryDirectory() as r:
+            env_sub = dict(os.environ, ATLAS_NO_CAL_SERVER="1")
+            atlas_py = os.path.join(TOOLS_DIR, "atlas.py")
+            subprocess.run(
+                [sys.executable, "-I", atlas_py, "--root", r, "init", "--source", REPO, "--name", "Test", "--modules", "coach", "--execute"],
+                check=True, capture_output=True, text=True, env=env_sub,
+            )
+            brain = os.path.join(r, "brain")
+
+            # 1. Default 1-Click config works with zero secrets configured
+            cfg = cc.hammerhead_oauth_config(brain, local_redirect_uri="http://127.0.0.1:8765/hammerhead-callback")
+            self.assertFalse(cfg["custom"])
+            self.assertEqual(cfg["client_id"], cc.DEFAULT_HAMMERHEAD_CLIENT_ID)
+            self.assertEqual(cfg["redirect_uri"], cc.DEFAULT_HAMMERHEAD_REDIRECT_URI)
+
+            # 2. CSRF state mint + single-use verification
+            st = cc.mint_hammerhead_oauth_state(brain, port=8765)
+            self.assertTrue(st.startswith("atlas:8765:"))
+            self.assertFalse(cc.verify_hammerhead_oauth_state(brain, "atlas:8765:forged-state"))
+            self.assertTrue(cc.verify_hammerhead_oauth_state(brain, st))
+            self.assertFalse(cc.verify_hammerhead_oauth_state(brain, st))  # Consumed once!
+
+            # 3. `atlas.py coach auth-hammerhead` outputs 1-Click link without asking for API keys
+            out = subprocess.run(
+                [sys.executable, "-I", atlas_py, "--root", r, "coach", "auth-hammerhead"],
+                check=True, capture_output=True, text=True, env=env_sub,
+            ).stdout
+            self.assertIn("1-Click Connect (Ready)", out)
+            self.assertIn("/hammerhead-connect", out)
+            self.assertIn("no API keys", out)
+
+            # 4. Stateless broker code exchange & token refresh save local tokens (`chmod 600`)
+            fake_resp = MagicMock()
+            fake_resp.read.return_value = json.dumps({
+                "access_token": "hh-1click-acc",
+                "refresh_token": "hh-1click-ref",
+                "expires_at": int(dt.datetime.now(dt.timezone.utc).timestamp()) - 10,  # Force refresh test next
+            }).encode("utf-8")
+            fake_resp.__enter__.return_value = fake_resp
+            with patch("urllib.request.urlopen", return_value=fake_resp) as mock_url:
+                ok, msg = cc.hammerhead_exchange_code(brain, code="oauth-code-xyz")
+                self.assertTrue(ok, msg)
+                req_sent = mock_url.call_args[0][0]
+                self.assertEqual(req_sent.full_url, cc.DEFAULT_HAMMERHEAD_BROKER_URL)
+
+            fake_ref = MagicMock()
+            fake_ref.read.return_value = json.dumps({
+                "access_token": "hh-1click-acc-fresh",
+                "refresh_token": "hh-1click-ref-fresh",
+                "expires_at": int(dt.datetime.now(dt.timezone.utc).timestamp()) + 3600,
+            }).encode("utf-8")
+            fake_ref.__enter__.return_value = fake_ref
+            with patch("urllib.request.urlopen", return_value=fake_ref):
+                tok = cc.hammerhead_refresh_if_needed(brain)
+                self.assertEqual(tok, "hh-1click-acc-fresh")
+            self.assertTrue(cc.connector_status_summary(brain)["hammerhead_connected"])
+
 
 if __name__ == "__main__":
     unittest.main()
