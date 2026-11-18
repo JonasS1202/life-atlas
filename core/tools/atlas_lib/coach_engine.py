@@ -2494,8 +2494,21 @@ def build_coach_telemetry(
         curves=curves,
         cp_watts=float(eff_cp) if eff_cp else None,
         mass_kg=body.get("mass_kg_7d"),
+        hr_max=prof.get("hr_max"),
         today=ref_today,
     )
+    # Re-label `durability_5m_90d` with Maximal-Effort Validity so passive Z2 rides are NEVER shown as "69% retention"!
+    dur_summary = {}
+    if base_5m:
+        tv_map = p5.get("tier_5m_validity") or {}
+        for tier_k, tier_label in DURABILITY_TIERS:
+            f5 = curves["durability_tiers"][tier_k]["5m"].get("90d")
+            if f5:
+                tv_entry = tv_map.get(tier_k) or {}
+                if tv_entry.get("verified_max"):
+                    dur_summary[tier_label] = f"{f5}W ({(f5 / base_5m) * 100.0:.0f}% verified)"
+                else:
+                    dur_summary[tier_label] = f"{f5}W (submax-only, untested)"
     p6 = pillars_engine.compute_pillar6_locomotion_environment(
         profile=prof,
         body=body,
@@ -2532,6 +2545,7 @@ def build_coach_telemetry(
         cal_items=cal_items or [],
         macro_info=macro_info,
         dna_snapshot=dna_snap,
+        pillar5=p5,
         today=ref_today,
     )
 

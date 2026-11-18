@@ -680,14 +680,17 @@ def compute_pillar5_durability_and_tid(
     curves: dict[str, Any],
     cp_watts: float | None,
     mass_kg: float | None,
+    hr_max: int | None = None,
     today: dt.date | None = None,
 ) -> dict[str, Any]:
-    """Compute `w_sub` vs `w_sup` (`>CP`), `Delta_CP_30kJ_pct`, cadence fade, and Dual-TID."""
+    """Compute `w_sub` vs `w_sup` (`>CP`), Maximal-Effort-Gated `Delta_CP_30kJ_pct`, cadence fade, and Dual-TID."""
     ref_today = today or dt.date.today()
     cutoff_7d = (ref_today - dt.timedelta(days=7)).isoformat()
     cutoff_28d = (ref_today - dt.timedelta(days=28)).isoformat()
+    cutoff_90d = (ref_today - dt.timedelta(days=90)).isoformat()
     bw = float(mass_kg) if (mass_kg and mass_kg > 25.0) else 70.0
     eff_cp = float(cp_watts) if (cp_watts and cp_watts > 50) else 275.0
+    eff_hrmax = int(hr_max) if (hr_max and hr_max >= 130) else None
 
     sub_7d_kj = 0.0
     sup_7d_kj = 0.0
@@ -732,18 +735,68 @@ def compute_pillar5_durability_and_tid(
                 w_lt1_kj += sub_kj * 0.88
                 w_heavy_kj += sub_kj * 0.12
 
-    # Fatigued 5m/20m drop after >25-35 kJ/kg
+    # Maximal-Effort Validity Gate for Durability Tiers (prevents passive Z2 ride censoring bias!)
+    # A 5-minute maximal effort (`MAP`) MUST sit strictly in the Severe Domain (`> 1.03 * CP`) and show
+    # exhaustion (`W'bal <= 25%` or `HR >= 91% HRmax` or `>= 85% Fresh 5m`). Submaximal Z2/tempo rolls
+    # on long endurance rides are classified `submax_untested` — NEVER as a physiological fatigue drop!
     dur_tiers = (curves or {}).get("durability_tiers") or {}
     fresh_5m = float(((curves or {}).get("fresh") or {}).get("5m", {}).get("90d") or 0.0)
-    fat_5m_25 = float(((dur_tiers.get("25kj_kg") or {}).get("5m") or {}).get("90d") or 0.0)
-    fat_5m_15 = float(((dur_tiers.get("15kj_kg") or {}).get("5m") or {}).get("90d") or 0.0)
-    ref_fat_5m = fat_5m_25 or fat_5m_15
-    cp_drop_pct = round(((fresh_5m - ref_fat_5m) / fresh_5m) * 100.0, 1) if (fresh_5m > 0 and ref_fat_5m > 0) else None
+
+    def _eval_tier_5m(tier_key: str) -> dict[str, Any]:
+        curve_w = int(round(float(((dur_tiers.get(tier_key) or {}).get("5m") or {}).get("90d") or 0.0)))
+        best_verified_w = 0
+        best_any_w = curve_w
+        for a in activities or []:
+            if not isinstance(a, dict) or not a.get("date") or str(a["date"])[:10] < cutoff_90d:
+                continue
+            if str(a.get("sport") or "cycling").lower() != "cycling" or a.get("device_watts") is False or a.get("locked_for_records"):
+                continue
+            t_map = (a.get("peaks_durability") or {}).get(tier_key) or {}
+            w5 = int(round(float(t_map.get("5m") or 0.0)))
+            if w5 <= 0:
+                continue
+            best_any_w = max(best_any_w, w5)
+            above_cp_gate = w5 > (eff_cp * 1.03)
+            wbal = a.get("w_bal_min_pct")
+            mhr = a.get("max_hr")
+            exhausted = (
+                (wbal is not None and float(wbal) <= 25.0)
+                or (eff_hrmax is not None and mhr is not None and float(mhr) >= 0.91 * eff_hrmax)
+                or (fresh_5m > 0 and w5 >= 0.85 * fresh_5m)
+                or (wbal is None and mhr is None and w5 > eff_cp * 1.06)
+            )
+            if above_cp_gate and exhausted:
+                best_verified_w = max(best_verified_w, w5)
+        # Fallback if curve_w was populated from an external curve fixture without per-activity peaks_durability
+        if best_verified_w == 0 and curve_w > eff_cp * 1.06 and not any((a.get("peaks_durability") or {}).get(tier_key) for a in (activities or []) if isinstance(a, dict)):
+            best_verified_w = curve_w
+
+        if best_verified_w > 0 and fresh_5m > 0:
+            drop_p = round(max(0.0, ((fresh_5m - best_verified_w) / fresh_5m) * 100.0), 1)
+            ret_p = round((best_verified_w / fresh_5m) * 100.0, 1)
+            return {"watts": best_verified_w, "retention_pct": ret_p, "drop_pct": drop_p, "verified_max": True, "status": "verified_max"}
+        if best_any_w > 0:
+            return {"watts": best_any_w, "retention_pct": None, "drop_pct": None, "verified_max": False, "status": "submax_untested"}
+        return {"watts": None, "retention_pct": None, "drop_pct": None, "verified_max": False, "status": "no_rides"}
+
+    tier_validity = {
+        tk: _eval_tier_5m(tk)
+        for tk in ("15kj_kg", "25kj_kg", "35kj_kg", "5kj_above_cp_kg")
+    }
+    v25 = tier_validity["25kj_kg"]
+    v35 = tier_validity["35kj_kg"]
+    v15 = tier_validity["15kj_kg"]
+    # `cp_drop_30kj_pct` ONLY reflects a verified maximal effort at >=25 kJ/kg (never a Z2 cruise!)
+    cp_drop_pct = v25["drop_pct"] if v25["verified_max"] else (v35["drop_pct"] if v35["verified_max"] else None)
+    verified_drop_15kj_pct = v15["drop_pct"] if v15["verified_max"] else None
 
     tot_sg = max(1, sg_low + sg_mod + sg_high)
     tot_dom = max(1.0, w_lt1_kj + w_heavy_kj + w_severe_kj)
     return {
         "cp_drop_30kj_pct": cp_drop_pct,
+        "verified_drop_15kj_pct": verified_drop_15kj_pct,
+        "durability_25kj_status": v25["status"],
+        "tier_5m_validity": tier_validity,
         "significant_drop_above_sem": bool(cp_drop_pct is not None and cp_drop_pct > 3.0),
         "cadence_drop_fatigued_rpm": round(statistics.median(cad_drops), 1) if cad_drops else None,
         "z2_pwhr_decoupling_pct": round(statistics.median(decouplings), 1) if decouplings else None,
@@ -1197,6 +1250,7 @@ def audit_missing_inputs_and_questions(
     cal_items: list[dict[str, Any]],
     macro_info: dict[str, Any] | None,
     dna_snapshot: dict[str, Any] | None,
+    pillar5: dict[str, Any] | None = None,
     today: dt.date | None = None,
 ) -> dict[str, Any]:
     """Build Missing-Data Gate (`0_missing`), Autonomy Actions (`1_autonomy`), Accountability & Question Radar."""
@@ -1259,6 +1313,13 @@ def audit_missing_inputs_and_questions(
     if is_cyclist and pillar2.get("sprint_anchor_status") in ("missing", "passive_lower_bound"):
         calibration_gaps.append(
             "No true 15s maximal seated sprint anchor in recent data -> schedule Field-Test Unit 1 (6s C_max + 15s All-Out Sprint)."
+        )
+    if is_cyclist and pillar5 and pillar5.get("durability_25kj_status") == "submax_untested":
+        v15_drop = pillar5.get("verified_drop_15kj_pct")
+        v15_note = f" (verified >15 kJ/kg drop is only {v15_drop}%!)" if v15_drop is not None else ""
+        calibration_gaps.append(
+            f"Durability >25 kJ/kg is UNTESTED (athlete only rode submaximal Z2/tempo after 25 kJ/kg{v15_note} — "
+            "NEVER interpret passive Z2 ride watts as a physiological fatigue drop; use Field-Test Unit 3 Preload to measure true late-ride 5m power)."
         )
 
     # Autonomous file actions
@@ -1512,10 +1573,23 @@ def format_seven_pillar_blocks(telemetry: dict[str, Any]) -> str:
                 f"({p4.get('myotype_class')}) | T_max={p4.get('t_max_nm_kg') or '—'} Nm/kg | C_opt={p4.get('c_opt_sprint_rpm') or '—'} rpm | "
                 f"HIIT_Recovery={p4.get('hiit_recovery_window')} | Protocol: {p4.get('recommended_vo2_protocol')}"
             )
+        tv = p5.get("tier_5m_validity") or {}
+        v15 = tv.get("15kj_kg") or {}
+        v25 = tv.get("25kj_kg") or {}
+        dur_parts = []
+        if v15.get("verified_max"):
+            dur_parts.append(f">15kJ/kg=-{v15['drop_pct']}% ({v15['watts']}W VERIFIED)")
+        elif v15.get("watts"):
+            dur_parts.append(f">15kJ/kg=UNTESTED ({v15['watts']}W submax-only)")
+        if v25.get("verified_max"):
+            dur_parts.append(f">25kJ/kg=-{v25['drop_pct']}% ({v25['watts']}W VERIFIED)")
+        elif v25.get("watts"):
+            dur_parts.append(f">25kJ/kg=UNTESTED ({v25['watts']}W submax Z2/tempo only — NO all-out effort!)")
+        dur_str = ", ".join(dur_parts) if dur_parts else "untested"
         lines.append(
             f"  [5_durability S5] 7d_Work: w_sub={p5.get('work_sub_cp_7d_kj_kg', 0)} kJ/kg (<=CP), "
             f"w_sup={p5.get('work_above_cp_7d_kj_kg', 0)} kJ/kg (>CP!) | "
-            f"Drop@25-30kJ/kg={p5.get('cp_drop_30kj_pct') if p5.get('cp_drop_30kj_pct') is not None else '—'}% | "
+            f"Durability_5m({dur_str}) | "
             f"Steady_Pw:Hr={p5.get('z2_pwhr_decoupling_pct') if p5.get('z2_pwhr_decoupling_pct') is not None else '—'}% | "
             f"Dual_TID(SG vs Domain)={p5.get('dual_tid_28d', {}).get('session_goal_pct')} vs {p5.get('dual_tid_28d', {}).get('work_domain_7d_pct')}"
         )

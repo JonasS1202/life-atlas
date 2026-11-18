@@ -691,6 +691,62 @@ class CoachMailUnit(unittest.TestCase):
             mode, _why, _macro = hk.detect_coach_mode(prompt)
             self.assertEqual(mode, expected_mode, f"Prompt {prompt!r} resolved to {mode!r}")
 
+    def test_durability_censoring_gate_submax_long_rides_vs_verified_all_out(self):
+        """Passive Z2 rides >25 kJ/kg must NEVER produce a false 30% durability drop when no all-out effort occurred."""
+        today = dt.date(2026, 11, 18)
+        prof = "---\ndepth: pro\nsex: male\nage: 25\n---\n| Metric | Value |\n|---|---|\n| **Biometrie** | 186 cm · 75 kg · 11.5% KFA |\n| **Max HR / Rest HR** | 200 bpm / 48 bpm |\n"
+        acts = [
+            {
+                "id": "fresh-vo2",
+                "date": "2026-10-19",
+                "name": "Fresh All-Out",
+                "sport": "cycling",
+                "device_watts": True,
+                "duration_min": 90,
+                "work_kj": 1350,
+                "np_w": 295,
+                "w_bal_min_pct": 0.0,
+                "max_hr": 196,
+                "peaks_fresh": {"5s": 1480, "15s": 1050, "1m": 700, "3m": 455, "5m": 418, "12m": 331, "20m": 322},
+                "peaks_durability": {},
+            },
+            {
+                "id": "bday-ride",
+                "date": "2026-10-06",
+                "name": "Verified 18kJ/kg Effort",
+                "sport": "cycling",
+                "device_watts": True,
+                "duration_min": 150,
+                "work_kj": 1900,
+                "np_w": 235,
+                "w_bal_min_pct": 0.0,
+                "max_hr": 194,
+                "peaks_fresh": {"5m": 405, "20m": 300},
+                "peaks_durability": {"15kj_kg": {"5m": 405}},
+            },
+            {
+                "id": "z2-long",
+                "date": "2026-10-12",
+                "name": "3.5h Z2 Endurance Cruise",
+                "sport": "cycling",
+                "device_watts": True,
+                "duration_min": 210,
+                "work_kj": 2615,
+                "np_w": 225,
+                "w_bal_min_pct": 60.0,
+                "max_hr": 176,
+                "peaks_fresh": {"5m": 289, "20m": 244},
+                "peaks_durability": {"15kj_kg": {"5m": 289}, "25kj_kg": {"5m": 289}, "35kj_kg": {"5m": 252}},
+            },
+        ]
+        tel = ce.build_coach_telemetry(prof, acts, today=today)
+        p5 = tel["seven_pillars"]["pillar5_durability"]
+        self.assertAlmostEqual(p5["verified_drop_15kj_pct"], 3.1, delta=0.2)
+        self.assertIsNone(p5["cp_drop_30kj_pct"])
+        self.assertEqual(p5["durability_25kj_status"], "submax_untested")
+        self.assertIn("submax-only, untested", tel["durability_5m_90d"][">25 kJ/kg"])
+        self.assertIn("verified", tel["durability_5m_90d"][">15 kJ/kg"])
+
 
 if __name__ == "__main__":
     unittest.main()

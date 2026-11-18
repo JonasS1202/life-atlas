@@ -2,6 +2,11 @@
 
 Written for users: `/atlas-update` shows the sections between the installed and the new version.
 
+## [1.4.4] - 2026-11-18
+
+- **Maximal-Effort Durability Validity Gate (`pillars_engine.py`, `coach_engine.py`, `atlas.py`, `coach.md`):**
+  - **Eliminates Passive Zone-2 Censoring Bias in Durability Curves:** `compute_pillar5_durability_and_tid()` now distinguishes **verified maximal efforts** (`> 1.03 * CP` in the Severe Domain with anaerobic `W'bal` depletion or `>= 91% HRmax`) from **passive submaximal Zone-2/tempo cruises** (`submax_untested`) across `>15 / >25 / >35 kJ/kg` tiers. Athletes who ride disciplined Zone 2 on 3–4h rides without a late all-out sprint/climb are no longer misdiagnosed with a `25–35%` late-ride durability drop; `power-curve.md`, `durability_5m_90d`, and `[CALIBRATION]` mark submaximal tiers explicitly as `submax-only, untested` until a Preload test (`Field-Test Unit 3`) or late race effort occurs.
+
 ## [1.4.3] - 2026-11-18
 
 - **Zero-Truncation Progressive Context & Canonical File Schemas (`atlas.py`, `coach.md`):**

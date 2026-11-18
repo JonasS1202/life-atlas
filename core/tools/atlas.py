@@ -2199,9 +2199,25 @@ def _rebuild_coach_markdown_files(brain, activities, ftp_watts=275, weight_kg=67
         "",
         "## 2. Cycling Durability — Multi-Tier Work (`kJ/kg`, `>CP`) & `> 1500 kJ`",
         "",
+        "> Values marked *(submax)* come from Zone-2/tempo rides without a late all-out effort — passive lower bounds, NOT physiological fatigue drops.",
+        "",
         "| Duration | Fresh (90d) | `>15 kJ/kg` (90d) | `>25 kJ/kg` (90d) | `>35 kJ/kg` (90d) | `>5 kJ/kg >CP` (90d) | `>1500 kJ` (90d) | Retention (`>1500 kJ`) |",
         "|---|---|---|---|---|---|---|---|",
     ]
+    eff_cp_pc = float(telemetry.get("effective_cp_w") or ftp_watts or 275.0)
+    tv_5m_pc = ((telemetry.get("seven_pillars") or {}).get("pillar5_durability") or {}).get("tier_5m_validity") or {}
+
+    def _fmt_dur_cell(val_w, dur_key: str, tier_key: str = "") -> str:
+        if not val_w:
+            return "—"
+        if dur_key == "5m" and tier_key in tv_5m_pc:
+            return f"{val_w} W" if tv_5m_pc[tier_key].get("verified_max") else f"{val_w} W *(submax)*"
+        if dur_key == "5m" and val_w <= eff_cp_pc * 1.03:
+            return f"{val_w} W *(submax)*"
+        if dur_key == "20m" and val_w <= eff_cp_pc * 0.90:
+            return f"{val_w} W *(submax)*"
+        return f"{val_w} W"
+
     for dur_lbl in ("5s", "1m", "5m", "20m"):
         r0 = fresh_ep[dur_lbl]
         rf = fatig_ep[dur_lbl]
@@ -2212,12 +2228,16 @@ def _rebuild_coach_markdown_files(brain, activities, ftp_watts=275, weight_kg=67
         t25 = dur_ep["25kj_kg"][dur_lbl].get("90d")
         t35 = dur_ep["35kj_kg"][dur_lbl].get("90d")
         tcp = dur_ep["5kj_above_cp_kg"][dur_lbl].get("90d")
-        v15 = f"{t15} W" if t15 else "—"
-        v25 = f"{t25} W" if t25 else "—"
-        v35 = f"{t35} W" if t35 else "—"
-        vcp = f"{tcp} W" if tcp else "—"
-        v1500 = f"{f90_1500} W" if f90_1500 else "—"
-        ret = f"{(f90_1500 / f90_0) * 100.0:.1f} %" if f90_1500 and f90_0 else "—"
+        v15 = _fmt_dur_cell(t15, dur_lbl, "15kj_kg")
+        v25 = _fmt_dur_cell(t25, dur_lbl, "25kj_kg")
+        v35 = _fmt_dur_cell(t35, dur_lbl, "35kj_kg")
+        vcp = _fmt_dur_cell(tcp, dur_lbl, "5kj_above_cp_kg")
+        v1500 = _fmt_dur_cell(f90_1500, dur_lbl)
+        if f90_1500 and f90_0:
+            is_submax_1500 = "*(submax)*" in v1500
+            ret = "*(submax — untested)*" if is_submax_1500 else f"{(f90_1500 / f90_0) * 100.0:.1f} %"
+        else:
+            ret = "—"
         pc_lines.append(f"| **{dur_lbl}** | {v0} | {v15} | {v25} | {v35} | {vcp} | {v1500} | {ret} |")
 
     pc_lines += [
