@@ -674,6 +674,23 @@ class CoachMailUnit(unittest.TestCase):
                 self.assertEqual(tok, "hh-1click-acc-fresh")
             self.assertTrue(cc.connector_status_summary(brain)["hammerhead_connected"])
 
+    def test_coach_hook_detects_natural_german_queries(self):
+        """Natural German training, history, W/kg, VO2max workout, and RHR/creatine prompts trigger `Atlas coach ->`."""
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("atlas_hook_test", os.path.join(REPO, "core", "hooks", "atlas_hook.py"))
+        hk = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(hk)
+        for prompt, expected_mode in (
+            ("Was steht heute im Training an?", "daily"),
+            ("Schau dir mal meine Formkurve der letzten 6 Monate an", "dna"),
+            ("Mein Ruhepuls ist 48 bpm und ich nehme kein Kreatin", "checkin"),
+            ("Wie war mein letzter Ride am 06.11.?", "checkin"),
+            ("Mach mir eine harte VO2max-Einheit für morgen", "plan-14d"),
+            ("Wie weit bin ich von 4 W/kg entfernt?", "daily"),
+        ):
+            mode, _why, _macro = hk.detect_coach_mode(prompt)
+            self.assertEqual(mode, expected_mode, f"Prompt {prompt!r} resolved to {mode!r}")
+
 
 if __name__ == "__main__":
     unittest.main()

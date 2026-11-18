@@ -29,7 +29,7 @@ Atlas Coach strictly separates **Stage 1 deterministic biophysical pre-computati
    python -I <ROOT>/brain/_atlas/tools/atlas.py coach compare --epoch-a YYYY-MM-DD..YYYY-MM-DD --epoch-b YYYY-MM-DD..YYYY-MM-DD
    python -I <ROOT>/brain/_atlas/tools/atlas.py coach inspect --date YYYY-MM-DD
    ```
-   Use `atlas.py find <words>` whenever broader life context (bike geometry, work travel, medical notes) matters.
+   If the user asks further back than `history` currently shows and Strava is connected, pull older activities once via `atlas.py coach sync --days 180 --execute`. Use `atlas.py find <words>` whenever broader life context (bike geometry, work travel, medical notes) matters.
 
 ---
 
@@ -98,4 +98,4 @@ All credentials stay local in `brain/_secrets/*.env` (`chmod 600`):
 6. **4-Stage Readiness Resolution (`GRÜN | GELB-A | GELB-B | ROT`, S7):**
    - **`GELB-B` Rule (Subjective Peripheral Overrides HRV!):** If autonomic `HRV`/`RHR` is green, yet local leg pain is high ("Beine wie Beton") or yesterday's `Q_Strain` spiked, peripheral Type-II / intramyofibrillar glycogen stores are depleted -> **postpone HIIT 24–48 h**!
    - When anchors are missing/stale, schedule standardized tests via `atlas.py coach field-test --unit 1|2|preload|lsct --date YYYY-MM-DD --execute`.
-   - Always include `[📅 Coach Dashboard öffnen](http://127.0.0.1:8765/calendar.html?view=coach)` when plans, workouts, or telemetry are discussed.
+   - Always include the exact Dashboard URL printed by `atlas.py coach context` (fallback: `[📅 Coach Dashboard öffnen](http://127.0.0.1:8765/calendar.html?view=coach)`) when plans, workouts, or telemetry are discussed.

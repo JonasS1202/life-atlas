@@ -2031,24 +2031,32 @@ COACH_RX_MACRO = re.compile(
 )
 COACH_RX_PLAN14 = re.compile(
     r"(?i)\b(?:2-?wochen-?plan\w*|zwei-?wochen\w*|14-?\s*tage\w*|14d\b|n[aä]chsten?\s+(?:zwei\s+)?wochen?\s+(?:planen|train\w*|workouts?)|"
-    r"trainingsplan\s+(?:f[uü]r|schreiben|erstellen|planen)|workouts?\s+(?:planen|erstellen|schreiben)|wochenplan\s+training)\b"
+    r"trainingsplan\w*|trainingswoche\w*|workouts?\s+(?:planen|erstellen|schreiben|bauen)|wochenplan\s+training|"
+    r"(?:vo2max|schwellen|sweet\s*spot|grundlagen|ga[12]|over[\s-]*under|cadence|torque|intervall\w*)[-\s]*(?:einheit|workout|session))\b"
 )
 COACH_RX_DNA = re.compile(
     r"(?i)\b(?:rider\s*dna|athlete\s*dna|athleten-?dna|dna\s*(?:profil|analyse|report|scouting)|scouting\s*report|"
-    r"wo\s+stehe\s+ich\s+leistungsm[aä][sß]ig|was\s+ist\s+mein\s+limiter|mein\s+limiter|formanalyse|leistungsprofil\s+analys\w*)\b"
+    r"wo\s+stehe\s+ich\s+leistungsm[aä][sß]ig|was\s+ist\s+mein\s+limiter|mein\s+limiter|formanalyse|leistungsprofil\s+analys\w*|"
+    r"formkurve\w*|leistungsentwicklung|leistungskurve|saisonr[uü]ckblick|power\s*curve)\b"
 )
 COACH_RX_CHECKIN = re.compile(
-    r"(?i)\b(?:rpe\s*\d|beine\s+(?:waren|sind|schwer|wie\s+beton|leer|frisch)|puls\s+war|ruhepuls\s+\d|rhr\s+\d|"
-    r"hrv\s+\d|schlecht\s+geschlafen|nur\s+\d+(?:[.,]\d+)?\s*h\s+geschlafen|halsschmerzen|erk[aä]ltet|krank\s+train\w*|"
+    r"(?i)\b(?:rpe\s*\d|beine\s+(?:waren|sind|schwer|wie\s+beton|leer|frisch)|puls\s+war|"
+    r"(?:ruhepuls|rhr|hrv|rmssd|kfa|k[oö]rperfett\w*|kreatin\w*)\s*(?:ist|war|liegt|betr[aä]gt|=|:|bei|nehm\w*|ja|nein|\d)|"
+    r"(?:kein\s+)?kreatin\b.*\b(?:ja|nein|nehm\w*|supplement\w*)|"
+    r"schlecht\s+geschlafen|nur\s+\d+(?:[.,]\d+)?\s*h\s+geschlafen|halsschmerzen|erk[aä]ltet|krank\s+train\w*|"
     r"strava\s+sync\w*|garmin\s+(?:sync\w*|verbinden|connect)|hammerhead|karoo\s+(?:sync\w*|verbinden|push)|"
     r"ride\s+check-?in|readiness\s+check|feedback\s+zum\s+(?:ride|training|workout|lauf)|"
-    r"training\s+gestern\s+war|einheit\s+gestern|ausfahrt\s+war)\b"
+    r"training\s+gestern\s+war|einheit\s+gestern|ausfahrt\s+war|"
+    r"letzte[rn]?\s+(?:ride|ausfahrt|einheit|lauf)|(?:ride|ausfahrt|einheit|training)\s+am\s+\d{1,2}\.\d{1,2})\b"
 )
 COACH_RX_DAILY = re.compile(
     r"(?i)\b(?:mein\s+workout|workout\s+heute|workout\s+morgen|was\s+trainier\w+\s+ich|heutiges?\s+(?:workout|training)|"
-    r"training\s+heute|training\s+morgen|soll\s+ich\s+(?:heute\s+)?(?:trainieren|fahren|laufen|auf\s+die\s+rolle)|"
+    r"im\s+training\b|training\s+heute|training\s+morgen|n[aä]chste\s+einheit|"
+    r"soll\s+ich\s+(?:heute\s+)?(?:trainieren|fahren|laufen|auf\s+die\s+rolle)|"
     r"auf\s+die\s+rolle|intervall-?training|\.zwo\b|\.fit\b|karoo\s+workout|ftp\s+test|feld-?test|lsct\b|"
-    r"sweet\s*spot\s+workout|tagesform\s+training|readiness\s+heute|7-?s[aä]ulen)\b"
+    r"sweet\s*spot\s+workout|tagesform\s+training|readiness\s+heute|7-?s[aä]ulen|"
+    r"w/kg|watt/kg|vlamax|vo2max|durability|fatmax|critical\s*power|w['’]?\s*bal)\b|"
+    r"\b(?:ftp|cp)\b.*\b(?:watt|w/kg|test|zone|schwelle|entfernt|aktuell|steigern)\b"
 )
 
 

@@ -2,6 +2,12 @@
 
 Written for users: `/atlas-update` shows the sections between the installed and the new version.
 
+## [1.4.2] - 2026-11-18
+
+- **Broadened Natural-Language Coach Routing & Full Playbook Context (`atlas_hook.py`, `atlas.py`, `coach.md`):**
+  - **Zero-Miss Prompt Routing (`COACH_RX_*`):** Natural-language German queries such as *"Was steht heute im Training an?"*, *"Formkurve der letzten 6 Monate"*, *"Mein Ruhepuls ist 48 bpm und ich nehme kein Kreatin"*, *"Wie war mein letzter Ride am 06.11.?"*, *"VO2max-Einheit für morgen"*, and *"4 W/kg"* now reliably trigger `Atlas coach ->` instead of falling through to generic text responses.
+  - **Full Playbook Context & History Guidance:** Raises the `playbook.md` context cap in `atlas.py coach context` from 2200 to 6000 chars so empirical body rules in Section 3 are never truncated mid-heading, and documents `coach sync --days 180` + dynamic dashboard ports in `coach.md`.
+
 ## [1.4.1] - 2026-11-18
 
 - **True 1-Click Hammerhead Karoo Connect (`coach_connectors.py`, `cal_engine.py`, `atlas.py`, `calendar.html`):**

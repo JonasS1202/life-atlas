@@ -3112,7 +3112,7 @@ def _coach_context(
 
     if pb_text.strip():
         say("\n=== 2A. ATHLETE PLAYBOOK & FEELINGS-FILE (brain/coach/playbook.md) ===")
-        say(pb_text.strip()[:2200])
+        say(pb_text.strip()[:6000])
 
     say("\n=== 2. ATHLETE PROFILE & THRESHOLDS (brain/coach/profile.md) ===")
     if prof_text:
