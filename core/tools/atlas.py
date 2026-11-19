@@ -44,6 +44,7 @@ import datetime as dt
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import platform
 import re
@@ -3398,31 +3399,144 @@ def _coach_simulate(
     dsl_spec=None,
     date_str=None,
     prior_kj=0.0,
+    prior_sup_kj=0.0,
     cho_g_h="60.0",
     solve_proto=None,
     form_pct="0.0",
+    sex=None,
+    alt_m=0.0,
+    temp_c=None,
+    heat_accl_days=0,
+    indoor=False,
+    drivetrain_loss=0.0,
+    cp_override=None,
+    wp_override_kj=None,
+    mass_override_kg=None,
+    run_splits=None,
+    grade_csv=None,
+    morin_spec=None,
+    re_spec=None,
 ):
-    """Run deterministic 1-Hz Chorley W'bal + 1st-order VO2(t) simulation OR inverse `--solve` bisection
-    with optional pre-fatigue `(prior_kj, cho_g_h)` and daily form scaling (`form_pct`)."""
+    """Run deterministic 1-Hz Chorley W'bal + 1st-order VO2(t) simulation, inverse `--solve` bisection,
+    environment/hardware/pre-fatigue scaling, OR Running Equivalence Bridge (`CS/D'`, Minetti, Morin `k_leg`, `RE`)."""
     ftp_w, weight_kg = _extract_profile_numbers(brain, hk)
     prof_p = os.path.join(brain, "coach", "profile.md")
     prof_txt = read(prof_p) if os.path.isfile(prof_p) else ""
     c_state = hk.load_coach_state()
     tel = coach_engine.build_coach_telemetry(prof_txt, c_state.get("activities", []), fallback_ftp=ftp_w, fallback_weight=weight_kg)
 
-    cp_w = float(tel.get("effective_cp_w") or ftp_w or 275.0)
-    wp_j = float(tel["effective_w_prime_kj"] * 1000.0) if tel.get("effective_w_prime_kj") else 20000.0
-    p5_w = float((tel.get("curves", {}).get("fresh", {}).get("5m") or {}).get("90d") or 0) or None
+    prof = tel.get("profile") or {}
     sp = tel.get("seven_pillars") or {}
-    mass_kg = float((sp.get("body") or {}).get("mass_kg_7d") or weight_kg or 75.0)
+    cp_w = float(cp_override) if cp_override else float(tel.get("effective_cp_w") or ftp_w or 275.0)
+    wp_j = float(wp_override_kj) * 1000.0 if wp_override_kj else (
+        float(tel["effective_w_prime_kj"] * 1000.0) if tel.get("effective_w_prime_kj") else 20000.0
+    )
+    p5_w = None if (cp_override or wp_override_kj) else (
+        float((tel.get("curves", {}).get("fresh", {}).get("5m") or {}).get("90d") or 0) or None
+    )
+    mass_kg = float(mass_override_kg) if mass_override_kg else float((sp.get("body") or {}).get("mass_kg_7d") or weight_kg or 75.0)
+    height_cm = float(prof.get("height_cm") or 180.0)
     v15_drop = (sp.get("pillar5_durability") or {}).get("verified_drop_15kj_pct")
     p2_met = sp.get("pillar2_metabolic") or {}
     p4_myo = sp.get("pillar4_myotype") or {}
-    creatine_flag = (tel.get("profile") or {}).get("creatine_flag")
+    p6_loc = sp.get("pillar6_locomotion") or {}
+    creatine_flag = prof.get("creatine_flag")
+    eff_sex = str(sex or prof.get("sex") or "male").strip().lower()
+    if eff_sex in ("f", "w", "weiblich"):
+        eff_sex = "female"
+    elif eff_sex in ("m", "männlich"):
+        eff_sex = "male"
+    indoor_off = float(p6_loc.get("indoor_cp_offset_w") if p6_loc.get("indoor_cp_offset_w") is not None else -19.0)
+
+    # Running Equivalence Bridge mode (`--run-splits`, `--grade`, `--morin`, `--re`)
+    if run_splits or grade_csv is not None or morin_spec or re_spec:
+        run_out = {}
+        say(f"=== RUNNING EQUIVALENCE BRIDGE (Mass={mass_kg:.1f}kg | Height={height_cm:.0f}cm) ===")
+        if run_splits:
+            sp_map = {}
+            for tok in str(run_splits).split(","):
+                if "=" in tok:
+                    dk, dv = tok.split("=", 1)
+                    sp_map[dk.strip()] = dv.strip()
+            cs_res = coach_engine.solve_running_cs_d_prime(sp_map)
+            run_out["cs_model"] = cs_res
+            say(f"  OLS CS/D': CS={cs_res.get('cs_mps')} m/s ({cs_res.get('cs_pace_fmt')}) | D'={cs_res.get('d_prime_m')} m | "
+                f"R²={cs_res.get('r2')} | MLSS(~95%)={cs_res.get('mlss_pace_fmt')} | LT1(80-85%)={cs_res.get('lt1_pace_range_fmt')}")
+        if grade_csv is not None:
+            g_vals = _parse_float_csv(grade_csv, 0.0)
+            flat_c = coach_engine.minetti_running_cost_j_kg_m(0.0)
+            g_rows = []
+            for gv in g_vals:
+                cr = coach_engine.minetti_running_cost_j_kg_m(gv)
+                g_rows.append((gv, cr, round(cr / flat_c * 100.0, 1)))
+                say(f"  Minetti C_r(g={gv:+.2f}): {cr:.2f} J/(kg·m) ({cr / flat_c * 100.0:.1f}% of flat {flat_c:.2f})")
+            run_out["minetti"] = g_rows
+        if morin_spec:
+            k_vals = []
+            for idx_m, chunk in enumerate(str(morin_spec).split(";")):
+                kv = {}
+                for part in chunk.split(","):
+                    if "=" in part:
+                        mk, mv = part.split("=", 1)
+                        try:
+                            kv[mk.strip().lower()] = float(mv.strip().replace(",", "."))
+                        except ValueError:
+                            pass
+                kl = coach_engine.compute_morin_leg_stiffness(
+                    mass_kg=kv.get("m", mass_kg),
+                    height_cm=kv.get("h", height_cm),
+                    vel_mps=kv.get("v", 4.0),
+                    contact_time_s=kv.get("tc", 0.22),
+                    flight_time_s=kv.get("tf", 0.14),
+                )
+                k_vals.append(kl)
+                say(f"  Morin k_leg[{idx_m + 1}] (v={kv.get('v', 4.0)}m/s, tc={kv.get('tc', 0.22)}s, tf={kv.get('tf', 0.14)}s): {kl} kN/m")
+            if len(k_vals) >= 2 and k_vals[0] and k_vals[-1]:
+                drop_pct = round(((k_vals[0] - k_vals[-1]) / k_vals[0]) * 100.0, 1)
+                flag_s = " -> GELB-B PERIPHERAL OVERRIDE (postpone HIIT 48h!)" if drop_pct >= 15.0 else ""
+                say(f"  k_leg Delta: -{drop_pct:.1f}%{flag_s}")
+            run_out["morin_k_leg"] = k_vals
+        if re_spec:
+            kv = {}
+            for part in str(re_spec).split(","):
+                if "=" in part:
+                    rk, rv = part.split("=", 1)
+                    try:
+                        kv[rk.strip().lower()] = float(rv.strip().replace(",", "."))
+                    except ValueError:
+                        pass
+            re_v = coach_engine.compute_running_effectiveness(kv.get("v", 4.0), kv.get("p", 300.0), kv.get("m", mass_kg))
+            run_out["re_kg_n"] = re_v
+            say(f"  Running Effectiveness RE: {re_v} kg/N")
+        if not solve_proto and not dsl_spec and not date_str:
+            return run_out
 
     cho_vals = _parse_float_csv(cho_g_h, 60.0)
     form_vals = _parse_float_csv(form_pct, 0.0)
     p_kj = float(prior_kj or 0.0)
+    p_sup_kj = float(prior_sup_kj or 0.0)
+    e_alt = float(alt_m or 0.0)
+    e_temp = float(temp_c) if temp_c is not None else None
+    e_accl = int(heat_accl_days or 0)
+    e_indoor = bool(indoor)
+    e_dt = float(drivetrain_loss or 0.0)
+    has_env = bool(p_kj > 0.0 or p_sup_kj > 0.0 or e_alt > 1500.0 or (e_temp is not None and e_temp > 25.0) or e_indoor or e_dt > 0.0)
+
+    def _env_tag():
+        parts = []
+        if p_sup_kj > 0.0:
+            parts.append(f"w_sup={p_sup_kj:.0f}kJ({p_sup_kj / mass_kg:.2f}kJ/kg)")
+        if e_alt > 1500.0:
+            parts.append(f"alt={e_alt:.0f}m")
+        if e_temp is not None and e_temp > 25.0:
+            parts.append(f"temp={e_temp:g}C(accl={e_accl}d)")
+        if e_indoor:
+            parts.append(f"indoor({indoor_off:+.0f}W)")
+        if e_dt > 0.0:
+            parts.append(f"drivetrain=-{e_dt:g}%")
+        if eff_sex == "female":
+            parts.append("sex=F")
+        return (" [" + ", ".join(parts) + "]") if parts else ""
 
     # Direct inverse bisection mode (`--solve [all|float-30-15|classic-30-15|hard-start-4x4|shuttle-1-4]`)
     if solve_proto:
@@ -3443,21 +3557,24 @@ def _coach_simulate(
         }
         selected = proto_aliases.get(proto_key, proto_aliases["all"])
         scenarios = []
-        if p_kj > 0.0 or any(abs(fv) > 1e-6 for fv in form_vals):
-            scenarios.append(("Fresh Baseline", 0.0, 60.0, 0.0))
+        if has_env or any(abs(fv) > 1e-6 for fv in form_vals):
+            scenarios.append(("Fresh Baseline", 0.0, 0.0, 60.0, 0.0, False))
         for fv in form_vals:
-            if p_kj > 0.0:
+            if p_kj > 0.0 or p_sup_kj > 0.0:
                 for cv in cho_vals:
-                    lbl = f"Preload {p_kj:.0f}kJ @ {cv:g}g/h CHO" + (f" (Form {fv:+g}%)" if abs(fv) > 1e-6 else "")
-                    scenarios.append((lbl, p_kj, cv, fv))
+                    base_l = f"Preload {p_kj:.0f}kJ" if p_kj > 0 else "Preload"
+                    lbl = f"{base_l} @ {cv:g}g/h CHO{_env_tag()}" + (f" (Form {fv:+g}%)" if abs(fv) > 1e-6 else "")
+                    scenarios.append((lbl, p_kj, p_sup_kj, cv, fv, True))
             else:
-                lbl = f"Fresh (Form {fv:+g}%)" if abs(fv) > 1e-6 else "Fresh Baseline"
+                lbl = (f"Condition{_env_tag()}" if has_env else "Fresh") + (f" (Form {fv:+g}%)" if abs(fv) > 1e-6 else "")
+                if not has_env and abs(fv) <= 1e-6:
+                    lbl = "Fresh Baseline"
                 if not scenarios or lbl != "Fresh Baseline":
-                    scenarios.append((lbl, 0.0, cho_vals[0], fv))
+                    scenarios.append((lbl, 0.0, 0.0, cho_vals[0], fv, True))
 
-        say(f"=== 1-HZ INVERSE PRESCRIPTION SOLVER (Anchor: CP={cp_w:.0f}W | W'={wp_j/1000.0:.1f}kJ | 5m={int(p5_w) if p5_w else '—'}W | Mass={mass_kg:.1f}kg | Creatine={creatine_flag}) ===")
+        say(f"=== 1-HZ INVERSE PRESCRIPTION SOLVER (Anchor: CP={cp_w:.0f}W | W'={wp_j/1000.0:.1f}kJ | 5m={int(p5_w) if p5_w else '—'}W | Mass={mass_kg:.1f}kg | Sex={eff_sex} | Creatine={creatine_flag}) ===")
         results = []
-        for s_lbl, s_kj, s_cho, s_form in scenarios:
+        for s_lbl, s_kj, s_sup, s_cho, s_form, apply_env in scenarios:
             rx = coach_engine.solve_individual_interval_prescriptions(
                 cp_watts=cp_w,
                 w_prime_j=wp_j,
@@ -3466,13 +3583,23 @@ def _coach_simulate(
                 p4_myotype=p4_myo,
                 mass_kg=mass_kg,
                 prior_kj=s_kj,
+                prior_sup_kj=s_sup,
                 cho_g_h=s_cho,
                 verified_drop_15kj_pct=v15_drop,
                 form_pct=s_form,
                 creatine_flag=creatine_flag,
+                sex=eff_sex,
+                elev_m=e_alt if apply_env else 0.0,
+                temp_c=e_temp if apply_env else None,
+                heat_accl_days=e_accl if apply_env else 0,
+                indoor=e_indoor if apply_env else False,
+                indoor_cp_offset_w=indoor_off,
+                drivetrain_loss_pct=e_dt if apply_env else 0.0,
             )
             results.append((s_lbl, rx))
+            rec10_sc = round((1.0 - math.exp(-600.0 / max(1.0, rx["tau_sc_50pct_s"]))) * 100.0, 1)
             say(f"\n  [{s_lbl}] CP_eff={rx['cp_eff_w']}W (-{rx['cp_drop_pct']}%) | W'_eff={rx['wp_eff_kj']}kJ (-{rx['wp_drop_pct']}%) | "
+                f"tau_FC={rx['tau_fc_50pct_s']}s, tau_SC={rx['tau_sc_50pct_s']}s (10m@50%CP SC={rec10_sc}%) | "
                 f"TargetFloor={rx['target_reserve_kj']}kJ | IIx_cap={rx['iix_cap_w']}W")
             for pk in selected:
                 item = rx.get(pk) or {}
@@ -3503,8 +3630,34 @@ def _coach_simulate(
                 raw_dsl = str(it.get("what") or "")
                 title = raw_dsl
                 break
+    # Pure Environment / Pre-Fatigue Effective CP/W' preview when flags are set without `--dsl` or `--solve`
+    if not raw_dsl and has_env:
+        eff = coach_engine.compute_effective_cp_w_prime(
+            cp_watts=cp_w,
+            w_prime_j=wp_j,
+            mass_kg=mass_kg,
+            prior_kj=p_kj,
+            prior_sup_kj=p_sup_kj,
+            cho_g_h=cho_vals[0],
+            verified_drop_15kj_pct=v15_drop,
+            form_pct=form_vals[0],
+            sex=eff_sex,
+            elev_m=e_alt,
+            temp_c=e_temp,
+            heat_accl_days=e_accl,
+            indoor=e_indoor,
+            indoor_cp_offset_w=indoor_off,
+            drivetrain_loss_pct=e_dt,
+        )
+        t_fc, t_sc = coach_engine.chorley_recovery_taus(50.0, tau_mult=eff["tau_w_mult"])
+        rec10 = round((1.0 - math.exp(-600.0 / t_sc)) * 100.0, 1)
+        say(f"=== EFFECTIVE CP / W' SCENARIO{_env_tag()} ===")
+        say(f"  Anchor: CP={cp_w:.0f}W | W'={wp_j/1000.0:.1f}kJ | Mass={mass_kg:.1f}kg | Sex={eff_sex}")
+        say(f"  Effective: CP_eff={eff['cp_eff_w']:.1f}W (-{eff['cp_drop_pct']}%) | W'_eff={eff['wp_eff_j']/1000.0:.1f}kJ (-{eff['wp_drop_pct']}%)")
+        say(f"  Chorley @50%CP: tau_FC={t_fc:.1f}s, tau_SC={t_sc:.1f}s (tau_mult={eff['tau_w_mult']}x; 10m SC recovery={rec10}%)")
+        return eff
     if not raw_dsl:
-        sys.exit("coach simulate requires `--dsl \"...\"`, `--date YYYY-MM-DD`, or `--solve`")
+        sys.exit("coach simulate requires `--dsl \"...\"`, `--date YYYY-MM-DD`, `--solve`, environment flags, or `--run-splits`/`--grade`/`--morin`")
 
     spec = hk.parse_workout_spec(raw_dsl, subkind="cycling", ftp_watts=int(round(cp_w)))
     title = str(spec.get("title") or title)
@@ -3519,24 +3672,33 @@ def _coach_simulate(
         p_5min_w=p5_w,
         mass_kg=mass_kg,
         prior_kj=p_kj,
+        prior_sup_kj=p_sup_kj,
         cho_g_h=cho_vals[0],
         verified_drop_15kj_pct=v15_drop,
         title=title,
         work_block_watts=wb_arr,
         form_pct=form_vals[0],
         creatine_flag=creatine_flag,
+        sex=eff_sex,
+        elev_m=e_alt,
+        temp_c=e_temp,
+        heat_accl_days=e_accl,
+        indoor=e_indoor,
+        indoor_cp_offset_w=indoor_off,
+        drivetrain_loss_pct=e_dt,
     )
     say(f"=== 1-HZ BIOPHYSICAL WORKOUT SIMULATION ({title}) ===")
-    say(f"  Input Anchor: CP={cp_w:.0f}W | W'={wp_j/1000.0:.1f}kJ | 5m={int(p5_w) if p5_w else '—'}W | Mass={mass_kg:.1f}kg | Creatine={creatine_flag}")
+    say(f"  Input Anchor: CP={cp_w:.0f}W | W'={wp_j/1000.0:.1f}kJ | 5m={int(p5_w) if p5_w else '—'}W | Mass={mass_kg:.1f}kg | Sex={eff_sex} | Creatine={creatine_flag}")
     if spec.get("unparsed_tokens"):
         say(f"  [!] UNPARSED DSL TOKEN(S): {', '.join(spec['unparsed_tokens'])} — check workout syntax!")
-    if sim["pre_fatigue_kj"] > 0 or abs(form_vals[0]) > 1e-6:
+    if has_env or abs(form_vals[0]) > 1e-6:
         form_s = f", form={form_vals[0]:+g}%" if abs(form_vals[0]) > 1e-6 else ""
-        say(f"  Pre-Fatigue Applied: prior_kj={sim['pre_fatigue_kj']:.0f}kJ @ {sim['cho_g_h']:.0f}g/h CHO{form_s} -> "
-            f"CP_eff={sim['cp_eff_w']}W (-{sim['cp_drop_pct']}%), W'_eff={sim['wp_eff_kj']}kJ (-{sim['wp_drop_pct']}%)")
+        say(f"  Pre-Fatigue Applied: prior_kj={sim['pre_fatigue_kj']:.0f}kJ @ {sim['cho_g_h']:.0f}g/h CHO{_env_tag()}{form_s} -> "
+            f"CP_eff={sim['cp_eff_w']}W (-{sim['cp_drop_pct']}%), W'_eff={sim['wp_eff_kj']}kJ (-{sim['wp_drop_pct']}%), tau_mult={sim['tau_w_mult']}x")
     say(f"  Duration: {sim['duration_min']} min | Session Avg: {sim['avg_w']}W | Work-Block Avg: {sim['work_block_avg_w']}W | "
         f"Total Work: {sim['total_kj']:.0f} kJ ({sim['kj_above_cp']} kJ > CP)")
-    say(f"  Chorley Bi-Exp W'bal: min={sim['w_bal_min_pct']}% ({sim['w_bal_min_kj']} kJ left) | Fast PCr/Myo Pool min={sim['fc_pcr_min_pct']}%")
+    say(f"  Chorley Bi-Exp W'bal: min={sim['w_bal_min_pct']}% ({sim['w_bal_min_kj']} kJ left) | Fast PCr/Myo Pool min={sim['fc_pcr_min_pct']}% | "
+        f"tau_FC={sim['tau_fc_50pct_s']}s, tau_SC={sim['tau_sc_50pct_s']}s")
     say(f"  1st-Order VO2(t) Kinetics: Time >=90% VO2max = {sim['time_ge_90_vo2max_min']} min | Peak VO2 = {sim['peak_vo2_pct']}%")
     say(f"  Stimulus Class: {sim['stimulus_class']}")
     if sim.get("stimulus_mismatch"):
@@ -3578,7 +3740,8 @@ def _coach_set_profile(
         return f"---\n{fm_new}\n---\n" + content[m_fm.end():]
 
     if sex is not None:
-        s_val = str(sex).strip().lower()
+        s_raw = str(sex).strip().lower()
+        s_val = "female" if s_raw in ("f", "female", "w", "weiblich") else "male"
         txt = _upsert_fm(txt, "sex", s_val)
         changes.append(f"sex={s_val}")
     if age is not None:
@@ -3831,9 +3994,23 @@ def cmd_coach(args):
             dsl_spec=getattr(args, "dsl", None) or getattr(args, "text", None),
             date_str=getattr(args, "date", None),
             prior_kj=getattr(args, "prior_kj", 0.0) or 0.0,
+            prior_sup_kj=getattr(args, "preload_sup_kj", 0.0) or 0.0,
             cho_g_h=getattr(args, "cho_g_h", "60.0"),
             solve_proto=getattr(args, "solve", None),
             form_pct=getattr(args, "form_pct", "0.0"),
+            sex=getattr(args, "sex", None),
+            alt_m=getattr(args, "alt_m", 0.0) or 0.0,
+            temp_c=getattr(args, "temp_c", None),
+            heat_accl_days=getattr(args, "heat_accl_days", 0) or 0,
+            indoor=bool(getattr(args, "indoor", False)),
+            drivetrain_loss=getattr(args, "drivetrain_loss", 0.0) or 0.0,
+            cp_override=getattr(args, "cp", None),
+            wp_override_kj=getattr(args, "w_prime", None),
+            mass_override_kg=getattr(args, "mass_kg", None),
+            run_splits=getattr(args, "run_splits", None),
+            grade_csv=getattr(args, "grade", None),
+            morin_spec=getattr(args, "morin", None),
+            re_spec=getattr(args, "re", None),
         )
     elif action == "set-profile":
         _coach_set_profile(
@@ -5382,16 +5559,35 @@ def main():
     p.add_argument("--solve", nargs="?", const="all", default=None,
                    help="run 1-Hz inverse bisection solver in `simulate` (`all`, `float-30-15`, `classic-30-15`, `hard-start-4x4`, `shuttle-1-4`, `mlss`)")
     p.add_argument("--prior-kj", "--preload-kj", dest="prior_kj", type=float, default=0.0,
-                   help="pre-fatigue work in kJ before intervals for `simulate` / `--solve`")
+                   help="pre-fatigue total work in kJ before intervals for `simulate` / `--solve`")
+    p.add_argument("--preload-sup-kj", "--prior-sup-kj", dest="preload_sup_kj", type=float, default=0.0,
+                   help="pre-fatigue supra-CP work (kJ > CP) for Mateo-March 2024 intensity-weighted durability scaling")
     p.add_argument("--cho-g-h", default="60.0",
                    help="carbohydrate intake (g/h) during prior work (single value or CSV batch like `42.5,90` for `--solve`)")
     p.add_argument("--form-pct", default="0.0",
                    help="daily form adjustment in percent for `simulate` / `--solve` (e.g. `-2` or CSV `0,-2`)")
+    p.add_argument("--alt-m", type=float, default=0.0,
+                   help="altitude in meters for Townsend 2-segment hypoxia scaling in `simulate`")
+    p.add_argument("--temp-c", type=float, default=None,
+                   help="ambient temperature in °C for heat stress scaling (>25°C) in `simulate`")
+    p.add_argument("--heat-accl-days", type=int, default=0,
+                   help="heat acclimatization days (0-14) for `simulate`")
+    p.add_argument("--indoor", action="store_true",
+                   help="apply learned/default `indoor_cp_offset_w` (-19 W) in `simulate`")
+    p.add_argument("--drivetrain-loss", nargs="?", const=2.4, default=0.0, type=float,
+                   help="apply pedal-vs-trainer drivetrain loss percent (default 2.4%% without PowerMatch) in `simulate`")
+    p.add_argument("--cp", type=float, default=None, help="optional CP override (W) for hypothetical `simulate` scenarios")
+    p.add_argument("--w-prime", type=float, default=None, help="optional W' override (kJ) for hypothetical `simulate` scenarios")
+    p.add_argument("--mass-kg", type=float, default=None, help="optional body mass override (kg) for hypothetical `simulate` scenarios")
+    p.add_argument("--run-splits", help="running split times for OLS CS/D' bridge (e.g. `1k=3:20,3k=10:55,5k=18:29`)")
+    p.add_argument("--grade", default=None, help="running grade decimal(s) for Minetti C_r(g) (e.g. `-0.12` or `0,-0.12,+0.12`)")
+    p.add_argument("--morin", help="Morin leg-spring stiffness input(s) (e.g. `v=4.0,tc=0.22,tf=0.14;v=4.0,tc=0.26,tf=0.10`)")
+    p.add_argument("--re", help="Coggan/Palladino Running Effectiveness input (e.g. `v=4.0,p=300`)")
     p.add_argument("--hr-max", type=int, help="maximum heart rate (bpm) for `set-profile`")
     p.add_argument("--kfa", type=float, help="body fat percentage (KFA %%) for `set-profile`")
     p.add_argument("--creatine", help="creatine supplementation (`yes`/`no`/`true`/`false`) for `set-profile`")
     p.add_argument("--age", type=int, help="athlete age (years) for `set-profile`")
-    p.add_argument("--sex", choices=("male", "female"), help="athlete biological sex for `set-profile`")
+    p.add_argument("--sex", choices=("male", "female", "M", "F", "m", "f"), help="athlete biological sex for `set-profile` or `simulate`")
     p.add_argument("--title", help="short bold heading for `add-rule`")
     p.add_argument("--init", action="store_true", help="scaffold brain/coach/ and harvest existing athlete thresholds")
     p.add_argument("--mode", choices=("auto", "daily", "checkin", "plan-14d", "macro", "dna"), default="auto",

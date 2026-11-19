@@ -17,17 +17,23 @@ from typing import Any
 
 from . import pillars_engine
 from .pillars_engine import (  # noqa: F401
+    chorley_recovery_taus,
     compute_chorley_w_bal,
+    compute_effective_cp_w_prime,
     compute_individual_response_model,
     compute_morin_leg_stiffness,
+    compute_running_effectiveness,
+    compute_townsend_altitude,
     evaluate_workout_execution,
     expand_spec_to_1hz_watts,
     filter_power_spikes,
     format_seven_pillar_blocks,
     minetti_running_cost_j_kg_m,
+    predict_omnipd_power,
     query_coach_history,
     simulate_workout_stream,
     solve_individual_interval_prescriptions,
+    solve_running_cs_d_prime,
 )
 
 COACH_DURATIONS: tuple[tuple[str, int], ...] = (
@@ -1147,8 +1153,9 @@ def compute_environment_adjustments(
     altitude: list[float] | None,
     temp: list[float] | None,
     cp_watts: float | None = None,
+    w_prime_kj: float | None = None,
 ) -> dict[str, Any]:
-    """Peronnet et al. (1991) hypoxia decay (~-6.3% per 1000m > 1000m) and >25°C thermal drift detection."""
+    """Townsend et al. (2017) 2-segment hypoxia adjustment (`CP` >1500m, `W'` >2760m, `tau_W'` mult) and >25°C thermal drift."""
     out: dict[str, Any] = {}
     if altitude:
         valid_alt = [float(a) for a in altitude if a is not None and -200.0 <= float(a) <= 6000.0]
@@ -1157,13 +1164,14 @@ def compute_environment_adjustments(
             max_m = max(valid_alt)
             out["elev_avg_m"] = int(round(avg_m))
             out["elev_max_m"] = int(round(max_m))
-            if avg_m > 1000.0:
-                loss_frac = min(0.35, 0.063 * ((avg_m - 1000.0) / 1000.0))
-                out["hypoxia_loss_pct"] = round(loss_frac * 100.0, 1)
-                if cp_watts and cp_watts > 0:
-                    out["cp_alt_adjusted_w"] = int(round(cp_watts * (1.0 - loss_frac)))
-            else:
-                out["hypoxia_loss_pct"] = 0.0
+            tw = pillars_engine.compute_townsend_altitude(avg_m, cp_watts=cp_watts, w_prime_kj=w_prime_kj)
+            out["hypoxia_loss_pct"] = tw["cp_loss_pct"]
+            out["w_prime_altitude_pct"] = tw["w_prime_pct"]
+            out["tau_w_altitude_mult"] = tw["tau_w_altitude_mult"]
+            if tw.get("cp_altitude_w") is not None:
+                out["cp_alt_adjusted_w"] = tw["cp_altitude_w"]
+            if tw.get("w_prime_altitude_kj") is not None:
+                out["w_prime_alt_adjusted_kj"] = tw["w_prime_altitude_kj"]
 
     if temp:
         valid_t = [float(t) for t in temp if t is not None and -30.0 <= float(t) <= 60.0]
@@ -1486,6 +1494,47 @@ def compute_stream_metrics(
                 e_run_peaks[rd_lbl] = erp
         if e_run_peaks:
             out["enriched_run_peaks"] = e_run_peaks
+
+        # Running Equivalence Bridge: Minetti grade cost, Coggan/Palladino RE & Morin leg-spring stiffness k_leg
+        grades = streams.get("grade_smooth") or streams.get("grade") or []
+        if grades:
+            g_vals = [float(g) / 100.0 for g in grades if g is not None and -35.0 <= float(g) <= 35.0]
+            if g_vals:
+                costs = [pillars_engine.minetti_running_cost_j_kg_m(g) for g in g_vals]
+                out["run_minetti_avg_j_kg_m"] = round(sum(costs) / len(costs), 2)
+                downhill_s = sum(1 for g in g_vals if g <= -0.06)
+                if downhill_s >= 60:
+                    out["run_steep_downhill_min"] = round(downhill_s / 60.0, 1)
+
+        run_watts = streams.get("watts") or []
+        active_v = [float(v) for v in vel if v and float(v) > 1.5]
+        if run_watts and active_v:
+            active_p = [float(p) for p in run_watts if p and float(p) > 50.0]
+            if active_p:
+                re_val = pillars_engine.compute_running_effectiveness(
+                    sum(active_v) / len(active_v), sum(active_p) / len(active_p), weight_kg
+                )
+                if re_val is not None:
+                    out["run_re_kg_n"] = re_val
+
+        gct_s = streams.get("contact_time_s") or streams.get("ground_contact_time_s") or []
+        flt_s = streams.get("flight_time_s") or []
+        height_cm = float(streams.get("height_cm") or 180.0)
+        if gct_s and flt_s and len(gct_s) == len(flt_s) and len(gct_s) == n_v:
+            k_series = [
+                pillars_engine.compute_morin_leg_stiffness(weight_kg, height_cm, float(v), float(tc), float(tf))
+                for v, tc, tf in zip(vel, gct_s, flt_s)
+                if v and float(v) > 1.5 and tc and float(tc) > 0.10 and tf is not None
+            ]
+            k_valid = [k for k in k_series if k is not None]
+            if k_valid:
+                out["run_k_leg_kn_m"] = round(sum(k_valid) / len(k_valid), 2)
+                if len(k_valid) >= 20:
+                    q = max(5, len(k_valid) // 4)
+                    k_early = sum(k_valid[:q]) / q
+                    k_late = sum(k_valid[-q:]) / q
+                    if k_early > 1.0:
+                        out["run_k_leg_drop_pct"] = round(max(0.0, ((k_early - k_late) / k_early) * 100.0), 1)
 
     return out
 
@@ -2485,15 +2534,27 @@ def build_coach_telemetry(
         creatine_flag=prof.get("creatine_flag"),
     )
     p3 = pillars_engine.compute_cp_see_and_omnipd(mmp_90d, cp_model)
-    p3["tau_fc_50pct_s"] = 22
-    p3["tau_sc_50pct_s"] = 503
+    tau_fc_50, tau_sc_50 = pillars_engine.chorley_recovery_taus(50.0)
+    p3["tau_fc_50pct_s"] = round(tau_fc_50, 1)
+    p3["tau_sc_50pct_s"] = round(tau_sc_50, 1)
+
+    recent_k_leg = next(
+        (float(a["run_k_leg_kn_m"]) for a in sorted_acts if str(a.get("sport") or "").lower() == "running" and a.get("run_k_leg_kn_m")),
+        None,
+    )
     p4 = pillars_engine.compute_pillar4_myotype(
         activities=sorted_acts,
         cp_watts=float(eff_cp) if eff_cp else None,
         mpr_watts=p3.get("mpr_w"),
         vlamax_sprint=p2.get("vlamax_sprint_proxy"),
         mass_kg=body.get("mass_kg_7d"),
+        run_k_leg_kn_m=recent_k_leg,
     )
+    # Re-evaluate OmniPD decay fallback with Myotype Z-score when no 60m empirical anchor exists
+    if p3.get("omni_decay_source") != "empirical_60m" and p4.get("myotype_z_score") is not None:
+        p3 = pillars_engine.compute_cp_see_and_omnipd(mmp_90d, cp_model, myotype_z=p4.get("myotype_z_score"))
+        p3["tau_fc_50pct_s"] = round(tau_fc_50, 1)
+        p3["tau_sc_50pct_s"] = round(tau_sc_50, 1)
     p3_rx = pillars_engine.solve_individual_interval_prescriptions(
         cp_watts=float(eff_cp) if eff_cp else None,
         w_prime_j=eff_wp_j,
@@ -2541,6 +2602,7 @@ def build_coach_telemetry(
         cp_watts=float(eff_cp) if eff_cp else None,
         myotype_z=p4.get("myotype_z_score"),
         today=ref_today,
+        run_k_leg_kn_m=recent_k_leg,
     )
     readiness["flag_4stage"] = p7["readiness_flag_4stage"]
     readiness["today_logged"] = p7["today_logged"]

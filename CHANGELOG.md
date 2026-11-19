@@ -2,6 +2,17 @@
 
 Written for users: `/atlas-update` shows the sections between the installed and the new version.
 
+## [1.4.7] - 2026-11-19
+
+- **Complete 7-Pillar Physics Core Migration & Zero-Ad-Hoc `coach simulate` (`pillars_engine.py`, `coach_engine.py`, `atlas.py`, `coach.md`):**
+  - **Intensity-Weighted Pre-Fatigue (`w_sub` vs. `w_sup`) & Sex Scaling:** Extends `compute_effective_cp_w_prime()` and `atlas.py coach simulate` with `--preload-sup-kj` (`kJ > CP`) and `--sex {male,female}` calibrated to Mateo-March et al. (2024/2025/2026: `2.5 / 5.0 / 7.5 kJ/kg > CP -> -2.2% / -6.1% / -16.2%` CP drop for males; `-29.6%` @ `5.0 kJ/kg > CP` for females, while preserving female sub-CP retention advantage) — works seamlessly with `--solve` bisection and scenario overrides (`--cp`, `--w-prime`, `--mass-kg`).
+  - **Environment & Sensor Flags + Unified Townsend Altitude:** Replaces legacy Peronnet (1991) with Townsend 2-segment hypoxia (`CP > 1500m`, `W'` 100% up to `2760m` then `-18.3%/km`, `tau_W'` `1.35–1.50x` at `3000m` wired directly into the 1-Hz Chorley ODE), and exposes `--alt-m`, `--temp-c`, `--heat-accl-days`, `--indoor` (`indoor_cp_offset_w`), and `--drivetrain-loss` (`2.4%` default without PowerMatch) directly on `coach simulate`.
+  - **OmniPD Myotype/`W'` Fallback & `>10%` Spike Quarantine:** Adds deterministic Myotype/`W'`-coupled fallback for `omni_decay_a_w` + `predict_omnipd_power()` when no `>30m` all-out anchor exists, and sharpens `filter_power_spikes()` to isolate non-progressive `>10%` (`>=35 W`) 1–2s glitches while preserving legitimate interval steps and sprint ramps (`>50` artifacts hard-locked out of records).
+  - **Running Equivalence Bridge, Deterministic RED-S Guard & Readiness Overrides:** Adds `solve_running_cs_d_prime()` (`CS/D'` OLS), `compute_running_effectiveness()` (`RE`), and live stream/CLI wiring (`--run-splits`, `--grade`, `--morin`, `--re`) for Minetti `C_r(g)` and Morin `k_leg` (with automatic `run_k_leg_kn_m` & drop propagation into Pillars 4 & 7). Hardens `reds_warning_flag` to strict 3-factor detection (`>3%` 28d weight loss + suppressed `ln RMSSD_7d` + performance stagnation), fixes a float-rounding false-positive in `hrv_below_swc`, and adds `HRmax` ceiling blunting (`ROT`) and eccentric `k_leg` drop (`GELB-B`) overrides over green morning RHR/HRV.
+  - **Unified Mader `FatMax`:** Standardizes `p_fatmax_w` and `fatmax_band_w` strictly to the recalibrated Mader `F_Ox(P)` `>=95%-MFO` plateau (removing the parallel `% CP` heuristic).
+- **Comprehensive Physics Verification Suite (`tests/test_coach_physics.py`):**
+  - Adds a 5-block deterministic unit & Golden-Master suite (`unittest` + `pytest`-compatible, auto-run by `tests/run.py`) verifying Kumpel A–E PDF archetypes, 64-kg Diesel vs. Fast-Myotype solver invariants (`-2%` form survival, `1:4` Shuttle, Compiler-Guard), Chorley conservation & `tau_FC=22.3s`/`tau_SC=503.5s`, Townsend/heat/indoor/drivetrain/spike/Mateo-March durability, and the Running Bridge + RED-S + `HRmax`/`k_leg` readiness overrides.
+
 ## [1.4.6] - 2026-11-19
 
 - **Direct `--solve` 1-Hz Bisection Solver & Token-Saving Helpers (`atlas.py`, `pillars_engine.py`, `coach.md`):**

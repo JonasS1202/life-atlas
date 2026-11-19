@@ -83,11 +83,12 @@ All credentials stay local in `brain/_secrets/*.env` (`chmod 600`):
 ## 5. The 7-Pillar Sports-Science Guardrails (2026 Gold Standard)
 
 1. **Ban `FTP_20` (`0.95 * P_20m`), Static `% CP` Above CP & Mental-Math `W'bal`:**
-   - **Below `CP` (Sub-CP):** Use the dynamic phenotype-scaled `f(CP, vLamax_met)` anchors printed by Stage 1 (`FatMax`, `LT1`, `MLSS`) — NEVER fixed `% CP` across Diesel (`vLamax_met ~0.32`) vs. Sprinter (`~0.80`) phenotypes!
-   - **Above `CP` (Severe Domain):** NEVER prescribe or critique VO2max/Supra-CP intervals using static `% CP` or mental-math `W'bal`/`PCr` guesses! Always read the pre-solved 1-Hz targets from **`[3B_prescriptions W'-scaled]`** in `coach context` OR run:
+   - **Below `CP` (Sub-CP):** Use Stage 1's unified Mader `>=95%-MFO` `FatMax` plateau plus dynamic `f(CP, vLamax_met)` `LT1`/`MLSS` anchors — NEVER fixed `% CP` across Diesel (`vLamax_met ~0.32`) vs. Sprinter (`~0.80`) phenotypes!
+   - **Above `CP` (Severe Domain) & What-If Scenarios (Zero Ad-Hoc Python / PDF Scraping!):** NEVER prescribe, critique, or calculate VO2max/Supra-CP intervals, altitude/heat/indoor/drivetrain offsets, pre-fatigue (`w_sub` vs. `w_sup`, `sex`), or running equivalence (`CS/D'`, Minetti, Morin `k_leg`, `RE`) with mental math or ad-hoc inline Python scripts! Always read **`[3B_prescriptions W'-scaled]`** in `coach context` OR run deterministic `coach simulate`:
      ```bash
-     python -I <ROOT>/brain/_atlas/tools/atlas.py coach simulate --dsl "<spec>" [--prior-kj 1600 --cho-g-h 60]
-     python -I <ROOT>/brain/_atlas/tools/atlas.py coach simulate --solve [all|float-30-15|hard-start-4x4|shuttle-1-4] [--prior-kj 1782 --cho-g-h 42.5,90 --form-pct 0,-2]
+     python -I <ROOT>/brain/_atlas/tools/atlas.py coach simulate --dsl "<spec>" [--prior-kj 1500 --preload-sup-kj 560 --cho-g-h 60 --sex male]
+     python -I <ROOT>/brain/_atlas/tools/atlas.py coach simulate --solve [all|float-30-15|hard-start-4x4|shuttle-1-4] [--prior-kj 1500 --preload-sup-kj 560 --cho-g-h 45,90 --form-pct 0,-2 --alt-m 2500 --temp-c 32 --heat-accl-days 0 --indoor --drivetrain-loss 2.4 --sex female --cp 230 --mass-kg 60]
+     python -I <ROOT>/brain/_atlas/tools/atlas.py coach simulate --run-splits "1k=3:20,3k=10:55,5k=18:29" --grade "0,-0.12" --morin "v=4.0,tc=0.22,tf=0.14;v=4.0,tc=0.26,tf=0.10"
      ```
      and respect `coach push`'s automatic 1-Hz `W'bal` / `Time >=90% VO2max` Compiler-Guard (`STIMULUS MISMATCH` / `BLOWOUT WARNING`).
 2. **Mader Metabolism (`vLamax_met` vs. Alactic Sprint), Shuttle (`eta_shuttle`) & Podlogar Functional Fueling (S1 + S2):**
@@ -103,7 +104,7 @@ All credentials stay local in `brain/_secrets/*.env` (`chmod 600`):
 5. **Environment, Hardware, Sex Differences & Running Bridge (S6):**
    - Apply learned `indoor_cp_offset_w` on indoor rides, Townsend 2-segment altitude (`CP` drops `>1500m`; `W'` holds until `2760m`), and heat scaling (`>25°C`). Respect female supra-CP repeatability needs & watch `RED-S` flags. Budget systemic cardio load across Cycling + Running, but keep eccentric running load (`k_leg`, `+10%/wk` cap) modality-specific.
 6. **4-Stage Readiness Resolution (`GRÜN | GELB-A | GELB-B | ROT`, S7):**
-   - **`GELB-B` Rule (Subjective Peripheral Overrides HRV!):** If autonomic `HRV`/`RHR` is green, yet local leg pain is high ("Beine wie Beton") or yesterday's `Q_Strain` spiked, peripheral Type-II / intramyofibrillar glycogen stores are depleted -> **postpone HIIT 24–48 h**!
+   - **`GELB-B` & `ROT` Overrides (Periphery & Blunted `HRmax` Override Green RHR/HRV!):** If autonomic `HRV`/`RHR` is green, yet local leg pain is high ("Beine wie Beton"), running leg-spring stiffness `k_leg` dropped `>=15%`, or yesterday's `Q_Strain` spiked -> **`GELB-B`** (postpone HIIT 24–48 h). If peak `HRmax` is blunted (`>=10 bpm` below `HRmax` on hard/RPE>=8 efforts) -> **`ROT`** (immediate 3–5d deload)!
    - When anchors are missing/stale, schedule standardized tests via `atlas.py coach field-test --unit 1|2|preload|lsct --date YYYY-MM-DD --execute`.
    - Always include the exact Dashboard URL printed by `atlas.py coach context` (fallback: `[📅 Coach Dashboard öffnen](http://127.0.0.1:8765/calendar.html?view=coach)`) when plans, workouts, or telemetry are discussed.
 

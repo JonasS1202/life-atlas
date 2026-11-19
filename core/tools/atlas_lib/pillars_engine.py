@@ -60,11 +60,12 @@ DISCOVERY_DIMENSIONS: tuple[tuple[str, str, str], ...] = (
 # ---------------------------------------------------------------------------
 
 def filter_power_spikes(watts: list[float]) -> tuple[list[float], dict[str, Any]]:
-    """Clean single-second non-progressive powermeter glitches (Mateo-March et al. 2025).
+    """Clean 1-2s non-progressive powermeter glitches (Mateo-March et al. 2025).
 
-    Preserves legitimate sharp interval step changes (where `[i+1]` sustains the step) while
-    clamping isolated 1-2s telemetry spikes (`>2500 W`, `<0 W`, or isolated `>35%` + `>180 W`
-    jumps above both neighbors). Sessions with `>50` artifacts are locked out of record curves.
+    Preserves legitimate sharp interval step changes and sprint accelerations (where neighbors
+    sustain or progress the load) while clamping isolated 1-2s telemetry spikes (`>2500 W`, `<0 W`,
+    or non-progressive `>10%` jumps >=35 W above both immediate neighbors). Sessions with `>50`
+    artifacts are hard-locked out of record curves (`locked_for_records=True`).
     """
     n = len(watts or [])
     if n == 0:
@@ -79,14 +80,20 @@ def filter_power_spikes(watts: list[float]) -> tuple[list[float], dict[str, Any]
             spikes += 1
             cleaned[i] = max(0.0, min(2000.0, 0.5 * (max(0.0, prev_w) + max(0.0, next_w))))
             continue
-        nbr_max = max(prev_w, next_w)
-        # Isolated 1s spike: jumps >35% AND >180W above BOTH immediate neighbors
-        if i > 0 and i + 1 < n and w > max(400.0, nbr_max * 1.35) and (w - nbr_max) > 180.0:
-            # Check 2s spike case as well: only treat as artifact if i+2 also drops back
-            next2_w = cleaned[i + 2] if i + 2 < n else next_w
-            if next_w <= prev_w * 1.35 or next2_w <= prev_w * 1.35:
+        if i > 0 and i + 1 < n:
+            nbr_max = max(prev_w, next_w)
+            # Isolated 1s spike: non-progressive >10% jump AND >=35 W above BOTH immediate neighbors
+            if nbr_max >= 80.0 and w > nbr_max * 1.10 and (w - nbr_max) >= 35.0:
                 spikes += 1
-                cleaned[i] = round(0.5 * (prev_w + min(next_w, next2_w)), 1)
+                cleaned[i] = round(0.5 * (prev_w + next_w), 1)
+                continue
+            # Isolated 2s spike: i and i+1 both jump >10% & >=35 W above prev_w, then i+2 drops back
+            if i + 2 < n and prev_w >= 80.0 and w > prev_w * 1.10 and (w - prev_w) >= 35.0:
+                next2_w = cleaned[i + 2]
+                if next_w > prev_w * 1.10 and next2_w <= prev_w * 1.10 and abs(next2_w - prev_w) <= max(35.0, 0.15 * prev_w):
+                    spikes += 1
+                    cleaned[i] = round(0.5 * (prev_w + next2_w), 1)
+                    continue
     return cleaned, {"spike_count": spikes, "locked_for_records": spikes > 50}
 
 
@@ -383,13 +390,13 @@ def compute_pillar2_metabolic_mader(
 
     rcp_w_kg = round(0.802 - 1.851 * vlamax_met + 0.070 * float(vo2max_rel_clean), 2)
 
-    # Stoichiometric MFO (g/min), 95%-MFO band & CarbMax@90g/h using calibrated `vlamax_met` (never PCr-inflated sprint proxy)
+    # Stoichiometric MFO (g/min), unified >=95%-MFO FatMax plateau & CarbMax@90g/h using calibrated `vlamax_met`
     best_fat_g_min = 0.0
     best_fat_w = None
     p_carb_90 = None
     fat_sweep: list[tuple[int, float]] = []
     upper_sweep = int(round((cp_watts or p_mlss_mader or 280.0) * 1.08))
-    for pw in range(50, max(80, upper_sweep) + 1, 2):
+    for pw in range(50, max(80, upper_sweep) + 1):
         vo2_ss, vla_eff = _mader_vla_ss(float(pw), float(mass), float(vo2max_rel_clean), vlamax_met)
         c_cho_gh = vla_eff * v_la_l * 0.09008 * 60.0
         f_ox_gmin = 0.50 * (float(mass) / 1000.0) * max(0.0, (vo2_ss - 3.5) - (vla_eff * vol_rel) / 0.02049)
@@ -402,30 +409,18 @@ def compute_pillar2_metabolic_mader(
     mader_95_pts = [pw for pw, fx in fat_sweep if best_fat_g_min > 0 and fx >= 0.95 * best_fat_g_min]
     mader_95_band = (min(mader_95_pts), max(mader_95_pts)) if mader_95_pts else None
 
-    # Dynamic phenotype-scaled Sub-CP anchors `f(CP, vLamax_met)` (NEVER static % CP across Diesel vs Sprinter!)
-    # Saturates upper FatMax at <=76.5% CP and reconciles extreme Diesels (`vLamax_met < 0.45`) with Mader 95%-MFO & <=94% LT1.
+    # Dynamic phenotype-scaled LT1 & MLSS anchors `f(CP, vLamax_met)`, while FatMax is strictly unified
+    # to the recalibrated Mader `F_Ox(P)` >=95%-MFO plateau (no parallel `% CP` heuristic!).
     p_mlss_dyn = None
     p_lt1_dyn = None
-    fatmax_band = None
-    p_fatmax_dyn = None
+    fatmax_band = mader_95_band
+    p_fatmax_unified = best_fat_w
     if cp_watts and cp_watts > 50:
         cp_f = float(cp_watts)
         mlss_frac = max(0.90, min(0.975, 0.985 - 0.065 * vlamax_met))
         lt1_frac = max(0.68, min(0.84, 0.865 - 0.14 * vlamax_met))
-        fm_lo_frac = max(0.60, min(0.725, 0.790 - 0.13 * vlamax_met))
-        fm_hi_frac = max(0.65, min(0.765, 0.845 - 0.14 * vlamax_met))
         p_mlss_dyn = int(round(cp_f * mlss_frac))
         p_lt1_dyn = int(round(cp_f * lt1_frac))
-        fm_lo_w = int(round(cp_f * fm_lo_frac))
-        fm_hi_w = int(round(cp_f * fm_hi_frac))
-        if vlamax_met < 0.45:
-            diesel_cap_w = int(round(0.94 * p_lt1_dyn))
-            if mader_95_band:
-                diesel_cap_w = min(diesel_cap_w, mader_95_band[1])
-            fm_hi_w = min(fm_hi_w, diesel_cap_w)
-            fm_lo_w = min(fm_lo_w, max(int(round(cp_f * 0.62)), fm_hi_w - 14))
-        fatmax_band = (fm_lo_w, fm_hi_w)
-        p_fatmax_dyn = int(round(0.5 * (fm_lo_w + fm_hi_w)))
 
     return {
         "vlamax_sprint_proxy": vlamax_sprint,
@@ -440,7 +435,7 @@ def compute_pillar2_metabolic_mader(
         "shuttle_index_eta": eta,
         "shuttle_class": shuttle_cls,
         "rcp_langley_w_kg": rcp_w_kg,
-        "p_fatmax_w": p_fatmax_dyn or best_fat_w,
+        "p_fatmax_w": p_fatmax_unified,
         "fatmax_band_w": fatmax_band,
         "mader_mfo_peak_w": best_fat_w,
         "mader_fatmax_95_band_w": mader_95_band,
@@ -457,12 +452,24 @@ def compute_pillar2_metabolic_mader(
 def compute_cp_see_and_omnipd(
     mmp_dict: dict[str, int | float],
     cp_model: dict[str, Any],
+    myotype_z: float | None = None,
 ) -> dict[str, Any]:
-    """Compute OLS Standard Error (`SEE_CP %`, `SEE_W' %`), `MPR`, `APR`, and OmniPD decay `A`."""
+    """Compute OLS Standard Error (`SEE_CP %`, `SEE_W' %`), `MPR`, `APR`, and OmniPD decay `A`.
+
+    When no true `>30 min` all-out anchor (`60m`) is present, derives a deterministic Myotype/`W'`-coupled
+    fallback for `omni_decay_a_w` (`omni_decay_source='myotype_wp_fallback'`).
+    """
     cp_w = cp_model.get("cp_w")
     wp_j = cp_model.get("w_prime_j")
     if not cp_w or not wp_j or cp_w <= 0 or wp_j <= 0:
-        return {"see_cp_pct": None, "see_wp_pct": None, "mpr_w": None, "apr_w": None, "omni_decay_a_w": None}
+        return {
+            "see_cp_pct": None,
+            "see_wp_pct": None,
+            "mpr_w": None,
+            "apr_w": None,
+            "omni_decay_a_w": None,
+            "omni_decay_source": None,
+        }
 
     dur_map = {"3m": 180, "5m": 300, "8m": 480, "10m": 600, "12m": 720, "20m": 1200}
     pts = [(float(sec), float(mmp_dict[k]) * sec) for k, sec in dur_map.items() if mmp_dict.get(k)]
@@ -485,14 +492,23 @@ def compute_cp_see_and_omnipd(
     mpr = int(round(p5s - cp_w)) if p5s > cp_w else None
     apr = int(round(p5s - p5m)) if (p5s > 0 and p5m > 0 and p5s > p5m) else None
 
-    # OmniPD decay term A (W) for t > TCP_max (1800s), evaluated on 60m (3600s) if available
+    # OmniPD decay term A (W) for t > TCP_max (1800s): empirical 60m anchor when valid, else Myotype/W' fallback
     omni_a = None
+    omni_src = None
     p60 = float(mmp_dict.get("60m") or 0.0)
-    if 0 < p60 < cp_w + (wp_j / 3600.0):
-        pred_3600 = float(cp_w) + (float(wp_j) / 3600.0)
+    pred_3600 = float(cp_w) + (float(wp_j) / 3600.0)
+    # Require realistic maximal 60m effort (>= 75% CP) to avoid passive Z2 60m inflating A
+    if (0.75 * float(cp_w)) <= p60 < pred_3600:
         ln_term = math.log(3600.0 / 1800.0)
         if ln_term > 0:
             omni_a = round(max(0.0, (pred_3600 - p60) / ln_term), 1)
+            omni_src = "empirical_60m"
+    if omni_a is None:
+        wp_s = float(wp_j) / float(cp_w)
+        z_term = 0.012 * max(-1.5, min(3.0, float(myotype_z))) if myotype_z is not None else 0.0
+        a_frac = max(0.032, min(0.15, 0.042 + 0.00085 * (wp_s - 45.0) + z_term))
+        omni_a = round(float(cp_w) * a_frac, 1)
+        omni_src = "myotype_wp_fallback"
 
     return {
         "see_cp_pct": see_cp_pct,
@@ -500,7 +516,37 @@ def compute_cp_see_and_omnipd(
         "mpr_w": mpr,
         "apr_w": apr,
         "omni_decay_a_w": omni_a,
+        "omni_decay_source": omni_src,
     }
+
+
+def predict_omnipd_power(
+    t_sec: float,
+    cp_watts: float,
+    w_prime_j: float,
+    omni_decay_a_w: float = 15.0,
+    p_max_w: float | None = None,
+    tcp_max_s: float = 1800.0,
+) -> float:
+    """Puchowicz (2020) OmniPD power-duration curve across sprint, severe, and >TCP_max durations."""
+    t = max(1.0, float(t_sec))
+    cp = max(50.0, float(cp_watts))
+    wp = max(1000.0, float(w_prime_j))
+    p_max = float(p_max_w) if (p_max_w and float(p_max_w) > cp) else (cp * 3.5)
+    exp_term = 1.0 - math.exp(-t * (p_max - cp) / wp)
+    p_base = (wp / t) * exp_term + cp
+    if t > tcp_max_s and omni_decay_a_w > 0:
+        p_base -= float(omni_decay_a_w) * math.log(t / float(tcp_max_s))
+    return round(max(0.0, p_base), 1)
+
+
+def chorley_recovery_taus(pct_d_cp: float, tau_mult: float = 1.0) -> tuple[float, float]:
+    """Chorley et al. (2023) bi-exponential `W'` recovery time constants `(tau_FC_s, tau_SC_s)`."""
+    d_pct = max(0.0, min(100.0, float(pct_d_cp)))
+    mult = max(0.5, min(2.5, float(tau_mult or 1.0)))
+    tau_fc = (45.0 * math.exp(-0.014 * d_pct) + 9999.0 * math.exp(-0.811 * d_pct)) * mult
+    tau_sc = (9999.0 * math.exp(-0.098 * d_pct) + 429.0) * mult
+    return tau_fc, tau_sc
 
 
 def compute_chorley_w_bal(
@@ -509,6 +555,7 @@ def compute_chorley_w_bal(
     w_prime_j: float = 20000.0,
     fc_fraction: float = 0.45,
     dt_s: float = 1.0,
+    tau_mult: float = 1.0,
 ) -> dict[str, Any]:
     """Dynamic Bi-Exponential `W'bal` ODE (Chorley et al. 2023) with fast PCr (`tau_FC`) & slow `H+` (`tau_SC`)."""
     if not watts or cp_watts <= 0 or w_prime_j <= 0:
@@ -526,6 +573,7 @@ def compute_chorley_w_bal(
     fc_bal = fc_amp
     sc_bal = sc_amp
     min_tot = float(w_prime_j)
+    max_tot = float(w_prime_j)
     total_above_j = 0.0
     total_sub_j = 0.0
 
@@ -550,8 +598,8 @@ def compute_chorley_w_bal(
             leftover = rem - take_sc
             if leftover > 0:
                 take_fc = min(fc_bal, take_fc + leftover)
-            fc_bal = max(0.0, fc_bal - take_fc)
-            sc_bal = max(0.0, sc_bal - take_sc)
+            fc_bal = max(0.0, min(fc_amp, fc_bal - take_fc))
+            sc_bal = max(0.0, min(sc_amp, sc_bal - take_sc))
             w_tot = fc_bal + sc_bal
             if w_tot < min_tot:
                 min_tot = w_tot
@@ -563,27 +611,32 @@ def compute_chorley_w_bal(
         else:
             total_sub_j += p * dt_s
             pct_d_cp = max(0.0, min(100.0, ((cp_watts - p) / cp_watts) * 100.0))
-            tau_fc = 45.0 * math.exp(-0.014 * pct_d_cp) + 9999.0 * math.exp(-0.811 * pct_d_cp)
-            tau_sc = 9999.0 * math.exp(-0.098 * pct_d_cp) + 429.0
-            fc_bal = fc_amp - (fc_amp - fc_bal) * math.exp(-dt_s / max(15.0, tau_fc))
-            sc_bal = sc_amp - (sc_amp - sc_bal) * math.exp(-dt_s / max(60.0, tau_sc))
+            tau_fc, tau_sc = chorley_recovery_taus(pct_d_cp, tau_mult=tau_mult)
+            fc_bal = max(0.0, min(fc_amp, fc_amp - (fc_amp - fc_bal) * math.exp(-dt_s / max(15.0, tau_fc))))
+            sc_bal = max(0.0, min(sc_amp, sc_amp - (sc_amp - sc_bal) * math.exp(-dt_s / max(60.0, tau_sc))))
+            w_tot = fc_bal + sc_bal
+            if w_tot > max_tot:
+                max_tot = w_tot
             sub_streak += dt_s
             if sub_streak >= 10.0:
                 bout_above_j = 0.0
                 bout_counted = False
-            if (fc_bal + sc_bal) >= 0.65 * w_prime_j:
+            if w_tot >= 0.65 * w_prime_j:
                 deep_armed = True
 
-    tau_fc_50 = int(round(45.0 * math.exp(-0.014 * 50.0) + 9999.0 * math.exp(-0.811 * 50.0)))
-    tau_sc_50 = int(round(9999.0 * math.exp(-0.098 * 50.0) + 429.0))
+    tau_fc_50, tau_sc_50 = chorley_recovery_taus(50.0, tau_mult=tau_mult)
     return {
         "w_bal_min_pct": round((min_tot / w_prime_j) * 100.0, 1),
         "w_bal_min_j": int(round(min_tot)),
+        "w_bal_end_j": int(round(fc_bal + sc_bal)),
+        "w_bal_max_j": int(round(max_tot)),
+        "fc_end_j": int(round(fc_bal)),
+        "sc_end_j": int(round(sc_bal)),
         "matches_burned": matches,
         "kj_above_cp": round(total_above_j / 1000.0, 1),
         "kj_sub_cp": round(total_sub_j / 1000.0, 1),
-        "tau_fc_50pct_s": tau_fc_50,
-        "tau_sc_50pct_s": tau_sc_50,
+        "tau_fc_50pct_s": round(tau_fc_50, 1),
+        "tau_sc_50pct_s": round(tau_sc_50, 1),
     }
 
 
@@ -653,6 +706,32 @@ def expand_spec_to_1hz_watts(
     return watts, work_watts
 
 
+def _interp_mateo_march_sup_drop(w_sup_kj_kg: float, is_female: bool = False) -> float:
+    """Mateo-March et al. (2024 / 2025 / 2026) intensity-weighted supra-CP CP-drop curve.
+
+    Male anchors (`kJ/kg > CP -> CP drop`): `2.5 -> 2.2%`, `5.0 -> 6.1%`, `7.5 -> 16.2%`.
+    Female anchors (sex-specific supra-CP paradox): steeper curve hitting `29.6%` at `5.0 kJ/kg > CP`.
+    """
+    x = max(0.0, float(w_sup_kj_kg))
+    if x <= 0.0:
+        return 0.0
+    pts = (
+        [(0.0, 0.0), (2.5, 0.090), (5.0, 0.296), (7.5, 0.380)]
+        if is_female
+        else [(0.0, 0.0), (2.5, 0.022), (5.0, 0.061), (7.5, 0.162)]
+    )
+    for idx in range(len(pts) - 1):
+        x0, y0 = pts[idx]
+        x1, y1 = pts[idx + 1]
+        if x <= x1:
+            t = (x - x0) / max(1e-6, x1 - x0)
+            return y0 + t * (y1 - y0)
+    last_x, last_y = pts[-1]
+    slope = 0.015 if is_female else 0.022
+    cap = 0.44 if is_female else 0.35
+    return min(cap, last_y + (x - last_x) * slope)
+
+
 def compute_effective_cp_w_prime(
     cp_watts: float,
     w_prime_j: float,
@@ -661,29 +740,87 @@ def compute_effective_cp_w_prime(
     cho_g_h: float = 60.0,
     verified_drop_15kj_pct: float | None = None,
     form_pct: float = 0.0,
+    prior_sup_kj: float = 0.0,
+    sex: str = "male",
+    elev_m: float = 0.0,
+    temp_c: float | None = None,
+    heat_accl_days: int = 0,
+    indoor: bool = False,
+    indoor_cp_offset_w: float = -19.0,
+    drivetrain_loss_pct: float = 0.0,
 ) -> dict[str, float]:
-    """Apply durability pre-fatigue `(prior_kj, cho_g_h)` and optional daily form offset (`form_pct`, e.g. `-2.0`) to `(CP, W')`."""
+    """Apply intensity-weighted pre-fatigue (`w_sub` vs. `w_sup` + sex scaling), daily form (`form_pct`),
+    Townsend altitude, heat/acclimatization, indoor physiology offset, and drivetrain loss to `(CP, W')`."""
     cp_fresh = max(80.0, float(cp_watts or 275.0))
     wp_fresh = max(4000.0, float(w_prime_j or 18000.0))
     bw = max(40.0, float(mass_kg or 75.0))
+    is_female = str(sex or "male").strip().lower() in ("f", "female", "w", "weiblich")
 
     form_mult = max(0.80, min(1.10, 1.0 + float(form_pct or 0.0) / 100.0))
     cp_base = cp_fresh * form_mult
     wp_base = wp_fresh * form_mult
 
-    cp_eff, wp_eff = cp_base, wp_base
-    if prior_kj and float(prior_kj) > 0.0:
-        kj_kg = float(prior_kj) / bw
-        excess = max(0.0, kj_kg - 12.0)
+    # 1. Intensity-weighted pre-fatigue: separate `w_sub` (<=CP) from `w_sup` (>CP) without double-counting
+    w_sup_kj = max(0.0, float(prior_sup_kj or 0.0))
+    tot_kj = max(0.0, float(prior_kj or 0.0))
+    w_sub_kj = max(0.0, tot_kj - w_sup_kj) if tot_kj > 0.0 else 0.0
+    w_sub_kj_kg = w_sub_kj / bw
+    w_sup_kj_kg = w_sup_kj / bw
+
+    sub_cp_drop = 0.0
+    sub_wp_drop = 0.0
+    if w_sub_kj > 0.0:
+        excess = max(0.0, w_sub_kj_kg - 12.0)
         # Fueling modulation: under-fueling (<60 g/h) accelerates glycogen/W' decay; 80-100 g/h dampens it
         fuel_mult = max(0.65, min(1.55, 1.0 + (60.0 - float(cho_g_h)) * 0.012))
+        # Pastorio et al. (2025/2026): trained females preserve sub-CP thresholds better than males
+        sub_sex_mult = 0.65 if is_female else 1.0
         base_cp_rate = 0.0020
         if verified_drop_15kj_pct is not None and verified_drop_15kj_pct > 0:
             base_cp_rate = max(0.0012, min(0.0040, (float(verified_drop_15kj_pct) / 100.0) * 0.25))
-        cp_drop = min(0.18, excess * base_cp_rate * fuel_mult)
-        wp_drop = min(0.35, excess * 0.0055 * fuel_mult)
-        cp_eff = cp_base * (1.0 - cp_drop)
-        wp_eff = wp_base * (1.0 - wp_drop)
+        sub_cp_drop = min(0.18, excess * base_cp_rate * fuel_mult * sub_sex_mult)
+        sub_wp_drop = min(0.35, excess * 0.0055 * fuel_mult * sub_sex_mult)
+
+    sup_cp_drop = 0.0
+    sup_wp_drop = 0.0
+    if w_sup_kj > 0.0:
+        raw_sup_drop = _interp_mateo_march_sup_drop(w_sup_kj_kg, is_female=is_female)
+        sup_fuel_mult = max(0.85, min(1.18, 1.0 + (60.0 - float(cho_g_h)) * 0.004))
+        sup_cp_drop = min(0.45, raw_sup_drop * sup_fuel_mult)
+        sup_wp_drop = min(0.55, sup_cp_drop * 1.65)
+
+    cp_eff = cp_base * (1.0 - sub_cp_drop) * (1.0 - sup_cp_drop)
+    wp_eff = wp_base * (1.0 - sub_wp_drop) * (1.0 - sup_wp_drop)
+
+    # 2. Townsend 2-Segment Altitude (`CP` >1500m, `W'` 100% up to 2760m, `tau_W'` 1.35-1.50x at 3000m)
+    tau_w_mult = 1.0
+    alt_cp_loss_pct = 0.0
+    alt_wp_pct = 100.0
+    if elev_m and float(elev_m) > 1500.0:
+        tw = compute_townsend_altitude(float(elev_m), cp_eff, wp_eff / 1000.0)
+        alt_cp_loss_pct = float(tw.get("cp_loss_pct") or 0.0)
+        alt_wp_pct = float(tw.get("w_prime_pct") or 100.0)
+        tau_w_mult = float(tw.get("tau_w_altitude_mult") or 1.0)
+        cp_eff *= (1.0 - alt_cp_loss_pct / 100.0)
+        wp_eff *= (alt_wp_pct / 100.0)
+
+    # 3. Heat Stress & 14-day Heat Acclimatization (`-0.5%/°C` >25°C unacclimatized)
+    heat_cp_loss_pct = 0.0
+    if temp_c is not None and float(temp_c) > 25.0:
+        accl_days = max(0.0, min(14.0, float(heat_accl_days or 0)))
+        accl_factor = max(0.10, 1.0 - (accl_days / 14.0) * 0.90)
+        heat_drop = min(0.22, (float(temp_c) - 25.0) * 0.005 * accl_factor)
+        heat_cp_loss_pct = round(heat_drop * 100.0, 2)
+        cp_eff *= (1.0 - heat_drop)
+        wp_eff *= (1.0 - 0.30 * heat_drop)
+
+    # 4. Indoor physiology offset (Lipski 2022 default -19 W) & Drivetrain sensor loss (2.4% without PowerMatch)
+    if indoor:
+        cp_eff = max(80.0, cp_eff + float(indoor_cp_offset_w))
+    dt_loss = max(0.0, min(10.0, float(drivetrain_loss_pct or 0.0)))
+    if dt_loss > 0.0:
+        cp_eff *= (1.0 - dt_loss / 100.0)
+        wp_eff *= (1.0 - dt_loss / 100.0)
 
     cp_drop_pct = round(max(0.0, (1.0 - cp_eff / cp_fresh) * 100.0), 1)
     wp_drop_pct = round(max(0.0, (1.0 - wp_eff / wp_fresh) * 100.0), 1)
@@ -692,6 +829,13 @@ def compute_effective_cp_w_prime(
         "wp_eff_j": wp_eff,
         "cp_drop_pct": cp_drop_pct,
         "wp_drop_pct": wp_drop_pct,
+        "w_sub_kj_kg": round(w_sub_kj_kg, 2),
+        "w_sup_kj_kg": round(w_sup_kj_kg, 2),
+        "sup_cp_drop_pct": round(sup_cp_drop * 100.0, 1),
+        "alt_cp_loss_pct": round(alt_cp_loss_pct, 1),
+        "alt_wp_pct": round(alt_wp_pct, 1),
+        "heat_cp_loss_pct": round(heat_cp_loss_pct, 1),
+        "tau_w_mult": round(tau_w_mult, 2),
     }
 
 
@@ -708,15 +852,24 @@ def simulate_workout_stream(
     work_block_watts: list[float] | None = None,
     form_pct: float = 0.0,
     creatine_flag: bool | None = None,
+    prior_sup_kj: float = 0.0,
+    sex: str = "male",
+    elev_m: float = 0.0,
+    temp_c: float | None = None,
+    heat_accl_days: int = 0,
+    indoor: bool = False,
+    indoor_cp_offset_w: float = -19.0,
+    drivetrain_loss_pct: float = 0.0,
+    tau_w_mult: float | None = None,
 ) -> dict[str, Any]:
     """1-Hz deterministic Chorley bi-exponential `W'bal` (`W'_FC` + `W'_SC`), 1st-order `VO2(t)` kinetics
-    with severe-domain slow component, pre-fatigue `(prior_kj, cho_g_h)` durability degradation, and
-    physiological stimulus / mismatch guard."""
+    with severe-domain slow component, intensity-weighted pre-fatigue `(w_sub, w_sup, cho_g_h, sex)`,
+    environment/hardware offsets, and physiological stimulus / mismatch guard."""
     cp_fresh = max(80.0, float(cp_watts or 275.0))
     wp_fresh = max(4000.0, float(w_prime_j or 18000.0))
     bw = max(40.0, float(mass_kg or 75.0))
 
-    # Guardrail #5: Pre-fatigue (prior_kj & cho_g_h) + optional daily form degradation of (CP_eff, W'_eff)
+    # Guardrail #5: Intensity-weighted pre-fatigue + environment/sensor/form scaling of (CP_eff, W'_eff)
     eff = compute_effective_cp_w_prime(
         cp_watts=cp_fresh,
         w_prime_j=wp_fresh,
@@ -725,11 +878,20 @@ def simulate_workout_stream(
         cho_g_h=cho_g_h,
         verified_drop_15kj_pct=verified_drop_15kj_pct,
         form_pct=form_pct,
+        prior_sup_kj=prior_sup_kj,
+        sex=sex,
+        elev_m=elev_m,
+        temp_c=temp_c,
+        heat_accl_days=heat_accl_days,
+        indoor=indoor,
+        indoor_cp_offset_w=indoor_cp_offset_w,
+        drivetrain_loss_pct=drivetrain_loss_pct,
     )
     cp_eff = eff["cp_eff_w"]
     wp_eff = eff["wp_eff_j"]
     cp_drop_pct = eff["cp_drop_pct"]
     wp_drop_pct = eff["wp_drop_pct"]
+    eff_tau_mult = float(tau_w_mult) if tau_w_mult is not None else float(eff.get("tau_w_mult") or 1.0)
 
     p5_eff = float(p_5min_w) if (p_5min_w and float(p_5min_w) > cp_fresh) else (cp_fresh + wp_fresh / 300.0)
     p5_deg = p5_eff * (cp_eff / cp_fresh)
@@ -763,14 +925,13 @@ def simulate_workout_stream(
             leftover = rem - take_sc
             if leftover > 0.0:
                 take_fc = min(fc_bal, take_fc + leftover)
-            fc_bal = max(0.0, fc_bal - take_fc)
-            sc_bal = max(0.0, sc_bal - take_sc)
+            fc_bal = max(0.0, min(fc_amp, fc_bal - take_fc))
+            sc_bal = max(0.0, min(sc_amp, sc_bal - take_sc))
         else:
             pct_d_cp = max(0.0, min(100.0, ((cp_eff - p) / cp_eff) * 100.0))
-            tau_fc = 45.0 * math.exp(-0.014 * pct_d_cp) + 9999.0 * math.exp(-0.811 * pct_d_cp)
-            tau_sc = 9999.0 * math.exp(-0.098 * pct_d_cp) + 429.0
-            fc_bal = fc_amp - (fc_amp - fc_bal) * math.exp(-1.0 / max(15.0, tau_fc))
-            sc_bal = sc_amp - (sc_amp - sc_bal) * math.exp(-1.0 / max(60.0, tau_sc))
+            tau_fc, tau_sc = chorley_recovery_taus(pct_d_cp, tau_mult=eff_tau_mult)
+            fc_bal = max(0.0, min(fc_amp, fc_amp - (fc_amp - fc_bal) * math.exp(-1.0 / max(15.0, tau_fc))))
+            sc_bal = max(0.0, min(sc_amp, sc_amp - (sc_amp - sc_bal) * math.exp(-1.0 / max(60.0, tau_sc))))
 
         wtot = fc_bal + sc_bal
         if wtot < min_tot:
@@ -844,14 +1005,19 @@ def simulate_workout_stream(
                 "this is intermittent threshold, not severe VO2max."
             )
 
+    tau_fc_50, tau_sc_50 = chorley_recovery_taus(50.0, tau_mult=eff_tau_mult)
     return {
         "duration_min": round(n_s / 60.0, 1),
         "cp_eff_w": round(cp_eff, 1),
         "wp_eff_kj": round(wp_eff / 1000.0, 1),
         "pre_fatigue_kj": round(float(prior_kj or 0.0), 0),
+        "pre_fatigue_sup_kj": round(float(prior_sup_kj or 0.0), 0),
         "cho_g_h": round(float(cho_g_h or 60.0), 0),
         "cp_drop_pct": cp_drop_pct,
         "wp_drop_pct": wp_drop_pct,
+        "tau_w_mult": round(eff_tau_mult, 2),
+        "tau_fc_50pct_s": round(tau_fc_50, 1),
+        "tau_sc_50pct_s": round(tau_sc_50, 1),
         "avg_w": avg_w,
         "work_block_avg_w": wb_avg_w,
         "total_kj": round(total_kj, 0),
@@ -879,9 +1045,18 @@ def solve_individual_interval_prescriptions(
     verified_drop_15kj_pct: float | None = None,
     form_pct: float = 0.0,
     creatine_flag: bool | None = None,
+    prior_sup_kj: float = 0.0,
+    sex: str = "male",
+    elev_m: float = 0.0,
+    temp_c: float | None = None,
+    heat_accl_days: int = 0,
+    indoor: bool = False,
+    indoor_cp_offset_w: float = -19.0,
+    drivetrain_loss_pct: float = 0.0,
 ) -> dict[str, Any]:
     """Constrained 1-Hz inverse `W'bal` + `VO2(t)` prescription solver individualized to `(CP, W', vLamax_met, Z_Myo)`
-    with optional durability pre-fatigue `(prior_kj, cho_g_h)` and daily form scaling (`form_pct`).
+    with intensity-weighted pre-fatigue `(prior_kj, prior_sup_kj, cho_g_h, sex)`, environment/hardware offsets,
+    and daily form scaling (`form_pct`).
 
     Enforces:
       - Diesel safety floor: `target_reserve >= max(0.20 * W', 3.0 kJ)`
@@ -909,9 +1084,18 @@ def solve_individual_interval_prescriptions(
         cho_g_h=cho_g_h,
         verified_drop_15kj_pct=verified_drop_15kj_pct,
         form_pct=form_pct,
+        prior_sup_kj=prior_sup_kj,
+        sex=sex,
+        elev_m=elev_m,
+        temp_c=temp_c,
+        heat_accl_days=heat_accl_days,
+        indoor=indoor,
+        indoor_cp_offset_w=indoor_cp_offset_w,
+        drivetrain_loss_pct=drivetrain_loss_pct,
     )
     cp = eff["cp_eff_w"]
     wp = eff["wp_eff_j"]
+    tau_mult = float(eff.get("tau_w_mult") or 1.0)
     scale_ratio = cp / cp_fresh
     p5 = p5_fresh * scale_ratio
 
@@ -938,7 +1122,7 @@ def solve_individual_interval_prescriptions(
     op_on = int(round(cp * 1.19))
     op_off = int(round(cp * 0.65))
     op_w, op_wb = _build_3015(op_on, op_off, 3, 13)
-    op_sim = simulate_workout_stream(op_w, cp, wp, p5, bw, work_block_watts=op_wb, creatine_flag=creatine_flag)
+    op_sim = simulate_workout_stream(op_w, cp, wp, p5, bw, work_block_watts=op_wb, creatine_flag=creatine_flag, tau_w_mult=tau_mult)
 
     # 2. VO2max Float 30/15 (`3x13`, `Off = 68-70% CP`, bisected to hit `target_res_j`, bounded by `p_on_iix_cap`)
     fl_off = int(round(cp * 0.70))
@@ -946,14 +1130,14 @@ def solve_individual_interval_prescriptions(
     for _ in range(28):
         mid = 0.5 * (lo + hi)
         sw, swb = _build_3015(mid, fl_off, 3, 13)
-        sm = simulate_workout_stream(sw, cp, wp, p5, bw, work_block_watts=swb, creatine_flag=creatine_flag)
+        sm = simulate_workout_stream(sw, cp, wp, p5, bw, work_block_watts=swb, creatine_flag=creatine_flag, tau_w_mult=tau_mult)
         if sm["w_bal_min_kj"] * 1000.0 > target_res_j:
             lo = mid
         else:
             hi = mid
     fl_on = int(round(0.5 * (lo + hi)))
     fl_w, fl_wb = _build_3015(fl_on, fl_off, 3, 13)
-    fl_sim = simulate_workout_stream(fl_w, cp, wp, p5, bw, work_block_watts=fl_wb, creatine_flag=creatine_flag)
+    fl_sim = simulate_workout_stream(fl_w, cp, wp, p5, bw, work_block_watts=fl_wb, creatine_flag=creatine_flag, tau_w_mult=tau_mult)
 
     # 3. VO2max Classic 30/15 (`Off = 50% CP`) — if `P_on` hits `p_on_iix_cap`, auto-escalate `P_off` (Float)!
     cl_off = int(round(cp * 0.50))
@@ -961,7 +1145,7 @@ def solve_individual_interval_prescriptions(
     for _ in range(28):
         mid = 0.5 * (lo + hi)
         sw, swb = _build_3015(mid, cl_off, 3, 13)
-        sm = simulate_workout_stream(sw, cp, wp, p5, bw, work_block_watts=swb, creatine_flag=creatine_flag)
+        sm = simulate_workout_stream(sw, cp, wp, p5, bw, work_block_watts=swb, creatine_flag=creatine_flag, tau_w_mult=tau_mult)
         if sm["w_bal_min_kj"] * 1000.0 > target_res_j:
             lo = mid
         else:
@@ -976,7 +1160,7 @@ def solve_individual_interval_prescriptions(
         for _ in range(24):
             omid = 0.5 * (o_lo + o_hi)
             sw, swb = _build_3015(cl_on, omid, 3, 13)
-            sm = simulate_workout_stream(sw, cp, wp, p5, bw, work_block_watts=swb, creatine_flag=creatine_flag)
+            sm = simulate_workout_stream(sw, cp, wp, p5, bw, work_block_watts=swb, creatine_flag=creatine_flag, tau_w_mult=tau_mult)
             if sm["w_bal_min_kj"] * 1000.0 > target_res_j:
                 o_lo = omid
             else:
@@ -985,11 +1169,9 @@ def solve_individual_interval_prescriptions(
     else:
         cl_on = int(round(cl_on_raw))
     cl_w, cl_wb = _build_3015(cl_on, cl_off, 3, 13)
-    cl_sim = simulate_workout_stream(cl_w, cp, wp, p5, bw, work_block_watts=cl_wb, creatine_flag=creatine_flag)
+    cl_sim = simulate_workout_stream(cl_w, cp, wp, p5, bw, work_block_watts=cl_wb, creatine_flag=creatine_flag, tau_w_mult=tau_mult)
 
     # 4. Guardrail #3c: 2-Stage Hard-Start 4x4m (`45s Start -> 3:15m Hold`, `5m @ 50% CP rest`)
-    # Stage 1: Solve `P_start` (45s) for ~60-65% depletion of fast alactic PCr reserve (~min(0.22*W', 0.09*mass*1000))
-    # without flooding `W'_SC` (`burn = (P_start - CP)*45`, `0.65*burn = 0.62*pcr_pool`)
     pcr_pool_j = min(0.22 * wp, 90.0 * bw)
     p_start_raw = cp + (0.62 * pcr_pool_j) / (45.0 * 0.65)
     hs_start = int(round(min(p5 * 1.03, max(cp * 1.15, p_start_raw))))
@@ -1009,22 +1191,19 @@ def solve_individual_interval_prescriptions(
     for _ in range(28):
         hmid = 0.5 * (h_lo + h_hi)
         sw, swb = _build_hs4x4(hs_start, hmid)
-        sm = simulate_workout_stream(sw, cp, wp, p5, bw, work_block_watts=swb, creatine_flag=creatine_flag)
+        sm = simulate_workout_stream(sw, cp, wp, p5, bw, work_block_watts=swb, creatine_flag=creatine_flag, tau_w_mult=tau_mult)
         if sm["w_bal_min_kj"] * 1000.0 > target_res_j:
             h_lo = hmid
         else:
             h_hi = hmid
     hs_hold = int(round(0.5 * (h_lo + h_hi)))
     hs_w, hs_wb = _build_hs4x4(hs_start, hs_hold)
-    hs_sim = simulate_workout_stream(hs_w, cp, wp, p5, bw, work_block_watts=hs_wb, creatine_flag=creatine_flag)
+    hs_sim = simulate_workout_stream(hs_w, cp, wp, p5, bw, work_block_watts=hs_wb, creatine_flag=creatine_flag, tau_w_mult=tau_mult)
 
     # 5. Guardrail #3a: Controlled 1:4 Lactate-Shuttle (`6x [1m Over / 4m Under]`)
-    # Anchor `4m Under` at `80-86% CP` (near LT1) for max aerobic ATP & MCT1 lactate clearance;
-    # bound `1m Over` to controlled `15-18% W'` pulse per 1m bout (never 460-500W IIx blast!)
     lt1_base = p2.get("p_lt1_w")
     lt1_w = (float(lt1_base) * scale_ratio) if lt1_base else (cp * 0.78)
     sh_under = int(round(max(cp * 0.80, min(cp * 0.86, lt1_w * 1.05))))
-    # 1m Over burns ~16-18% of W' per bout, clamped <= 0.92 * P_5m and <= 1.28 * CP
     over_target_j = min(0.17 * wp, 0.28 * cp * 60.0)
     sh_over = int(round(min(p5 * 0.92, max(cp * 1.12, cp + over_target_j / 60.0))))
     sh_w = [0.60 * cp] * 600
@@ -1032,12 +1211,13 @@ def solve_individual_interval_prescriptions(
     for _ in range(6):
         sh_w.extend([sh_over] * 60 + [sh_under] * 240)
         sh_wb.extend([sh_over] * 60 + [sh_under] * 240)
-    sh_sim = simulate_workout_stream(sh_w, cp, wp, p5, bw, work_block_watts=sh_wb, creatine_flag=creatine_flag)
+    sh_sim = simulate_workout_stream(sh_w, cp, wp, p5, bw, work_block_watts=sh_wb, creatine_flag=creatine_flag, tau_w_mult=tau_mult)
 
     # 6. Sub-Threshold / MLSS Builder (`4x10m @ MLSS`)
     mlss_base = p2.get("p_mlss_w")
     mlss_w = int(round(float(mlss_base) * scale_ratio)) if mlss_base else int(round(cp * 0.95))
 
+    tau_fc_50, tau_sc_50 = chorley_recovery_taus(50.0, tau_mult=tau_mult)
     return {
         "cp_fresh_w": round(cp_fresh, 1),
         "wp_fresh_kj": round(wp_fresh / 1000.0, 1),
@@ -1046,8 +1226,12 @@ def solve_individual_interval_prescriptions(
         "cp_drop_pct": eff["cp_drop_pct"],
         "wp_drop_pct": eff["wp_drop_pct"],
         "prior_kj": round(float(prior_kj or 0.0), 0),
+        "prior_sup_kj": round(float(prior_sup_kj or 0.0), 0),
         "cho_g_h": round(float(cho_g_h if cho_g_h is not None else 60.0), 1),
         "form_pct": round(float(form_pct or 0.0), 1),
+        "tau_w_mult": round(tau_mult, 2),
+        "tau_fc_50pct_s": round(tau_fc_50, 1),
+        "tau_sc_50pct_s": round(tau_sc_50, 1),
         "target_reserve_kj": target_res_kj,
         "iix_cap_w": int(round(p_on_iix_cap)),
         "re_entry_opener": {
@@ -1391,6 +1575,108 @@ def compute_pillar5_durability_and_tid(
 # 6. Pillar 6: Morphometry (`CdA`), `Compound Score`, Environment, RED-S & Run
 # ---------------------------------------------------------------------------
 
+def _fmt_run_pace(sec_per_km: float | None) -> str:
+    if not sec_per_km or sec_per_km <= 0:
+        return "—"
+    total_s = int(round(float(sec_per_km)))
+    return f"{total_s // 60}:{total_s % 60:02d}/km"
+
+
+def solve_running_cs_d_prime(
+    splits: list[tuple[float, float]] | dict[str, float | str],
+) -> dict[str, Any]:
+    """OLS Running Equivalence Bridge (`D(t) = CS * t + D'`) from `(dist_m, time_s)` pairs or split dict.
+
+    Accepts either `[(1000, 200), (3000, 655), (5000, 1109)]` or `{"1km": "3:20", "3km": "10:55", "5km": "18:29"}`.
+    Returns `cs_mps`, `cs_pace_fmt`, `d_prime_m`, `r2`, and derived `mlss_pace_fmt` (~95% CS) / `lt1_pace_range_fmt`.
+    """
+    dist_lookup = {
+        "400m": 400.0, "800m": 800.0, "1k": 1000.0, "1km": 1000.0, "1000m": 1000.0,
+        "1500m": 1500.0, "1.5k": 1500.0, "1600m": 1600.0, "mile": 1609.34,
+        "2k": 2000.0, "2km": 2000.0, "3k": 3000.0, "3km": 3000.0, "3000m": 3000.0,
+        "5k": 5000.0, "5km": 5000.0, "5000m": 5000.0, "10k": 10000.0, "10km": 10000.0, "10000m": 10000.0,
+    }
+
+    def _parse_time_s(raw: Any) -> float | None:
+        if isinstance(raw, (int, float)):
+            return float(raw) if float(raw) > 0 else None
+        s = str(raw or "").strip()
+        if not s:
+            return None
+        if ":" in s:
+            parts = s.split(":")
+            try:
+                if len(parts) == 2:
+                    return float(parts[0]) * 60.0 + float(parts[1].replace(",", "."))
+                if len(parts) == 3:
+                    return float(parts[0]) * 3600.0 + float(parts[1]) * 60.0 + float(parts[2].replace(",", "."))
+            except ValueError:
+                return None
+        try:
+            return float(s.replace(",", "."))
+        except ValueError:
+            return None
+
+    pts: list[tuple[float, float]] = []
+    if isinstance(splits, dict):
+        for k, v in splits.items():
+            kl = str(k).strip().lower()
+            dist_m = dist_lookup.get(kl)
+            if dist_m is None:
+                m_num = re.match(r"^(\d+(?:[.,]\d+)?)\s*(km|k|m)$", kl)
+                if m_num:
+                    val = float(m_num.group(1).replace(",", "."))
+                    dist_m = val * 1000.0 if m_num.group(2) in ("km", "k") else val
+            t_s = _parse_time_s(v)
+            if dist_m and dist_m > 0 and t_s and t_s > 0:
+                pts.append((t_s, dist_m))
+    else:
+        for item in splits or []:
+            if len(item) >= 2 and float(item[0]) > 0 and float(item[1]) > 0:
+                pts.append((float(item[1]), float(item[0])))
+
+    if len(pts) < 2:
+        return {"valid": False, "cs_mps": None, "d_prime_m": None, "r2": 0.0, "cs_pace_fmt": "—"}
+
+    pts.sort(key=lambda x: x[0])
+    n = len(pts)
+    mx = sum(t for t, _ in pts) / n
+    my = sum(d for _, d in pts) / n
+    sxx = sum((t - mx) ** 2 for t, _ in pts)
+    sxy = sum((t - mx) * (d - my) for t, d in pts)
+    syy = sum((d - my) ** 2 for _, d in pts)
+    if sxx <= 0.0:
+        return {"valid": False, "cs_mps": None, "d_prime_m": None, "r2": 0.0, "cs_pace_fmt": "—"}
+    cs_mps = sxy / sxx
+    d_prime_m = my - cs_mps * mx
+    r2 = (sxy ** 2) / (sxx * syy) if syy > 0.0 else 0.0
+    valid = bool(cs_mps > 1.5 and d_prime_m >= 15.0 and r2 >= 0.98)
+    cs_spk = 1000.0 / cs_mps if cs_mps > 0.5 else None
+    mlss_spk = 1000.0 / (0.95 * cs_mps) if cs_mps > 0.5 else None
+    lt1_lo_spk = 1000.0 / (0.85 * cs_mps) if cs_mps > 0.5 else None
+    lt1_hi_spk = 1000.0 / (0.80 * cs_mps) if cs_mps > 0.5 else None
+    return {
+        "valid": valid,
+        "cs_mps": round(cs_mps, 2),
+        "cs_mps_exact": round(cs_mps, 4),
+        "cs_pace_spk": round(cs_spk, 1) if cs_spk else None,
+        "cs_pace_fmt": _fmt_run_pace(cs_spk),
+        "d_prime_m": int(round(d_prime_m)),
+        "d_prime_m_exact": round(d_prime_m, 1),
+        "r2": round(r2, 6),
+        "mlss_pace_fmt": _fmt_run_pace(mlss_spk),
+        "lt1_pace_range_fmt": f"{_fmt_run_pace(lt1_lo_spk)}–{_fmt_run_pace(lt1_hi_spk)}" if lt1_lo_spk else "—",
+    }
+
+
+def compute_running_effectiveness(vel_mps: float, power_w: float, mass_kg: float) -> float | None:
+    """Coggan & Palladino Running Effectiveness `RE = v [m/s] / (P / M [W/kg])` in `kg/N`."""
+    if not vel_mps or not power_w or not mass_kg or float(vel_mps) <= 0.5 or float(power_w) <= 30.0 or float(mass_kg) <= 25.0:
+        return None
+    w_kg = float(power_w) / float(mass_kg)
+    return round(float(vel_mps) / w_kg, 3)
+
+
 def minetti_running_cost_j_kg_m(grade_dec: float) -> float:
     """Minetti et al. (2002) 5th-degree metabolic cost polynomial (`-0.25 <= g <= +0.30`)."""
     g = max(-0.25, min(0.30, float(grade_dec)))
@@ -1421,12 +1707,15 @@ def compute_morin_leg_stiffness(
 
 
 def compute_townsend_altitude(elev_m: float, cp_watts: float | None, w_prime_kj: float | None) -> dict[str, Any]:
-    """Townsend et al. (2017) 2-segment altitude adjustment (`CP` drops >1500m; `W'` stable to 2760m)."""
+    """Townsend et al. (2017) 2-segment altitude adjustment (`CP` drops >1500m; `W'` 100% up to 2760m, -18.3%/km above; `tau_W'` 1.35-1.50x at 3000m)."""
     h_km = float(elev_m or 0.0) / 1000.0
     cp_loss_pct = round(min(30.0, max(0.0, (h_km - 1.50) * 8.0)), 1) if h_km > 1.50 else 0.0
     wp_pct = 100.0 if h_km <= 2.76 else max(50.0, round(100.0 - 18.3 * (h_km - 2.76), 1))
-    tau_mult = 1.0 if h_km <= 1.50 else round(min(1.55, 1.0 + 0.28 * (h_km - 1.50)), 2)
+    tau_mult = 1.0 if h_km <= 1.50 else round(min(1.55, 1.0 + 0.30 * (h_km - 1.50)), 2)
     return {
+        "elev_m": int(round(float(elev_m or 0.0))),
+        "cp_loss_pct": cp_loss_pct,
+        "w_prime_pct": wp_pct,
         "cp_altitude_w": int(round(float(cp_watts) * (1.0 - cp_loss_pct / 100.0))) if cp_watts else None,
         "w_prime_altitude_kj": round(float(w_prime_kj) * (wp_pct / 100.0), 1) if w_prime_kj else None,
         "tau_w_altitude_mult": tau_mult,
@@ -1489,19 +1778,58 @@ def compute_pillar6_locomotion_environment(
         if isinstance(a, dict) and str(a.get("date", ""))[:10] >= cutoff_14d and (a.get("temp_c") or 0) >= 25.0
     )
 
-    # RED-S Early Warning (falling weight trend + suppressed HRV + stagnant/dropping performance)
+    # Deterministic RED-S Guard: rapid 28d weight loss (>3%) + suppressed `ln RMSSD_7d` + performance stagnation
+    cutoff_7d = (ref_today - dt.timedelta(days=7)).isoformat()
+    cutoff_28d = (ref_today - dt.timedelta(days=28)).isoformat()
+    reds_warning_flag = False
     reds_warning = None
-    weights_sorted = [
-        (r["date"], float(r["weight_kg"]))
-        for r in sorted((readiness_rows or []), key=lambda x: x["date"])
-        if r.get("weight_kg") is not None
+    weight_loss_28d_pct = None
+    weights_28d = [
+        (str(r["date"])[:10], float(r["weight_kg"]))
+        for r in sorted((readiness_rows or []), key=lambda x: str(x.get("date") or ""))
+        if r.get("weight_kg") is not None and str(r.get("date") or "")[:10] >= cutoff_28d
     ]
-    if len(weights_sorted) >= 4:
-        w_early = sum(x[1] for x in weights_sorted[:2]) / 2.0
-        w_late = sum(x[1] for x in weights_sorted[-2:]) / 2.0
-        hrv_vals = [float(r["hrv_rmssd"]) for r in (readiness_rows or [])[:7] if r.get("hrv_rmssd")]
-        if (w_late - w_early) / max(30.0, w_early) <= -0.025 and hrv_vals and len(hrv_vals) >= 3:
-            reds_warning = "Weight down >=2.5% alongside tracked autonomic load — verify energy availability (RED-S guard)"
+    if len(weights_28d) >= 2:
+        k_win = 2 if len(weights_28d) >= 4 else 1
+        w_early = sum(x[1] for x in weights_28d[:k_win]) / k_win
+        w_late = sum(x[1] for x in weights_28d[-k_win:]) / k_win
+        weight_loss_28d_pct = round(((w_early - w_late) / max(30.0, w_early)) * 100.0, 2)
+
+        ln_7d = [
+            math.log(float(r["hrv_rmssd"]))
+            for r in (readiness_rows or [])
+            if r.get("hrv_rmssd") and float(r["hrv_rmssd"]) > 5.0 and str(r.get("date") or "")[:10] >= cutoff_7d
+        ]
+        ln_28d = [
+            math.log(float(r["hrv_rmssd"]))
+            for r in (readiness_rows or [])
+            if r.get("hrv_rmssd") and float(r["hrv_rmssd"]) > 5.0 and str(r.get("date") or "")[:10] >= cutoff_28d
+        ]
+        hrv_suppressed = False
+        if ln_7d and len(ln_28d) >= 4:
+            m7 = sum(ln_7d) / len(ln_7d)
+            m28 = sum(ln_28d) / len(ln_28d)
+            swc = 0.5 * statistics.pstdev(ln_28d)
+            hrv_suppressed = bool((swc > 0.0 and m7 < (m28 - swc)) or (m28 - m7) >= 0.08)
+
+        # Performance stagnation: 42d peak not exceeding 90d peak (or no 42d breakout)
+        fresh_c = (curves or {}).get("fresh") or {}
+        p5_42 = float((fresh_c.get("5m") or {}).get("42d") or 0.0)
+        p5_90 = float((fresh_c.get("5m") or {}).get("90d") or 0.0)
+        p20_42 = float((fresh_c.get("20m") or {}).get("42d") or 0.0)
+        p20_90 = float((fresh_c.get("20m") or {}).get("90d") or 0.0)
+        perf_stagnant = True
+        if p5_42 > 0 and p5_90 > 0 and p5_42 > p5_90 * 1.01:
+            perf_stagnant = False
+        if p20_42 > 0 and p20_90 > 0 and p20_42 > p20_90 * 1.01:
+            perf_stagnant = False
+
+        if weight_loss_28d_pct > 3.0 and hrv_suppressed and perf_stagnant:
+            reds_warning_flag = True
+            reds_warning = (
+                f"RED-S ALARM: Rapid 28d weight loss (-{weight_loss_28d_pct:.1f}% > 3.0%) + "
+                "suppressed ln RMSSD_7d + performance stagnation — stop deficit, raise CHO/energy availability (>=45 kcal/kg FFM/d) & deload!"
+            )
 
     sex = str(profile.get("sex") or "neutral")
     sex_dur_note = (
@@ -1521,6 +1849,8 @@ def compute_pillar6_locomotion_environment(
         "heat_exposures_14d": heat_exposures_14d,
         "heat_acclimatized": heat_exposures_14d >= 8,
         "sex_durability_note": sex_dur_note,
+        "weight_loss_28d_pct": weight_loss_28d_pct,
+        "reds_warning_flag": reds_warning_flag,
         "reds_warning": reds_warning,
     }
 
@@ -1537,9 +1867,13 @@ def compute_pillar7_and_stage2_readiness(
     cp_watts: float | None,
     myotype_z: float | None = None,
     today: dt.date | None = None,
+    run_k_leg_kn_m: float | None = None,
+    run_k_leg_drop_pct: float | None = None,
 ) -> dict[str, Any]:
-    """Compute `ln RMSSD_7d`, `CV`, `SWC`, Sanders `Q_Strain`/`Q_RPE:PO`, & 4-Stage Readiness Flag."""
+    """Compute `ln RMSSD_7d`, `CV`, `SWC`, Sanders `Q_Strain`/`Q_RPE:PO`, `HRmax` blunting,
+    eccentric running `k_leg` collapse, & 4-Stage Readiness Flag (`GRÜN`/`GELB-A`/`GELB-B`/`ROT`)."""
     ref_today = today or dt.date.today()
+    cutoff_2d = (ref_today - dt.timedelta(days=2)).isoformat()
     cutoff_7d = (ref_today - dt.timedelta(days=7)).isoformat()
     cutoff_28d = (ref_today - dt.timedelta(days=28)).isoformat()
 
@@ -1555,19 +1889,33 @@ def compute_pillar7_and_stage2_readiness(
             if r["date"] >= cutoff_7d:
                 ln_7d.append(ln_v)
 
-    ln_mean_7d = round(sum(ln_7d) / len(ln_7d), 3) if ln_7d else None
-    cv_ln_7d = round((statistics.pstdev(ln_7d) / ln_mean_7d) * 100.0, 2) if (len(ln_7d) >= 3 and ln_mean_7d) else None
+    ln_raw_7d = (sum(ln_7d) / len(ln_7d)) if ln_7d else None
+    ln_mean_7d = round(ln_raw_7d, 3) if ln_raw_7d is not None else None
+    cv_ln_7d = round((statistics.pstdev(ln_7d) / ln_raw_7d) * 100.0, 2) if (len(ln_7d) >= 3 and ln_raw_7d) else None
     ln_mean_28d = (sum(ln_28d) / len(ln_28d)) if len(ln_28d) >= 5 else None
     swc_28d = (0.5 * statistics.pstdev(ln_28d)) if len(ln_28d) >= 5 else None
-    hrv_below_swc = bool(ln_mean_7d is not None and ln_mean_28d is not None and swc_28d is not None and ln_mean_7d < (ln_mean_28d - swc_28d))
+    hrv_below_swc = bool(ln_raw_7d is not None and ln_mean_28d is not None and swc_28d is not None and ln_raw_7d < (ln_mean_28d - max(0.01, swc_28d)))
 
-    # 2. Sanders Subjective-Objective Ratios (sRPE / TSS_CP, RPE / (P_avg / CP))
+    # 2. Sanders Subjective-Objective Ratios + HRmax ceiling blunting + eccentric k_leg drop detection
     eff_cp = float(cp_watts or profile.get("cp_w") or profile.get("ftp_w") or 275.0)
+    hrmax = profile.get("hr_max")
     q_strains: list[float] = []
     q_rpe_pos: list[float] = []
+    hrmax_blunted = False
+    detected_k_leg_drop = float(run_k_leg_drop_pct) if run_k_leg_drop_pct is not None else None
+
+    # Baseline k_leg from older runs if not explicitly passed
+    run_k_vals = [
+        float(a["run_k_leg_kn_m"])
+        for a in (activities or [])
+        if isinstance(a, dict) and str(a.get("sport") or "").lower() == "running" and a.get("run_k_leg_kn_m")
+    ]
+    k_leg_base = statistics.median(run_k_vals) if len(run_k_vals) >= 2 else None
+
     for a in (activities or [])[:10]:
         if not isinstance(a, dict):
             continue
+        act_d = str(a.get("date") or "")[:10]
         rpe = a.get("rpe")
         if rpe is None and a.get("feedback"):
             m_r = re.search(r"\brpe\s*[:=]?\s*(\d{1,2}(?:[.,]\d)?)", str(a["feedback"]), re.I)
@@ -1583,8 +1931,32 @@ def compute_pillar7_and_stage2_readiness(
             if avg_w > 50.0 and eff_cp > 50.0:
                 q_rpe_pos.append(round(float(rpe) / (avg_w / eff_cp), 2))
 
+        # HRmax-Deckelung (Overreaching signature): hard/maximal session in last 7d with blunted peak HR (>=10 bpm / >=7% below HRmax)
+        if hrmax and float(hrmax) >= 140.0 and act_d >= cutoff_7d:
+            act_max_hr = float(a.get("max_hr") or 0.0)
+            is_hard = bool(
+                (rpe is not None and float(rpe) >= 8.0)
+                or float(a.get("if") or 0.0) >= 0.90
+                or float(a.get("kj_above_cp") or 0.0) >= 12.0
+                or a.get("maximal_effort") is True
+            )
+            if is_hard and act_max_hr > 80.0 and act_max_hr <= min(float(hrmax) - 10.0, float(hrmax) * 0.93):
+                hrmax_blunted = True
+
+        # Eccentric running leg-spring stiffness collapse in last 48h
+        if str(a.get("sport") or "").lower() == "running" and act_d >= cutoff_2d:
+            if a.get("run_k_leg_drop_pct") is not None:
+                drop_v = float(a["run_k_leg_drop_pct"])
+                if detected_k_leg_drop is None or drop_v > detected_k_leg_drop:
+                    detected_k_leg_drop = drop_v
+            elif a.get("run_k_leg_kn_m") and k_leg_base and k_leg_base > 2.0:
+                drop_v = ((k_leg_base - float(a["run_k_leg_kn_m"])) / k_leg_base) * 100.0
+                if detected_k_leg_drop is None or drop_v > detected_k_leg_drop:
+                    detected_k_leg_drop = round(drop_v, 1)
+
     latest_q_strain = q_strains[0] if q_strains else None
     latest_q_rpe_po = q_rpe_pos[0] if q_rpe_pos else None
+    k_leg_collapsed = bool(detected_k_leg_drop is not None and detected_k_leg_drop >= 15.0)
 
     # 3. Resolve 4-Stage Readiness (`GRÜN` | `GELB-A` | `GELB-B` | `ROT`)
     today_row = next((r for r in (readiness_rows or []) if r["date"] == ref_today.isoformat()), None)
@@ -1596,13 +1968,22 @@ def compute_pillar7_and_stage2_readiness(
     heavy_legs_text = any(w in notes_low for w in ("beine wie beton", "schwere beine", "leere beine", "dead legs", "heavy legs"))
 
     base_st = base_readiness.get("status", "GREEN")
-    if base_st == "RED" or (fatigue_7d is not None and fatigue_7d >= 5):
+    if base_st == "RED" or (fatigue_7d is not None and fatigue_7d >= 5) or hrmax_blunted:
         flag_4 = "ROT"
-        directive = "Overreaching / Red Guardrail: Immediate recovery or 3–5d deload + high CHO availability; cancel all HIIT."
-    elif (leg_pain is not None and leg_pain >= 4) or heavy_legs_text or (latest_q_strain is not None and latest_q_strain >= 8.5):
+        if hrmax_blunted:
+            directive = "Overreaching / HRmax Ceiling Blunted (overrides green RHR): Immediate 3–5d deload + high CHO availability; cancel all HIIT."
+        else:
+            directive = "Overreaching / Red Guardrail: Immediate recovery or 3–5d deload + high CHO availability; cancel all HIIT."
+    elif k_leg_collapsed or (leg_pain is not None and leg_pain >= 4) or heavy_legs_text or (latest_q_strain is not None and latest_q_strain >= 8.5):
         flag_4 = "GELB-B"
         myo_note = " (Fast-Myotype Type-II / intramyofibrillar glycogen lag)" if (myotype_z and myotype_z > 0.5) else ""
-        directive = f"Peripheral Conflict — Subjective Legs Override Autonomic HRV{myo_note}: postpone HIIT 24–48h; spin easy Z1."
+        if k_leg_collapsed:
+            directive = (
+                f"Peripheral Conflict — Eccentric Running Leg-Stiffness Drop (k_leg -{detected_k_leg_drop:.0f}%) "
+                f"Overrides Green RHR/HRV{myo_note}: postpone HIIT 48h; spin easy Z1."
+            )
+        else:
+            directive = f"Peripheral Conflict — Subjective Legs Override Autonomic HRV{myo_note}: postpone HIIT 24–48h; spin easy Z1."
     elif base_st == "AMBER" or hrv_below_swc:
         flag_4 = "GELB-A"
         directive = "Acute Stimulus Stress: swap today's HIIT for relaxed Zone 1/2 endurance; keep macro block intact."
@@ -1611,7 +1992,6 @@ def compute_pillar7_and_stage2_readiness(
         directive = "All Systems Clear: execute planned key intervals or progression at full target."
 
     # Karvonen HRR anchor
-    hrmax = profile.get("hr_max")
     rhr = (today_row or {}).get("rhr") or base_readiness.get("baseline_rhr") or profile.get("rhr")
     hrr_span = int(round(float(hrmax) - float(rhr))) if (hrmax and rhr and float(hrmax) > float(rhr) + 20) else None
 
@@ -1622,6 +2002,9 @@ def compute_pillar7_and_stage2_readiness(
         "ln_rmssd_7d": ln_mean_7d,
         "cv_ln_rmssd_pct": cv_ln_7d,
         "hrv_below_swc": hrv_below_swc,
+        "hrmax_blunted": hrmax_blunted,
+        "k_leg_drop_pct": detected_k_leg_drop,
+        "k_leg_collapsed": k_leg_collapsed,
         "hrr_karvonen_bpm": hrr_span,
         "q_strain_srpe_tss": latest_q_strain,
         "q_rpe_po": latest_q_rpe_po,
@@ -2126,21 +2509,23 @@ def format_seven_pillar_blocks(telemetry: dict[str, Any], include_actions: bool 
         )
         if p1.get("vo2max_rel_clean") or p2.get("vlamax_sprint_proxy") or p2.get("vlamax_met_mmol_l_s"):
             fm_band = p2.get("fatmax_band_w")
-            fm_str = f"{fm_band[0]}–{fm_band[1]}W" if fm_band else f"{p2.get('p_fatmax_w') or '—'}W"
+            fm_pk = p2.get("p_fatmax_w")
+            fm_str = f"{fm_pk}W (95%-MFO: {fm_band[0]}–{fm_band[1]}W)" if (fm_band and fm_pk) else f"{fm_pk or '—'}W"
             lines.append(
                 f"  [2_metabolic S1+S2] VO2max_clean={p1.get('vo2max_rel_clean') or '—'} mL/kg/min "
                 f"(VO2max_FFM={p1.get('vo2max_ffm') or '—'}, W'-deduct={p1.get('w_prime_deduction_w') or 0}W) | "
                 f"vLamax_met={p2.get('vlamax_met_mmol_l_s') or '—'} mmol/L/s (inverse Mader; alactic_15s_sprint_proxy={p2.get('vlamax_sprint_proxy') or '—'}) | "
                 f"eta_shuttle={p2.get('shuttle_index_eta') or '—'} ({p2.get('shuttle_class') or 'uncalibrated'}) | "
-                f"Sub-CP f(CP,vLamax_met): FatMax={fm_str} ({p2.get('mfo_g_min') or '—'}g/min), LT1={p2.get('p_lt1_w') or '—'}W, MLSS={p2.get('p_mlss_w') or '—'}W | "
+                f"Mader FatMax={fm_str} ({p2.get('mfo_g_min') or '—'}g/min), LT1={p2.get('p_lt1_w') or '—'}W, MLSS={p2.get('p_mlss_w') or '—'}W | "
                 f"CarbMax@90g/h={p2.get('p_carbmax_90_w') or '—'}W"
             )
         if cp_m.get("cp_w") or telemetry.get("effective_cp_w"):
+            omni_tag = f" ({p3.get('omni_decay_source')})" if p3.get("omni_decay_source") else ""
             lines.append(
                 f"  [3_kinetics S3] CP={cp_m.get('cp_w') or telemetry.get('effective_cp_w')}W (SEE={p3.get('see_cp_pct') or '—'}%) | "
                 f"W'={cp_m.get('w_prime_kj') or telemetry.get('effective_w_prime_kj') or '—'}kJ | "
-                f"MPR={p3.get('mpr_w') or '—'}W | OmniPD_A={p3.get('omni_decay_a_w') or '—'}W | "
-                f"Chorley tau_FC(50%CP)={p3.get('tau_fc_50pct_s') or 22}s, tau_SC={p3.get('tau_sc_50pct_s') or 503}s"
+                f"MPR={p3.get('mpr_w') or '—'}W | OmniPD_A={p3.get('omni_decay_a_w') or '—'}W{omni_tag} | "
+                f"Chorley tau_FC(50%CP)={p3.get('tau_fc_50pct_s') or 22.3}s, tau_SC={p3.get('tau_sc_50pct_s') or 503.5}s"
             )
         if p3_rx:
             op = p3_rx.get("re_entry_opener") or {}
@@ -2173,10 +2558,11 @@ def format_seven_pillar_blocks(telemetry: dict[str, Any], include_actions: bool 
                 f"    • 1:4 Lactate-Shuttle (6x): 1m@{sh.get('over_w')}W ({sh.get('over_pct')}%) / 4m@{sh.get('under_w')}W ({sh.get('under_pct')}%) "
                 f"[W'bal_min={sh.get('w_bal_min_pct')}%] | Sub-Threshold 4x10m: {st.get('target_w')}W ({st.get('target_pct')}%)"
             )
-        if p4.get("myotype_z_score") is not None or p4.get("t_max_nm_kg") is not None:
+        if p4.get("myotype_z_score") is not None or p4.get("t_max_nm_kg") is not None or p4.get("run_k_leg_kn_m") is not None:
+            k_leg_s = f" | run_k_leg={p4.get('run_k_leg_kn_m')} kN/m" if p4.get("run_k_leg_kn_m") is not None else ""
             lines.append(
                 f"  [4_neuromuscular S4] Z_Myo={p4.get('myotype_z_score') if p4.get('myotype_z_score') is not None else '—'} "
-                f"({p4.get('myotype_class')}) | T_max={p4.get('t_max_nm_kg') or '—'} Nm/kg | C_opt={p4.get('c_opt_sprint_rpm') or '—'} rpm | "
+                f"({p4.get('myotype_class')}) | T_max={p4.get('t_max_nm_kg') or '—'} Nm/kg | C_opt={p4.get('c_opt_sprint_rpm') or '—'} rpm{k_leg_s} | "
                 f"HIIT_Recovery={p4.get('hiit_recovery_window')} | Protocol: {p4.get('recommended_vo2_protocol')}"
             )
         tv = p5.get("tier_5m_validity") or {}

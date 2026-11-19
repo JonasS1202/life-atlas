@@ -1058,6 +1058,13 @@ if TESTS_DIR not in sys.path:
     sys.path.insert(0, TESTS_DIR)
 from test_graph_engine import GraphEngineUnit  # noqa: E402,F401
 from test_coach_mail import CoachMailUnit  # noqa: E402,F401
+from test_coach_physics import (  # noqa: E402,F401
+    TestBlock1GoldenMasterKumpelMatrix,
+    TestBlock2SolverAndPhenotypeInvariants,
+    TestBlock3ChorleyAndSubstrateConservation,
+    TestBlock4EnvironmentSpikesAndDurability,
+    TestBlock5RunningBridgeRedsAndReadinessOverrides,
+)
 from test_ui_cal import UiCalUnit  # noqa: E402,F401
 
 
@@ -2070,8 +2077,10 @@ class UiReleaseV11(AtlasCase):
         p2_fast = pe.compute_pillar2_metabolic_mader(curves_fast, 294.0, p1["vo2max_rel_clean"], body, t_alac_s=2.0)
         self.assertGreater(p2_fast["vlamax_sprint_proxy"], 0.85)
         self.assertTrue(0.52 <= p2_fast["vlamax_met_mmol_l_s"] <= 0.66, p2_fast)
-        self.assertTrue(208 <= p2_fast["fatmax_band_w"][0] <= 216, p2_fast)
-        self.assertTrue(220 <= p2_fast["fatmax_band_w"][1] <= 230, p2_fast)
+        self.assertEqual(p2_fast["fatmax_band_w"], p2_fast["mader_fatmax_95_band_w"])
+        self.assertEqual(p2_fast["p_fatmax_w"], p2_fast["mader_mfo_peak_w"])
+        self.assertTrue(150 <= p2_fast["fatmax_band_w"][0] <= 175, p2_fast)
+        self.assertTrue(200 <= p2_fast["fatmax_band_w"][1] <= 220, p2_fast)
         self.assertTrue(225 <= p2_fast["p_lt1_w"] <= 236, p2_fast)
 
         # Diesel phenotype (low vLamax_met) gets higher FatMax & LT1 % CP than high-vLamax Sprinter at identical CP
@@ -2185,13 +2194,14 @@ class UiReleaseV11(AtlasCase):
         hk_m = importlib.util.module_from_spec(spec_hk)
         spec_hk.loader.exec_module(hk_m)
 
-        # 1. Extreme Diesel FatMax stays cleanly below LT1 (<=94% LT1) and within Mader 95%-MFO band
+        # 1. Extreme Diesel FatMax uses unified Mader >=95%-MFO plateau and stays cleanly below LT1
         body_d = {"mass_kg_7d": 64.0, "kfa_pct": 10.0, "kfa_calibrated": True, "ffm_kg": 57.6, "vol_rel_ind": 0.4533, "v_la_l": 29.01}
         p1_d = pe.compute_pillar1_oxidative(345.0, 10500.0, 64.0, 57.6, True)
         p2_d = pe.compute_pillar2_metabolic_mader({"fresh": {"15s": {"90d": 680}}}, 310.0, p1_d["vo2max_rel_clean"], body_d)
-        self.assertLessEqual(p2_d["fatmax_band_w"][1], int(round(0.94 * p2_d["p_lt1_w"])) + 1, p2_d)
-        self.assertLessEqual(p2_d["fatmax_band_w"][1], p2_d["mader_fatmax_95_band_w"][1], p2_d)
-        self.assertLessEqual(p2_d["fatmax_band_w"][1] / 310.0, 0.77, p2_d)
+        self.assertEqual(p2_d["fatmax_band_w"], p2_d["mader_fatmax_95_band_w"])
+        self.assertEqual(p2_d["p_fatmax_w"], p2_d["mader_mfo_peak_w"])
+        self.assertLess(p2_d["fatmax_band_w"][1], p2_d["p_lt1_w"], p2_d)
+        self.assertLessEqual(p2_d["p_fatmax_w"] / 310.0, 0.75, p2_d)
 
         # 2. Diesel safety floor in simulate_workout_stream enforces 3.0 kJ floor for small W' (10.5 kJ)
         diesel_push = [180.0] * 300 + ([342.0] * 30 + [217.0] * 15) * 13 + [155.0] * 240 + ([342.0] * 30 + [217.0] * 15) * 13

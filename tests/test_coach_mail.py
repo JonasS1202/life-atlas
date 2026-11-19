@@ -129,9 +129,11 @@ class CoachMailUnit(unittest.TestCase):
         self.assertGreaterEqual(fuel["fueling_g_h"], 90)
         self.assertIn("1:0.8", fuel["fueling_recommendation"])
 
-        env = ce.compute_environment_adjustments([2000.0] * 100, [29.5] * 100, cp_watts=300.0)
-        self.assertAlmostEqual(env["hypoxia_loss_pct"], 6.3, places=1)
-        self.assertEqual(env["cp_alt_adjusted_w"], 281)
+        env = ce.compute_environment_adjustments([2000.0] * 100, [29.5] * 100, cp_watts=300.0, w_prime_kj=20.0)
+        self.assertAlmostEqual(env["hypoxia_loss_pct"], 4.0, places=1)
+        self.assertEqual(env["cp_alt_adjusted_w"], 288)
+        self.assertEqual(env["w_prime_altitude_pct"], 100.0)
+        self.assertGreater(env["tau_w_altitude_mult"], 1.10)
         self.assertTrue(env["thermal_drift"])
 
         # 2. Cross-Sport PMC (Cycling TSS + Running rTSS + HR hrTSS + Strength sRPE)
