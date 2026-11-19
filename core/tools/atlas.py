@@ -3089,7 +3089,9 @@ def _coach_context(
 
     # STANDARD & PRO TIERS
     conn = coach_connectors.connector_status_summary(brain)
-    say(f"=== 1. ATLAS SPORT-COACH CONTEXT (mode: {eff_mode}, depth: {depth}) ===")
+    today_d = dt.date.today()
+    iso_wk = today_d.isocalendar()[1]
+    say(f"=== 1. ATLAS SPORT-COACH CONTEXT (mode: {eff_mode}, depth: {depth}, today: {today_d.strftime('%a')} {today_d.isoformat()} KW {iso_wk:02d}) ===")
     say(f"  Macro Plan: active_phase='{macro['active_phase']}', updated='{macro['updated'] or 'never'}', "
         f"goals_hash='{macro['goals_hash']} -> {macro['current_goals_hash']}', stale={macro['stale']}"
         + (f" ({macro['stale_reason']})" if macro["stale"] else ""))
@@ -3121,10 +3123,11 @@ def _coach_context(
         f"Intervals.icu={'connected' if conn['intervals_connected'] else 'optional'}"
     )
     say("  On-Demand Pull & 1-Hz Simulation CLI (NEVER compute W'bal/VO2 in your head!):")
-    say("    - `atlas.py coach simulate --dsl \"15m WU 55-68%, 13x 30s@388W / 15s@205W\" [--prior-kj 1600 --cho-g-h 60]`")
+    say("    - `atlas.py coach simulate --dsl \"15m WU 55-68%, 3x (13x 30s@388W / 15s@205W) / 4m@150W\" [--prior-kj 1600 --cho-g-h 60]`")
+    say("    - `atlas.py coach simulate --solve [all|float-30-15|classic-30-15|hard-start-4x4|shuttle-1-4] [--prior-kj 1782 --cho-g-h 42.5,90 --form-pct 0,-2]`")
     say("    - `atlas.py coach history --months 6 [--sport cycling|running]`")
     say("    - `atlas.py coach compare --epoch-a YYYY-MM-DD..YYYY-MM-DD --epoch-b YYYY-MM-DD..YYYY-MM-DD`")
-    say("    - `atlas.py coach inspect --date YYYY-MM-DD` | `atlas.py coach push --execute` | `atlas.py coach field-test --unit 1|2|preload|lsct --date YYYY-MM-DD --execute`")
+    say("    - `atlas.py coach inspect --date YYYY-MM-DD` | `atlas.py coach push --execute` | `atlas.py coach set-profile ... --execute` | `atlas.py coach add-rule --text \"...\" --execute`")
 
     pend = c_state.get("pending_feedback", [])
     if pend:
@@ -3351,6 +3354,7 @@ def _coach_push(root, brain, hk, days=14, execute=True, mock_dir=None):
         w_prime_j=eff_wp_j,
         p_5min_w=eff_p5m,
         mass_kg=float(prof_info.get("weight_kg") or weight_kg or 75.0),
+        creatine_flag=prof_info.get("creatine_flag"),
     )
     if execute:
         hk.render_calendar_html(idx, start_server=False)
@@ -3363,6 +3367,8 @@ def _coach_push(root, brain, hk, days=14, execute=True, mock_dir=None):
         say(f"  [1Hz-Guard {sr['date']} '{sr['title'][:42]}'] avg={sr['work_block_avg_w']}W | "
             f"W'bal_min={sr['w_bal_min_pct']}% ({sr['w_bal_min_kj']}kJ) | PCr_min={sr['fc_pcr_min_pct']}% | "
             f"t>=90%VO2={sr['time_ge_90_vo2max_min']}m | {sr['stimulus_class']}")
+        if sr.get("unparsed_tokens"):
+            say(f"    [!] UNPARSED DSL TOKEN(S): {', '.join(sr['unparsed_tokens'])} — check syntax!")
         if sr.get("stimulus_mismatch"):
             say(f"    [!] {sr['stimulus_mismatch']}")
     for act_msg in res["device_actions"]:
@@ -3370,8 +3376,34 @@ def _coach_push(root, brain, hk, days=14, execute=True, mock_dir=None):
     return res
 
 
-def _coach_simulate(brain, hk, dsl_spec=None, date_str=None, prior_kj=0.0, cho_g_h=60.0):
-    """Run deterministic 1-Hz Chorley W'bal + 1st-order VO2(t) + pre-fatigue simulation on any DSL or calendar workout."""
+def _parse_float_csv(raw_val, default_val=0.0):
+    """Parse either a single float or comma-separated floats (e.g. `42.5,90` or `0,-2`)."""
+    if raw_val is None:
+        return [float(default_val)]
+    if isinstance(raw_val, (int, float)):
+        return [float(raw_val)]
+    parts = [p.strip().replace(",", ".") for p in str(raw_val).split(",") if p.strip()]
+    out = []
+    for p in parts:
+        try:
+            out.append(float(p))
+        except ValueError:
+            pass
+    return out or [float(default_val)]
+
+
+def _coach_simulate(
+    brain,
+    hk,
+    dsl_spec=None,
+    date_str=None,
+    prior_kj=0.0,
+    cho_g_h="60.0",
+    solve_proto=None,
+    form_pct="0.0",
+):
+    """Run deterministic 1-Hz Chorley W'bal + 1st-order VO2(t) simulation OR inverse `--solve` bisection
+    with optional pre-fatigue `(prior_kj, cho_g_h)` and daily form scaling (`form_pct`)."""
     ftp_w, weight_kg = _extract_profile_numbers(brain, hk)
     prof_p = os.path.join(brain, "coach", "profile.md")
     prof_txt = read(prof_p) if os.path.isfile(prof_p) else ""
@@ -3381,8 +3413,85 @@ def _coach_simulate(brain, hk, dsl_spec=None, date_str=None, prior_kj=0.0, cho_g
     cp_w = float(tel.get("effective_cp_w") or ftp_w or 275.0)
     wp_j = float(tel["effective_w_prime_kj"] * 1000.0) if tel.get("effective_w_prime_kj") else 20000.0
     p5_w = float((tel.get("curves", {}).get("fresh", {}).get("5m") or {}).get("90d") or 0) or None
-    mass_kg = float((tel.get("seven_pillars", {}).get("body") or {}).get("mass_kg_7d") or weight_kg or 75.0)
-    v15_drop = (tel.get("seven_pillars", {}).get("pillar5_durability") or {}).get("verified_drop_15kj_pct")
+    sp = tel.get("seven_pillars") or {}
+    mass_kg = float((sp.get("body") or {}).get("mass_kg_7d") or weight_kg or 75.0)
+    v15_drop = (sp.get("pillar5_durability") or {}).get("verified_drop_15kj_pct")
+    p2_met = sp.get("pillar2_metabolic") or {}
+    p4_myo = sp.get("pillar4_myotype") or {}
+    creatine_flag = (tel.get("profile") or {}).get("creatine_flag")
+
+    cho_vals = _parse_float_csv(cho_g_h, 60.0)
+    form_vals = _parse_float_csv(form_pct, 0.0)
+    p_kj = float(prior_kj or 0.0)
+
+    # Direct inverse bisection mode (`--solve [all|float-30-15|classic-30-15|hard-start-4x4|shuttle-1-4]`)
+    if solve_proto:
+        proto_key = str(solve_proto).strip().lower()
+        proto_aliases = {
+            "all": ["vo2max_float_30_15", "vo2max_classic_30_15", "vo2max_hard_start_4x4", "lactate_shuttle_1_4", "sub_threshold"],
+            "float": ["vo2max_float_30_15"],
+            "float-30-15": ["vo2max_float_30_15"],
+            "30/15": ["vo2max_float_30_15", "vo2max_classic_30_15"],
+            "classic-30-15": ["vo2max_classic_30_15"],
+            "hard-start": ["vo2max_hard_start_4x4"],
+            "hard-start-4x4": ["vo2max_hard_start_4x4"],
+            "4x4": ["vo2max_hard_start_4x4"],
+            "shuttle": ["lactate_shuttle_1_4"],
+            "shuttle-1-4": ["lactate_shuttle_1_4"],
+            "1:4": ["lactate_shuttle_1_4"],
+            "mlss": ["sub_threshold"],
+        }
+        selected = proto_aliases.get(proto_key, proto_aliases["all"])
+        scenarios = []
+        if p_kj > 0.0 or any(abs(fv) > 1e-6 for fv in form_vals):
+            scenarios.append(("Fresh Baseline", 0.0, 60.0, 0.0))
+        for fv in form_vals:
+            if p_kj > 0.0:
+                for cv in cho_vals:
+                    lbl = f"Preload {p_kj:.0f}kJ @ {cv:g}g/h CHO" + (f" (Form {fv:+g}%)" if abs(fv) > 1e-6 else "")
+                    scenarios.append((lbl, p_kj, cv, fv))
+            else:
+                lbl = f"Fresh (Form {fv:+g}%)" if abs(fv) > 1e-6 else "Fresh Baseline"
+                if not scenarios or lbl != "Fresh Baseline":
+                    scenarios.append((lbl, 0.0, cho_vals[0], fv))
+
+        say(f"=== 1-HZ INVERSE PRESCRIPTION SOLVER (Anchor: CP={cp_w:.0f}W | W'={wp_j/1000.0:.1f}kJ | 5m={int(p5_w) if p5_w else '—'}W | Mass={mass_kg:.1f}kg | Creatine={creatine_flag}) ===")
+        results = []
+        for s_lbl, s_kj, s_cho, s_form in scenarios:
+            rx = coach_engine.solve_individual_interval_prescriptions(
+                cp_watts=cp_w,
+                w_prime_j=wp_j,
+                p_5min_w=p5_w,
+                p2_metabolic=p2_met,
+                p4_myotype=p4_myo,
+                mass_kg=mass_kg,
+                prior_kj=s_kj,
+                cho_g_h=s_cho,
+                verified_drop_15kj_pct=v15_drop,
+                form_pct=s_form,
+                creatine_flag=creatine_flag,
+            )
+            results.append((s_lbl, rx))
+            say(f"\n  [{s_lbl}] CP_eff={rx['cp_eff_w']}W (-{rx['cp_drop_pct']}%) | W'_eff={rx['wp_eff_kj']}kJ (-{rx['wp_drop_pct']}%) | "
+                f"TargetFloor={rx['target_reserve_kj']}kJ | IIx_cap={rx['iix_cap_w']}W")
+            for pk in selected:
+                item = rx.get(pk) or {}
+                if pk == "vo2max_float_30_15":
+                    say(f"    • Float 30/15 (3x13): {item['on_w']}W ({item['on_pct']}%) / {item['off_w']}W ({item['off_pct']}%) "
+                        f"[avg {item['block_avg_w']}W, W'bal_min={item['w_bal_min_pct']}% ({item['w_bal_min_kj']}kJ), t>=90%VO2={item['t90_min']}m] | DSL: `{item['dsl']}`")
+                elif pk == "vo2max_classic_30_15":
+                    cap_s = " [IIx-capped -> auto-float]" if item.get("iix_capped") else ""
+                    say(f"    • Classic 30/15 (3x13{cap_s}): {item['on_w']}W ({item['on_pct']}%) / {item['off_w']}W ({item['off_pct']}%) "
+                        f"[avg {item['block_avg_w']}W, W'bal_min={item['w_bal_min_pct']}% ({item['w_bal_min_kj']}kJ), t>=90%VO2={item['t90_min']}m] | DSL: `{item['dsl']}`")
+                elif pk == "vo2max_hard_start_4x4":
+                    say(f"    • Hard-Start 4x4m: 45s@{item['start_w']}W ({item['start_pct']}%) -> 3:15m@{item['hold_w']}W ({item['hold_pct']}%) "
+                        f"[avg {item['block_avg_w']}W, W'bal_min={item['w_bal_min_pct']}% ({item['w_bal_min_kj']}kJ), PCr_min={item['fc_pcr_min_pct']}%, t>=90%VO2={item['t90_min']}m] | DSL: `{item['dsl']}`")
+                elif pk == "lactate_shuttle_1_4":
+                    say(f"    • 1:4 Lactate-Shuttle (6x): 1m@{item['over_w']}W ({item['over_pct']}%) / 4m@{item['under_w']}W ({item['under_pct']}%) "
+                        f"[W'bal_min={item['w_bal_min_pct']}%] | DSL: `{item['dsl']}`")
+                elif pk == "sub_threshold":
+                    say(f"    • Sub-Threshold MLSS (4x10m): {item['target_w']}W ({item['target_pct']}%) | DSL: `{item['dsl']}`")
+        return results
 
     raw_dsl = (dsl_spec or "").strip()
     title = "Custom Workout"
@@ -3395,7 +3504,7 @@ def _coach_simulate(brain, hk, dsl_spec=None, date_str=None, prior_kj=0.0, cho_g
                 title = raw_dsl
                 break
     if not raw_dsl:
-        sys.exit("coach simulate requires `--dsl \"...\"` (or `--date YYYY-MM-DD` matching a calendar workout)")
+        sys.exit("coach simulate requires `--dsl \"...\"`, `--date YYYY-MM-DD`, or `--solve`")
 
     spec = hk.parse_workout_spec(raw_dsl, subkind="cycling", ftp_watts=int(round(cp_w)))
     title = str(spec.get("title") or title)
@@ -3409,16 +3518,21 @@ def _coach_simulate(brain, hk, dsl_spec=None, date_str=None, prior_kj=0.0, cho_g
         w_prime_j=wp_j,
         p_5min_w=p5_w,
         mass_kg=mass_kg,
-        prior_kj=float(prior_kj or 0.0),
-        cho_g_h=float(cho_g_h if cho_g_h is not None else 60.0),
+        prior_kj=p_kj,
+        cho_g_h=cho_vals[0],
         verified_drop_15kj_pct=v15_drop,
         title=title,
         work_block_watts=wb_arr,
+        form_pct=form_vals[0],
+        creatine_flag=creatine_flag,
     )
     say(f"=== 1-HZ BIOPHYSICAL WORKOUT SIMULATION ({title}) ===")
-    say(f"  Input Anchor: CP={cp_w:.0f}W | W'={wp_j/1000.0:.1f}kJ | 5m={int(p5_w) if p5_w else '—'}W | Mass={mass_kg:.1f}kg")
-    if sim["pre_fatigue_kj"] > 0:
-        say(f"  Pre-Fatigue Applied: prior_kj={sim['pre_fatigue_kj']:.0f}kJ @ {sim['cho_g_h']:.0f}g/h CHO -> "
+    say(f"  Input Anchor: CP={cp_w:.0f}W | W'={wp_j/1000.0:.1f}kJ | 5m={int(p5_w) if p5_w else '—'}W | Mass={mass_kg:.1f}kg | Creatine={creatine_flag}")
+    if spec.get("unparsed_tokens"):
+        say(f"  [!] UNPARSED DSL TOKEN(S): {', '.join(spec['unparsed_tokens'])} — check workout syntax!")
+    if sim["pre_fatigue_kj"] > 0 or abs(form_vals[0]) > 1e-6:
+        form_s = f", form={form_vals[0]:+g}%" if abs(form_vals[0]) > 1e-6 else ""
+        say(f"  Pre-Fatigue Applied: prior_kj={sim['pre_fatigue_kj']:.0f}kJ @ {sim['cho_g_h']:.0f}g/h CHO{form_s} -> "
             f"CP_eff={sim['cp_eff_w']}W (-{sim['cp_drop_pct']}%), W'_eff={sim['wp_eff_kj']}kJ (-{sim['wp_drop_pct']}%)")
     say(f"  Duration: {sim['duration_min']} min | Session Avg: {sim['avg_w']}W | Work-Block Avg: {sim['work_block_avg_w']}W | "
         f"Total Work: {sim['total_kj']:.0f} kJ ({sim['kj_above_cp']} kJ > CP)")
@@ -3428,6 +3542,121 @@ def _coach_simulate(brain, hk, dsl_spec=None, date_str=None, prior_kj=0.0, cho_g
     if sim.get("stimulus_mismatch"):
         say(f"  [!] {sim['stimulus_mismatch']}")
     return sim
+
+
+def _coach_set_profile(
+    root,
+    brain,
+    hk,
+    rhr=None,
+    hr_max=None,
+    weight=None,
+    kfa=None,
+    creatine=None,
+    age=None,
+    sex=None,
+    execute=False,
+):
+    """Atomic token-saving helper to update biometric/calibration fields in `brain/coach/profile.md`."""
+    _coach_init(root, brain, hk, execute=execute, quiet=True)
+    prof_p = os.path.join(brain, "coach", "profile.md")
+    if not os.path.isfile(prof_p):
+        sys.exit("brain/coach/profile.md not found — run `atlas.py coach context --init --execute` first")
+    txt = read(prof_p)
+    today_iso = dt.date.today().isoformat()
+    changes = []
+
+    def _upsert_fm(content, key, val_str):
+        m_fm = re.match(r"^---\n(.*?)\n---\n", content, flags=re.S)
+        if not m_fm:
+            return f"---\n{key}: {val_str}\n---\n" + content
+        fm_body = m_fm.group(1)
+        if re.search(rf"(?im)^{re.escape(key)}\s*:", fm_body):
+            fm_new = re.sub(rf"(?im)^{re.escape(key)}\s*:.*$", f"{key}: {val_str}", fm_body)
+        else:
+            fm_new = fm_body.rstrip("\n") + f"\n{key}: {val_str}"
+        return f"---\n{fm_new}\n---\n" + content[m_fm.end():]
+
+    if sex is not None:
+        s_val = str(sex).strip().lower()
+        txt = _upsert_fm(txt, "sex", s_val)
+        changes.append(f"sex={s_val}")
+    if age is not None:
+        txt = _upsert_fm(txt, "age", str(int(age)))
+        changes.append(f"age={int(age)}")
+    if creatine is not None:
+        c_bool = str(creatine).strip().lower() in ("true", "yes", "ja", "1", "on")
+        txt = _upsert_fm(txt, "creatine", "true" if c_bool else "false")
+        cr_row = f"| **Kreatin (`creatine_flag`)** | {'Ja' if c_bool else 'Nein'} | Kalibriert (Stand: {today_iso}) |"
+        if re.search(r"(?im)^\|[^\n]*(?:kreatin|creatine)[^\n]*\|$", txt):
+            txt = re.sub(r"(?im)^\|[^\n]*(?:kreatin|creatine)[^\n]*\|$", cr_row, txt, count=1)
+        changes.append(f"creatine={c_bool}")
+    if rhr is not None or hr_max is not None:
+        m_hr_row = re.search(r"(?im)^(\|\s*\*\*Max HR / Rest HR\*\*\s*\|\s*)([^|\n]+?)(\s*\|\s*)([^|\n]*?)(\s*\|)$", txt)
+        if m_hr_row:
+            cur_val = m_hr_row.group(2).strip()
+            parts = [p.strip() for p in cur_val.split("/", 1)]
+            cur_max = parts[0] if parts else "— bpm"
+            cur_rest = parts[1] if len(parts) > 1 else "— bpm"
+            new_max = f"{int(hr_max)} bpm" if hr_max is not None else cur_max
+            new_rest = f"{int(rhr)} bpm" if rhr is not None else cur_rest
+            new_row = f"{m_hr_row.group(1)}{new_max} / {new_rest}{m_hr_row.group(3)}Aktualisiert (Stand: {today_iso}){m_hr_row.group(5)}"
+            txt = txt[:m_hr_row.start()] + new_row + txt[m_hr_row.end():]
+        else:
+            if hr_max is not None:
+                txt = _upsert_fm(txt, "hr_max", str(int(hr_max)))
+            if rhr is not None:
+                txt = _upsert_fm(txt, "rhr", str(int(rhr)))
+        if hr_max is not None:
+            changes.append(f"hr_max={int(hr_max)}")
+        if rhr is not None:
+            changes.append(f"rhr={int(rhr)}")
+    if weight is not None:
+        w_f = float(weight)
+        if re.search(r"(?im)^\|[^\n]*Biometrie[^\n]*\d+(?:[.,]\d+)?\s*kg", txt):
+            txt = re.sub(r"(?im)(^\|[^\n]*Biometrie[^\n]*?)\d+(?:[.,]\d+)?(\s*kg)", rf"\g<1>{w_f:.1f}\2", txt, count=1)
+        else:
+            txt = _upsert_fm(txt, "weight_kg", f"{w_f:.1f}")
+        changes.append(f"weight_kg={w_f:.1f}")
+    if kfa is not None:
+        k_f = float(kfa)
+        if re.search(r"(?im)^\|[^\n]*Biometrie[^\n]*~?\d+(?:[.,–-]\d+)?\s*%\s*KFA", txt):
+            txt = re.sub(r"(?im)(^\|[^\n]*Biometrie[^\n]*?)~?\d+(?:[.,–-]\d+)?(\s*%\s*KFA)", rf"\g<1>{k_f:.1f}\2", txt, count=1)
+        else:
+            txt = _upsert_fm(txt, "kfa_pct", f"{k_f:.1f}")
+        changes.append(f"kfa_pct={k_f:.1f}")
+
+    if not changes:
+        sys.exit("coach set-profile requires at least one flag: --rhr, --hr-max, --weight, --kfa, --creatine, --age, --sex")
+
+    txt = re.sub(r"(?m)^Stand:\s*\d{4}-\d{2}-\d{2}\.", f"Stand: {today_iso}.", txt, count=1)
+    if execute:
+        write(prof_p, txt)
+    say(f"coach set-profile ({'applied' if execute else 'dry-run'}): {', '.join(changes)} -> brain/coach/profile.md")
+    return changes
+
+
+def _coach_add_rule(root, brain, hk, text, title=None, execute=False):
+    """Atomic token-saving helper to append a dated empirical rule to `brain/coach/playbook.md`."""
+    _coach_init(root, brain, hk, execute=execute, quiet=True)
+    pb_p = os.path.join(brain, "coach", "playbook.md")
+    if not os.path.isfile(pb_p):
+        sys.exit("brain/coach/playbook.md not found — run `atlas.py coach context --init --execute` first")
+    clean_text = str(text or "").strip()
+    if not clean_text:
+        sys.exit("coach add-rule requires `--text \"...\"`")
+    today_iso = dt.date.today().isoformat()
+    bullet = f"- **{title.strip()} (Stand: {today_iso}):** {clean_text}" if (title and str(title).strip()) else f"- **(Stand: {today_iso}):** {clean_text}"
+    txt = read(pb_p)
+    txt = re.sub(r"(?m)^updated:\s*\d{4}-\d{2}-\d{2}$", f"updated: {today_iso}", txt, count=1)
+    txt = re.sub(r"(?m)^Stand:\s*\d{4}-\d{2}-\d{2}\.", f"Stand: {today_iso}.", txt, count=1)
+    if not txt.endswith("\n"):
+        txt += "\n"
+    txt += bullet + "\n"
+    if execute:
+        write(pb_p, txt)
+    say(f"coach add-rule ({'applied' if execute else 'dry-run'}): appended to brain/coach/playbook.md -> {bullet}")
+    return bullet
 
 
 def _coach_compare_epochs(brain, hk, epoch_a, epoch_b):
@@ -3602,7 +3831,32 @@ def cmd_coach(args):
             dsl_spec=getattr(args, "dsl", None) or getattr(args, "text", None),
             date_str=getattr(args, "date", None),
             prior_kj=getattr(args, "prior_kj", 0.0) or 0.0,
-            cho_g_h=getattr(args, "cho_g_h", 60.0),
+            cho_g_h=getattr(args, "cho_g_h", "60.0"),
+            solve_proto=getattr(args, "solve", None),
+            form_pct=getattr(args, "form_pct", "0.0"),
+        )
+    elif action == "set-profile":
+        _coach_set_profile(
+            root,
+            brain,
+            hk,
+            rhr=getattr(args, "rhr", None),
+            hr_max=getattr(args, "hr_max", None),
+            weight=getattr(args, "weight", None),
+            kfa=getattr(args, "kfa", None),
+            creatine=getattr(args, "creatine", None),
+            age=getattr(args, "age", None),
+            sex=getattr(args, "sex", None),
+            execute=args.execute,
+        )
+    elif action == "add-rule":
+        _coach_add_rule(
+            root,
+            brain,
+            hk,
+            text=getattr(args, "text", None),
+            title=getattr(args, "title", None),
+            execute=args.execute,
         )
     elif action == "field-test":
         _coach_field_test(root, brain, hk, unit=getattr(args, "unit", "1"), date_str=args.date, execute=args.execute)
@@ -5120,12 +5374,25 @@ def main():
         choices=(
             "context", "status", "auth-strava", "auth-hammerhead", "auth-garmin", "auth-intervals",
             "sync", "note", "zwo", "fit", "push", "history", "inspect", "compare", "simulate", "field-test",
+            "set-profile", "add-rule",
         ),
         help="coach action (default: context)",
     )
-    p.add_argument("--dsl", help="cycling workout DSL string for `simulate` (supports pct CP, W, and Hard-Start syntax)")
-    p.add_argument("--prior-kj", type=float, default=0.0, help="pre-fatigue work in kJ before intervals for `simulate`")
-    p.add_argument("--cho-g-h", type=float, default=60.0, help="carbohydrate intake (g/h) during prior work for `simulate`")
+    p.add_argument("--dsl", help="cycling workout DSL string for `simulate` (supports pct CP, W, nested sets, and Hard-Start syntax)")
+    p.add_argument("--solve", nargs="?", const="all", default=None,
+                   help="run 1-Hz inverse bisection solver in `simulate` (`all`, `float-30-15`, `classic-30-15`, `hard-start-4x4`, `shuttle-1-4`, `mlss`)")
+    p.add_argument("--prior-kj", "--preload-kj", dest="prior_kj", type=float, default=0.0,
+                   help="pre-fatigue work in kJ before intervals for `simulate` / `--solve`")
+    p.add_argument("--cho-g-h", default="60.0",
+                   help="carbohydrate intake (g/h) during prior work (single value or CSV batch like `42.5,90` for `--solve`)")
+    p.add_argument("--form-pct", default="0.0",
+                   help="daily form adjustment in percent for `simulate` / `--solve` (e.g. `-2` or CSV `0,-2`)")
+    p.add_argument("--hr-max", type=int, help="maximum heart rate (bpm) for `set-profile`")
+    p.add_argument("--kfa", type=float, help="body fat percentage (KFA %%) for `set-profile`")
+    p.add_argument("--creatine", help="creatine supplementation (`yes`/`no`/`true`/`false`) for `set-profile`")
+    p.add_argument("--age", type=int, help="athlete age (years) for `set-profile`")
+    p.add_argument("--sex", choices=("male", "female"), help="athlete biological sex for `set-profile`")
+    p.add_argument("--title", help="short bold heading for `add-rule`")
     p.add_argument("--init", action="store_true", help="scaffold brain/coach/ and harvest existing athlete thresholds")
     p.add_argument("--mode", choices=("auto", "daily", "checkin", "plan-14d", "macro", "dna"), default="auto",
                    help="context slicing mode (default: auto)")

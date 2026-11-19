@@ -2501,6 +2501,7 @@ def build_coach_telemetry(
         p2_metabolic=p2,
         p4_myotype=p4,
         mass_kg=body.get("mass_kg_7d"),
+        creatine_flag=prof.get("creatine_flag"),
     )
     p5 = pillars_engine.compute_pillar5_durability_and_tid(
         activities=sorted_acts,

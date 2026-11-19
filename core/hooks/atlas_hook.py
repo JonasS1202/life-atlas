@@ -735,8 +735,8 @@ def parse_workout_spec(what_text, subkind="cycling", ftp_watts=275, sport=None):
 
     title = clean_raw
     spec_body = ""
-    # Look for `( ... | ... )` first
-    m_pipe = re.search(r"\(([^()]*\|[^()]*)\)", clean_raw)
+    # Look for `( ... | ... )` first (allows 1 level of nested parens, e.g. `4x (45s@420W + 3.25m@350W)` or `3x (13x 30s/15s)`)
+    m_pipe = re.search(r"\(((?:[^()]|\([^()]*\))*\|(?:[^()]|\([^()]*\))*)\)", clean_raw)
     if m_pipe:
         title = (clean_raw[:m_pipe.start()] + clean_raw[m_pipe.end():]).strip()
         parts = m_pipe.group(1).split("|", 1)
@@ -756,10 +756,54 @@ def parse_workout_spec(what_text, subkind="cycling", ftp_watts=275, sport=None):
             spec_body = clean_raw
 
     segments = []
+    unparsed_tokens = []
     if spec_body:
         tokens = [t.strip() for t in re.split(r"[,;]+", spec_body) if t.strip()]
         for tok in tokens:
-            # 0. Compound multi-stage intervals (e.g. Hard-Start: `4x (45s@420W + 3.25m@350W) / 5m@147W`)
+            # 0a. Nested interval sets:
+            #   `3x (13x 30s@394W / 15s@206W) / 4m@150W`
+            #   `3x13x 30s@394W / 15s@206W` (optional `/ 4m@150W` inter-set rest; default 4m @ 50%)
+            m_nset = re.match(
+                r"^(\d+)\s*[x×]\s*\(\s*(\d+)\s*[x×]\s*(\d+(?:[.,]\d+)?)\s*(m|min|s)?\s*(?:@\s*(\d+(?:[.,]\d+)?\s*[wW%]?))?"
+                r"(?:\s*(?:/|with|rest|pause)\s*(\d+(?:[.,]\d+)?)\s*(m|min|s)?\s*(?:@\s*(\d+(?:[.,]\d+)?\s*[wW%]?))?)?\s*\)"
+                r"(?:\s*(?:/|rest|pause)\s*(\d+(?:[.,]\d+)?)\s*(m|min|s)?\s*(?:@\s*(\d+(?:[.,]\d+)?\s*[wW%]?))?)?$",
+                tok, re.I
+            )
+            if not m_nset:
+                m_nset = re.match(
+                    r"^(\d+)\s*[x×]\s*(\d+)\s*[x×]\s*(\d+(?:[.,]\d+)?)\s*(m|min|s)?\s*(?:@\s*(\d+(?:[.,]\d+)?\s*[wW%]?))?"
+                    r"(?:\s*(?:/|with|rest|pause)\s*(\d+(?:[.,]\d+)?)\s*(m|min|s)?\s*(?:@\s*(\d+(?:[.,]\d+)?\s*[wW%]?))?)?"
+                    r"(?:\s*(?:/|rest|pause)\s*(\d+(?:[.,]\d+)?)\s*(m|min|s)?\s*(?:@\s*(\d+(?:[.,]\d+)?\s*[wW%]?))?)?$",
+                    tok, re.I
+                )
+            if m_nset:
+                n_sets = max(1, int(m_nset.group(1)))
+                rep = max(1, int(m_nset.group(2)))
+                on_sec = _dur_sec(m_nset.group(3), m_nset.group(4) or "s")
+                on_p = _norm_pwr(m_nset.group(5), 1.15, ftp_watts=ftp_watts)
+                off_sec = _dur_sec(m_nset.group(6), m_nset.group(7) or "s") if m_nset.group(6) else max(15, int(round(on_sec * 0.5)))
+                off_p = _norm_pwr(m_nset.group(8), 0.60, ftp_watts=ftp_watts)
+                set_rest_sec = _dur_sec(m_nset.group(9), m_nset.group(10) or "m") if m_nset.group(9) else 240
+                set_rest_p = _norm_pwr(m_nset.group(11), 0.50, ftp_watts=ftp_watts)
+                iv_lbl = (
+                    f"{rep}× {on_sec // 60 if on_sec >= 60 else str(on_sec) + 's'}"
+                    f"{'m' if on_sec >= 60 else ''} @ {int(round(on_p * 100))}% / "
+                    f"{off_sec // 60 if off_sec >= 60 else str(off_sec) + 's'}"
+                    f"{'m' if off_sec >= 60 else ''} @ {int(round(off_p * 100))}%"
+                )
+                for s_idx in range(n_sets):
+                    segments.append({
+                        "type": "intervals", "repeat": rep, "on_sec": on_sec, "off_sec": off_sec,
+                        "on_p": on_p, "off_p": off_p, "label": iv_lbl,
+                    })
+                    if s_idx < n_sets - 1 and set_rest_sec > 0:
+                        segments.append({
+                            "type": "steady", "sec": set_rest_sec, "p": set_rest_p,
+                            "label": f"{set_rest_sec // 60}m Rest @ {int(round(set_rest_p * 100))}%",
+                        })
+                continue
+
+            # 0b. Compound multi-stage intervals (e.g. Hard-Start: `4x (45s@420W + 3.25m@350W) / 5m@147W`)
             m_cmp = re.match(
                 r"^(\d+)\s*[x×]\s*\(([^()]+)\)(?:\s*(?:/|rest|pause)\s*(\d+(?:[.,]\d+)?)\s*(m|min|s)?\s*(?:@\s*(\d+(?:[.,]\d+)?\s*[wW%]?))?)?$",
                 tok, re.I
@@ -873,6 +917,9 @@ def parse_workout_spec(what_text, subkind="cycling", ftp_watts=275, sport=None):
                                  "label": f"{sec // 60}m @ {int(round(p * 100))}%"})
                 continue
 
+            # Track unrecognized DSL tokens so `coach simulate` & `coach push` never silently drop interval blocks!
+            unparsed_tokens.append(tok)
+
     # Fallback shorthand synthesis for cycling workouts if no pipe DSL was given (e.g. `90m SweetSpot (2x20m)`)
     if not segments and subkind == "cycling" and total_min and total_min >= 20:
         low_c = clean_raw.lower()
@@ -945,6 +992,7 @@ def parse_workout_spec(what_text, subkind="cycling", ftp_watts=275, sport=None):
         "visual_blocks": visual_blocks,
         "has_structure": bool(segments),
         "has_intervals": bool(segments),
+        "unparsed_tokens": unparsed_tokens,
     }
 
 

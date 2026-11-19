@@ -829,6 +829,7 @@ def sync_calendar_workouts_to_devices(
     w_prime_j: float | None = None,
     p_5min_w: float | None = None,
     mass_kg: float | None = None,
+    creatine_flag: bool | None = None,
 ) -> dict[str, Any]:
     """Compile `.zwo` + `.fit` files, run 1-Hz W'bal/VO2 Compiler-Guard, archive superseded files, and sync to devices."""
     ref_today = today or dt.date.today()
@@ -909,9 +910,12 @@ def sync_calendar_workouts_to_devices(
                     mass_kg=float(mass_kg or 75.0),
                     title=str(spec.get("title") or it.get("what") or ""),
                     work_block_watts=wb_arr,
+                    creatine_flag=creatine_flag,
                 )
                 sim["date"] = d_iso
                 sim["title"] = str(spec.get("title") or "Workout")
+                if spec.get("unparsed_tokens"):
+                    sim["unparsed_tokens"] = list(spec["unparsed_tokens"])
                 sim_reports.append(sim)
 
         if spec.get("segments") or spec.get("blocks") or sport in ("cycling", "running"):

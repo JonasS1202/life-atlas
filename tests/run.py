@@ -2175,6 +2175,97 @@ class UiReleaseV11(AtlasCase):
         mode7, _, _ = hk_m.detect_coach_mode("Wenn ich heute beim Laufen 310 W hatte und gestern auf der Rolle ein 1580 W 5s-Peak, was heißt das für CP und Laktatbildung?")
         self.assertEqual(mode7, "daily")
 
+    def test_coach_v146_solver_helpers_and_bugfixes(self):
+        """v1.4.6: `--solve` pre-fatigue/form bisection, nested-set DSL, Diesel FatMax/safety-floor, creatine physics, MLSS guard & atomic helpers."""
+        import importlib.util
+        sys.path.insert(0, os.path.join(REPO, "core", "tools"))
+        from atlas_lib import pillars_engine as pe
+
+        spec_hk = importlib.util.spec_from_file_location("atlas_hook_v146", os.path.join(REPO, "core", "hooks", "atlas_hook.py"))
+        hk_m = importlib.util.module_from_spec(spec_hk)
+        spec_hk.loader.exec_module(hk_m)
+
+        # 1. Extreme Diesel FatMax stays cleanly below LT1 (<=94% LT1) and within Mader 95%-MFO band
+        body_d = {"mass_kg_7d": 64.0, "kfa_pct": 10.0, "kfa_calibrated": True, "ffm_kg": 57.6, "vol_rel_ind": 0.4533, "v_la_l": 29.01}
+        p1_d = pe.compute_pillar1_oxidative(345.0, 10500.0, 64.0, 57.6, True)
+        p2_d = pe.compute_pillar2_metabolic_mader({"fresh": {"15s": {"90d": 680}}}, 310.0, p1_d["vo2max_rel_clean"], body_d)
+        self.assertLessEqual(p2_d["fatmax_band_w"][1], int(round(0.94 * p2_d["p_lt1_w"])) + 1, p2_d)
+        self.assertLessEqual(p2_d["fatmax_band_w"][1], p2_d["mader_fatmax_95_band_w"][1], p2_d)
+        self.assertLessEqual(p2_d["fatmax_band_w"][1] / 310.0, 0.77, p2_d)
+
+        # 2. Diesel safety floor in simulate_workout_stream enforces 3.0 kJ floor for small W' (10.5 kJ)
+        diesel_push = [180.0] * 300 + ([342.0] * 30 + [217.0] * 15) * 13 + [155.0] * 240 + ([342.0] * 30 + [217.0] * 15) * 13
+        sim_d = pe.simulate_workout_stream(diesel_push, 310.0, 10500.0, 345.0, 64.0, title="VO2max Float 30/15")
+        if sim_d["w_bal_min_kj"] < 3.0:
+            self.assertEqual(sim_d["stimulus_class"], "UNSUSTAINABLE_BLOWOUT")
+            self.assertIn("BLOWOUT WARNING", sim_d["stimulus_mismatch"])
+
+        # 3. creatine_flag=True calibrates Meixner t_alac (+0.35s) and Chorley fast PCr pool (0.43 vs 0.40)
+        body_j = {"mass_kg_7d": 75.0, "kfa_pct": 11.5, "kfa_calibrated": True, "ffm_kg": 66.38, "vol_rel_ind": 0.4458, "v_la_l": 33.43}
+        p2_no_cr = pe.compute_pillar2_metabolic_mader({"fresh": {"15s": {"90d": 1094}}}, 294.0, 62.3, body_j, t_alac_s=3.0, creatine_flag=False)
+        p2_cr = pe.compute_pillar2_metabolic_mader({"fresh": {"15s": {"90d": 1094}}}, 294.0, 62.3, body_j, t_alac_s=3.0, creatine_flag=True)
+        self.assertAlmostEqual(p2_cr["t_alac_s"], p2_no_cr["t_alac_s"] + 0.35, places=2)
+        test_burst = [180.0] * 300 + [550.0] * 30 + [150.0] * 120
+        s_no_cr = pe.simulate_workout_stream(test_burst, 294.0, 31400.0, 418.0, 75.0, creatine_flag=False)
+        s_cr = pe.simulate_workout_stream(test_burst, 294.0, 31400.0, 418.0, 75.0, creatine_flag=True)
+        self.assertGreater(s_cr["fc_pcr_min_pct"], s_no_cr["fc_pcr_min_pct"])
+
+        # 4. Nested-set DSL parsing (`3x13x ...` and `3x (13x ...) / 4m@150W`) + unparsed_tokens detection
+        sp1 = hk_m.parse_workout_spec("15m WU 55-68%, 3x13x 30s@394W / 15s@206W, 10m CD 62-48%", subkind="cycling", ftp_watts=294)
+        self.assertEqual(sp1["unparsed_tokens"], [])
+        self.assertEqual(sum(1 for s in sp1["segments"] if s["type"] == "intervals"), 3)
+        sp2 = hk_m.parse_workout_spec("Float 30/15 (75m | 10m WU 55-68%, 3x (13x 30s@394W / 15s@206W) / 4m@150W, 10m CD 62-48%)", subkind="cycling", ftp_watts=294)
+        self.assertEqual(sp2["unparsed_tokens"], [])
+        self.assertEqual(sum(1 for s in sp2["segments"] if s["type"] == "intervals"), 3)
+        sp_bad = hk_m.parse_workout_spec("10m WU 55-68%, gibberish_token, 10m CD 62-48%", subkind="cycling", ftp_watts=294)
+        self.assertEqual(sp_bad["unparsed_tokens"], ["gibberish_token"])
+
+        # 5. Sub-Threshold `4x 10m@278W / 4m@160W` classified as THRESHOLD_OR_SHUTTLE_OPENER (not AEROBIC_BASE_Z2!)
+        sp_mlss = hk_m.parse_workout_spec("15m WU 52-68%, 4x 10m@278W / 4m@160W, 9m CD 62-48%", subkind="cycling", ftp_watts=294)
+        w_mlss, wb_mlss = pe.expand_spec_to_1hz_watts(sp_mlss, cp_watts=294.0)
+        sim_mlss = pe.simulate_workout_stream(w_mlss, 294.0, 31400.0, 418.0, 75.0, work_block_watts=wb_mlss)
+        self.assertEqual(sim_mlss["stimulus_class"], "THRESHOLD_OR_SHUTTLE_OPENER", sim_mlss)
+        self.assertGreaterEqual(sim_mlss["work_block_avg_w"], 275.0)
+
+        # 6. CLI `--solve` with `--preload-kj`, batch `--cho-g-h 42.5,90`, `--form-pct`, plus `set-profile`, `add-rule` & `today:` header
+        self.atlas("coach", "context", "--init", "--execute")
+        self.page("coach/profile.md", (
+            "---\nsummary: Profile\ntags: [sport]\ndepth: pro\nsex: male\nage: 25\n---\n"
+            "# Athlete Profile\n\nStand: 2026-11-18.\n\n| Metric | Value | Notes |\n|---|---|---|\n"
+            "| **Biometrie** | 186 cm · 75,0 kg · ~11,5 % KFA | Test |\n"
+            "| **CP / W'** | 294 W / 31.4 kJ | Anchor |\n"
+            "| **Max HR / Rest HR** | ~200 bpm / — bpm | Test |\n"
+        ))
+        self.atlas("coach", "set-profile", "--rhr", "45", "--creatine", "yes", "--execute")
+        prof_txt = self.read(os.path.join(self.brain, "coach", "profile.md"))
+        self.assertIn("creatine: true", prof_txt)
+        self.assertIn("45 bpm", prof_txt)
+
+        self.atlas("coach", "add-rule", "--title", "Gut-Test", "--text", "90-100 g KH/h stabil", "--execute")
+        pb_txt = self.read(os.path.join(self.brain, "coach", "playbook.md"))
+        self.assertIn("Gut-Test", pb_txt)
+        self.assertIn("90-100 g KH/h stabil", pb_txt)
+
+        ctx_out = self.atlas("coach", "context", "--mode", "daily", "--depth", "pro", "--no-sync").stdout
+        self.assertIn("today:", ctx_out)
+        self.assertIn("KW ", ctx_out)
+        self.assertIn("creatine=True", ctx_out)
+
+        solve_out = self.atlas(
+            "coach", "simulate", "--solve", "float-30-15",
+            "--preload-kj", "1782", "--cho-g-h", "42.5,90", "--form-pct", "0,-2",
+        ).stdout
+        self.assertIn("1-HZ INVERSE PRESCRIPTION SOLVER", solve_out)
+        self.assertIn("Fresh Baseline", solve_out)
+        self.assertIn("Preload 1782kJ @ 42.5g/h CHO", solve_out)
+        self.assertIn("Preload 1782kJ @ 90g/h CHO", solve_out)
+        self.assertIn("Form -2%", solve_out)
+
+        # Nested-set CLI simulate works without dropping into RECOVERY_Z1
+        sim_ns = self.atlas("coach", "simulate", "--dsl", "15m WU 55-68%, 3x13x 30s@394W / 15s@206W, 10m CD 62-48%").stdout
+        self.assertIn("TRUE_VO2MAX_SEVERE", sim_ns)
+        self.assertNotIn("UNPARSED DSL", sim_ns)
+
 
 if __name__ == "__main__":
     os.makedirs(BASE_DIR, exist_ok=True)

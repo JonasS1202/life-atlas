@@ -316,7 +316,8 @@ def compute_pillar2_metabolic_mader(
             "optimal_cadence_rpm": {"lt1": 66, "fatmax": 76, "mlss": 82, "vo2max": 85, "sprint": 135},
         }
 
-    eff_t_alac = max(2.0, min(5.5, float(t_alac_s or 3.0)))
+    # Creatine supplementation (+~10-15% intramuscular PCr buffer) slightly extends alactic t_alac in Meixner 15s sprint calibration
+    eff_t_alac = max(2.0, min(5.5, float(t_alac_s or 3.0) + (0.35 if creatine_flag is True else 0.0)))
     delta_la = max(1.2, (15.0 * p15_eff + 551.0 - 123.0 * float(ffm)) / (11.0 * float(ffm)))
     # Alactic/PCr-influenced 15s sprint proxy (reflects explosive W'_FC + glycolytic recruitment)
     vlamax_sprint = round(max(0.20, min(1.35, delta_la / (15.0 - eff_t_alac))), 2)
@@ -382,7 +383,27 @@ def compute_pillar2_metabolic_mader(
 
     rcp_w_kg = round(0.802 - 1.851 * vlamax_met + 0.070 * float(vo2max_rel_clean), 2)
 
+    # Stoichiometric MFO (g/min), 95%-MFO band & CarbMax@90g/h using calibrated `vlamax_met` (never PCr-inflated sprint proxy)
+    best_fat_g_min = 0.0
+    best_fat_w = None
+    p_carb_90 = None
+    fat_sweep: list[tuple[int, float]] = []
+    upper_sweep = int(round((cp_watts or p_mlss_mader or 280.0) * 1.08))
+    for pw in range(50, max(80, upper_sweep) + 1, 2):
+        vo2_ss, vla_eff = _mader_vla_ss(float(pw), float(mass), float(vo2max_rel_clean), vlamax_met)
+        c_cho_gh = vla_eff * v_la_l * 0.09008 * 60.0
+        f_ox_gmin = 0.50 * (float(mass) / 1000.0) * max(0.0, (vo2_ss - 3.5) - (vla_eff * vol_rel) / 0.02049)
+        fat_sweep.append((pw, f_ox_gmin))
+        if f_ox_gmin > best_fat_g_min:
+            best_fat_g_min = f_ox_gmin
+            best_fat_w = pw
+        if p_carb_90 is None and c_cho_gh >= 90.0:
+            p_carb_90 = pw
+    mader_95_pts = [pw for pw, fx in fat_sweep if best_fat_g_min > 0 and fx >= 0.95 * best_fat_g_min]
+    mader_95_band = (min(mader_95_pts), max(mader_95_pts)) if mader_95_pts else None
+
     # Dynamic phenotype-scaled Sub-CP anchors `f(CP, vLamax_met)` (NEVER static % CP across Diesel vs Sprinter!)
+    # Saturates upper FatMax at <=76.5% CP and reconciles extreme Diesels (`vLamax_met < 0.45`) with Mader 95%-MFO & <=94% LT1.
     p_mlss_dyn = None
     p_lt1_dyn = None
     fatmax_band = None
@@ -391,29 +412,20 @@ def compute_pillar2_metabolic_mader(
         cp_f = float(cp_watts)
         mlss_frac = max(0.90, min(0.975, 0.985 - 0.065 * vlamax_met))
         lt1_frac = max(0.68, min(0.84, 0.865 - 0.14 * vlamax_met))
-        fm_lo_frac = max(0.60, min(0.75, 0.790 - 0.13 * vlamax_met))
-        fm_hi_frac = max(0.65, min(0.80, 0.845 - 0.14 * vlamax_met))
+        fm_lo_frac = max(0.60, min(0.725, 0.790 - 0.13 * vlamax_met))
+        fm_hi_frac = max(0.65, min(0.765, 0.845 - 0.14 * vlamax_met))
         p_mlss_dyn = int(round(cp_f * mlss_frac))
         p_lt1_dyn = int(round(cp_f * lt1_frac))
         fm_lo_w = int(round(cp_f * fm_lo_frac))
         fm_hi_w = int(round(cp_f * fm_hi_frac))
+        if vlamax_met < 0.45:
+            diesel_cap_w = int(round(0.94 * p_lt1_dyn))
+            if mader_95_band:
+                diesel_cap_w = min(diesel_cap_w, mader_95_band[1])
+            fm_hi_w = min(fm_hi_w, diesel_cap_w)
+            fm_lo_w = min(fm_lo_w, max(int(round(cp_f * 0.62)), fm_hi_w - 14))
         fatmax_band = (fm_lo_w, fm_hi_w)
         p_fatmax_dyn = int(round(0.5 * (fm_lo_w + fm_hi_w)))
-
-    # Stoichiometric MFO (g/min) & CarbMax@90g/h using calibrated `vlamax_met` (never PCr-inflated sprint proxy)
-    best_fat_g_min = 0.0
-    best_fat_w = None
-    p_carb_90 = None
-    upper_sweep = int(round((cp_watts or p_mlss_mader or 280.0) * 1.08))
-    for pw in range(50, max(80, upper_sweep) + 1, 2):
-        vo2_ss, vla_eff = _mader_vla_ss(float(pw), float(mass), float(vo2max_rel_clean), vlamax_met)
-        c_cho_gh = vla_eff * v_la_l * 0.09008 * 60.0
-        f_ox_gmin = 0.50 * (float(mass) / 1000.0) * max(0.0, (vo2_ss - 3.5) - (vla_eff * vol_rel) / 0.02049)
-        if f_ox_gmin > best_fat_g_min:
-            best_fat_g_min = f_ox_gmin
-            best_fat_w = pw
-        if p_carb_90 is None and c_cho_gh >= 90.0:
-            p_carb_90 = pw
 
     return {
         "vlamax_sprint_proxy": vlamax_sprint,
@@ -430,6 +442,8 @@ def compute_pillar2_metabolic_mader(
         "rcp_langley_w_kg": rcp_w_kg,
         "p_fatmax_w": p_fatmax_dyn or best_fat_w,
         "fatmax_band_w": fatmax_band,
+        "mader_mfo_peak_w": best_fat_w,
+        "mader_fatmax_95_band_w": mader_95_band,
         "mfo_g_min": round(best_fat_g_min, 2) if best_fat_w else None,
         "p_carbmax_90_w": p_carb_90,
         "optimal_cadence_rpm": {"lt1": 66, "fatmax": 76, "mlss": 82, "vo2max": 85, "sprint": 135},
@@ -598,7 +612,9 @@ def expand_spec_to_1hz_watts(
                 if off_s > 0:
                     seg_off = [off_w] * off_s
                     watts.extend(seg_off)
-                    if r_idx < reps - 1 or off_s <= 60:
+                    # Only include short micro-rests/floats (<=60s, e.g. 30/15 or 40/20) in work-block avg;
+                    # exclude long passive recoveries (>60s, e.g. 4m@160W between 4x10m MLSS) so threshold work isn't misclassified as Z2.
+                    if off_s <= 60:
                         work_watts.extend(seg_off)
         elif kind == "compound_intervals":
             # Multi-stage intervals such as Hard-Start `4x (45s@420W + 195s@350W) / 5m@147W`
@@ -637,6 +653,48 @@ def expand_spec_to_1hz_watts(
     return watts, work_watts
 
 
+def compute_effective_cp_w_prime(
+    cp_watts: float,
+    w_prime_j: float,
+    mass_kg: float = 75.0,
+    prior_kj: float = 0.0,
+    cho_g_h: float = 60.0,
+    verified_drop_15kj_pct: float | None = None,
+    form_pct: float = 0.0,
+) -> dict[str, float]:
+    """Apply durability pre-fatigue `(prior_kj, cho_g_h)` and optional daily form offset (`form_pct`, e.g. `-2.0`) to `(CP, W')`."""
+    cp_fresh = max(80.0, float(cp_watts or 275.0))
+    wp_fresh = max(4000.0, float(w_prime_j or 18000.0))
+    bw = max(40.0, float(mass_kg or 75.0))
+
+    form_mult = max(0.80, min(1.10, 1.0 + float(form_pct or 0.0) / 100.0))
+    cp_base = cp_fresh * form_mult
+    wp_base = wp_fresh * form_mult
+
+    cp_eff, wp_eff = cp_base, wp_base
+    if prior_kj and float(prior_kj) > 0.0:
+        kj_kg = float(prior_kj) / bw
+        excess = max(0.0, kj_kg - 12.0)
+        # Fueling modulation: under-fueling (<60 g/h) accelerates glycogen/W' decay; 80-100 g/h dampens it
+        fuel_mult = max(0.65, min(1.55, 1.0 + (60.0 - float(cho_g_h)) * 0.012))
+        base_cp_rate = 0.0020
+        if verified_drop_15kj_pct is not None and verified_drop_15kj_pct > 0:
+            base_cp_rate = max(0.0012, min(0.0040, (float(verified_drop_15kj_pct) / 100.0) * 0.25))
+        cp_drop = min(0.18, excess * base_cp_rate * fuel_mult)
+        wp_drop = min(0.35, excess * 0.0055 * fuel_mult)
+        cp_eff = cp_base * (1.0 - cp_drop)
+        wp_eff = wp_base * (1.0 - wp_drop)
+
+    cp_drop_pct = round(max(0.0, (1.0 - cp_eff / cp_fresh) * 100.0), 1)
+    wp_drop_pct = round(max(0.0, (1.0 - wp_eff / wp_fresh) * 100.0), 1)
+    return {
+        "cp_eff_w": cp_eff,
+        "wp_eff_j": wp_eff,
+        "cp_drop_pct": cp_drop_pct,
+        "wp_drop_pct": wp_drop_pct,
+    }
+
+
 def simulate_workout_stream(
     watts: list[float],
     cp_watts: float,
@@ -648,6 +706,8 @@ def simulate_workout_stream(
     verified_drop_15kj_pct: float | None = None,
     title: str = "",
     work_block_watts: list[float] | None = None,
+    form_pct: float = 0.0,
+    creatine_flag: bool | None = None,
 ) -> dict[str, Any]:
     """1-Hz deterministic Chorley bi-exponential `W'bal` (`W'_FC` + `W'_SC`), 1st-order `VO2(t)` kinetics
     with severe-domain slow component, pre-fatigue `(prior_kj, cho_g_h)` durability degradation, and
@@ -656,33 +716,29 @@ def simulate_workout_stream(
     wp_fresh = max(4000.0, float(w_prime_j or 18000.0))
     bw = max(40.0, float(mass_kg or 75.0))
 
-    # Guardrail #5: Pre-fatigue (prior_kj & cho_g_h) degradation of (CP_eff, W'_eff)
-    cp_eff, wp_eff = cp_fresh, wp_fresh
-    cp_drop_pct = 0.0
-    wp_drop_pct = 0.0
-    if prior_kj and float(prior_kj) > 0.0:
-        kj_kg = float(prior_kj) / bw
-        excess = max(0.0, kj_kg - 12.0)
-        # Fueling modulation: under-fueling (<60 g/h) accelerates glycogen/W' decay; 80-100 g/h dampens it
-        fuel_mult = max(0.65, min(1.55, 1.0 + (60.0 - float(cho_g_h)) * 0.012))
-        # Use athlete's verified >15 kJ/kg durability drop if available, else conservative baseline
-        base_cp_rate = 0.0020
-        if verified_drop_15kj_pct is not None and verified_drop_15kj_pct > 0:
-            base_cp_rate = max(0.0012, min(0.0040, (float(verified_drop_15kj_pct) / 100.0) * 0.25))
-        cp_drop = min(0.18, excess * base_cp_rate * fuel_mult)
-        wp_drop = min(0.35, excess * 0.0055 * fuel_mult)
-        cp_eff = cp_fresh * (1.0 - cp_drop)
-        wp_eff = wp_fresh * (1.0 - wp_drop)
-        cp_drop_pct = round(cp_drop * 100.0, 1)
-        wp_drop_pct = round(wp_drop * 100.0, 1)
+    # Guardrail #5: Pre-fatigue (prior_kj & cho_g_h) + optional daily form degradation of (CP_eff, W'_eff)
+    eff = compute_effective_cp_w_prime(
+        cp_watts=cp_fresh,
+        w_prime_j=wp_fresh,
+        mass_kg=bw,
+        prior_kj=prior_kj,
+        cho_g_h=cho_g_h,
+        verified_drop_15kj_pct=verified_drop_15kj_pct,
+        form_pct=form_pct,
+    )
+    cp_eff = eff["cp_eff_w"]
+    wp_eff = eff["wp_eff_j"]
+    cp_drop_pct = eff["cp_drop_pct"]
+    wp_drop_pct = eff["wp_drop_pct"]
 
     p5_eff = float(p_5min_w) if (p_5min_w and float(p_5min_w) > cp_fresh) else (cp_fresh + wp_fresh / 300.0)
     p5_deg = p5_eff * (cp_eff / cp_fresh)
     p_vo2max = max(cp_eff * 1.15, p5_deg * 0.92)
 
-    # Chorley bi-exponential pools: fast PCr/myoglobin pool (`fc`) + slow glycolytic pool (`sc`)
-    fc_amp = 0.40 * wp_eff
-    sc_amp = 0.60 * wp_eff
+    # Chorley bi-exponential pools: fast PCr/myoglobin pool (`fc`, slightly elevated with creatine) + slow glycolytic pool (`sc`)
+    fc_frac = 0.43 if creatine_flag is True else 0.40
+    fc_amp = fc_frac * wp_eff
+    sc_amp = (1.0 - fc_frac) * wp_eff
     fc_bal = fc_amp
     sc_bal = sc_amp
     vo2_frac = 0.15
@@ -747,7 +803,9 @@ def simulate_workout_stream(
     t90_min = round(t_ge_90_s / 60.0, 1)
     peak_vo2_pct = round(peak_vo2 * 100.0, 1)
 
-    safety_floor_kj = min(3.0, round(0.15 * (wp_eff / 1000.0), 2))
+    # Blowout guard floor: protect small-W' Diesels (~10 kJ) with >= 3.0 kJ floor (capped at 30% W'), large W' with >= 10% W'
+    wp_eff_kj = wp_eff / 1000.0
+    safety_floor_kj = round(min(0.30 * wp_eff_kj, max(0.10 * wp_eff_kj, 3.0)), 2)
     unsustainable = (blowup_s is not None) or (w_min_kj < safety_floor_kj and kj_above > 5.0)
 
     if unsustainable:
@@ -816,11 +874,17 @@ def solve_individual_interval_prescriptions(
     p2_metabolic: dict[str, Any] | None = None,
     p4_myotype: dict[str, Any] | None = None,
     mass_kg: float | None = 75.0,
+    prior_kj: float = 0.0,
+    cho_g_h: float = 60.0,
+    verified_drop_15kj_pct: float | None = None,
+    form_pct: float = 0.0,
+    creatine_flag: bool | None = None,
 ) -> dict[str, Any]:
-    """Constrained 1-Hz inverse `W'bal` + `VO2(t)` prescription solver individualized to `(CP, W', vLamax_met, Z_Myo)`.
+    """Constrained 1-Hz inverse `W'bal` + `VO2(t)` prescription solver individualized to `(CP, W', vLamax_met, Z_Myo)`
+    with optional durability pre-fatigue `(prior_kj, cho_g_h)` and daily form scaling (`form_pct`).
 
     Enforces:
-      - Diesel safety floor: `target_reserve >= max(0.18 * W', 3.0 kJ)`
+      - Diesel safety floor: `target_reserve >= max(0.20 * W', 3.0 kJ)`
       - Aerobic IIx-cap on `30/15s`: never pushes `P_on` above `min(0.98 * P_5m, CP + 0.35 * W'/100)` —
         automatically raises `P_off` (Float) instead of driving `P_on` into an anaerobic sprint trap!
       - 2-stage Hard-Start `4x4m`: Stage 1 targets `60-70%` fast PCr depletion in 45s without `W'_SC` flood;
@@ -831,13 +895,27 @@ def solve_individual_interval_prescriptions(
     if not cp_watts or float(cp_watts) < 80.0 or not w_prime_j or float(w_prime_j) < 4000.0:
         return {}
 
-    cp = float(cp_watts)
-    wp = float(w_prime_j)
+    cp_fresh = float(cp_watts)
+    wp_fresh = float(w_prime_j)
     bw = max(40.0, float(mass_kg or 75.0))
-    p5 = float(p_5min_w) if (p_5min_w and float(p_5min_w) > cp) else (cp + wp / 300.0)
+    p5_fresh = float(p_5min_w) if (p_5min_w and float(p_5min_w) > cp_fresh) else (cp_fresh + wp_fresh / 300.0)
     p2 = p2_metabolic or {}
 
-    # Guardrail #3b: Diesel safety floor (`max(0.18 * W', 3.0 kJ)`, capped at 0.45*W' only for ultra-tiny W')
+    eff = compute_effective_cp_w_prime(
+        cp_watts=cp_fresh,
+        w_prime_j=wp_fresh,
+        mass_kg=bw,
+        prior_kj=prior_kj,
+        cho_g_h=cho_g_h,
+        verified_drop_15kj_pct=verified_drop_15kj_pct,
+        form_pct=form_pct,
+    )
+    cp = eff["cp_eff_w"]
+    wp = eff["wp_eff_j"]
+    scale_ratio = cp / cp_fresh
+    p5 = p5_fresh * scale_ratio
+
+    # Guardrail #3b: Diesel safety floor (`max(0.20 * W', 3.0 kJ)`, capped at 0.45*W' only for ultra-tiny W')
     target_res_j = min(0.45 * wp, max(0.20 * wp, 3000.0))
     target_res_kj = round(target_res_j / 1000.0, 1)
 
@@ -860,7 +938,7 @@ def solve_individual_interval_prescriptions(
     op_on = int(round(cp * 1.19))
     op_off = int(round(cp * 0.65))
     op_w, op_wb = _build_3015(op_on, op_off, 3, 13)
-    op_sim = simulate_workout_stream(op_w, cp, wp, p5, bw, work_block_watts=op_wb)
+    op_sim = simulate_workout_stream(op_w, cp, wp, p5, bw, work_block_watts=op_wb, creatine_flag=creatine_flag)
 
     # 2. VO2max Float 30/15 (`3x13`, `Off = 68-70% CP`, bisected to hit `target_res_j`, bounded by `p_on_iix_cap`)
     fl_off = int(round(cp * 0.70))
@@ -868,14 +946,14 @@ def solve_individual_interval_prescriptions(
     for _ in range(28):
         mid = 0.5 * (lo + hi)
         sw, swb = _build_3015(mid, fl_off, 3, 13)
-        sm = simulate_workout_stream(sw, cp, wp, p5, bw, work_block_watts=swb)
+        sm = simulate_workout_stream(sw, cp, wp, p5, bw, work_block_watts=swb, creatine_flag=creatine_flag)
         if sm["w_bal_min_kj"] * 1000.0 > target_res_j:
             lo = mid
         else:
             hi = mid
     fl_on = int(round(0.5 * (lo + hi)))
     fl_w, fl_wb = _build_3015(fl_on, fl_off, 3, 13)
-    fl_sim = simulate_workout_stream(fl_w, cp, wp, p5, bw, work_block_watts=fl_wb)
+    fl_sim = simulate_workout_stream(fl_w, cp, wp, p5, bw, work_block_watts=fl_wb, creatine_flag=creatine_flag)
 
     # 3. VO2max Classic 30/15 (`Off = 50% CP`) — if `P_on` hits `p_on_iix_cap`, auto-escalate `P_off` (Float)!
     cl_off = int(round(cp * 0.50))
@@ -883,7 +961,7 @@ def solve_individual_interval_prescriptions(
     for _ in range(28):
         mid = 0.5 * (lo + hi)
         sw, swb = _build_3015(mid, cl_off, 3, 13)
-        sm = simulate_workout_stream(sw, cp, wp, p5, bw, work_block_watts=swb)
+        sm = simulate_workout_stream(sw, cp, wp, p5, bw, work_block_watts=swb, creatine_flag=creatine_flag)
         if sm["w_bal_min_kj"] * 1000.0 > target_res_j:
             lo = mid
         else:
@@ -898,7 +976,7 @@ def solve_individual_interval_prescriptions(
         for _ in range(24):
             omid = 0.5 * (o_lo + o_hi)
             sw, swb = _build_3015(cl_on, omid, 3, 13)
-            sm = simulate_workout_stream(sw, cp, wp, p5, bw, work_block_watts=swb)
+            sm = simulate_workout_stream(sw, cp, wp, p5, bw, work_block_watts=swb, creatine_flag=creatine_flag)
             if sm["w_bal_min_kj"] * 1000.0 > target_res_j:
                 o_lo = omid
             else:
@@ -907,7 +985,7 @@ def solve_individual_interval_prescriptions(
     else:
         cl_on = int(round(cl_on_raw))
     cl_w, cl_wb = _build_3015(cl_on, cl_off, 3, 13)
-    cl_sim = simulate_workout_stream(cl_w, cp, wp, p5, bw, work_block_watts=cl_wb)
+    cl_sim = simulate_workout_stream(cl_w, cp, wp, p5, bw, work_block_watts=cl_wb, creatine_flag=creatine_flag)
 
     # 4. Guardrail #3c: 2-Stage Hard-Start 4x4m (`45s Start -> 3:15m Hold`, `5m @ 50% CP rest`)
     # Stage 1: Solve `P_start` (45s) for ~60-65% depletion of fast alactic PCr reserve (~min(0.22*W', 0.09*mass*1000))
@@ -931,19 +1009,20 @@ def solve_individual_interval_prescriptions(
     for _ in range(28):
         hmid = 0.5 * (h_lo + h_hi)
         sw, swb = _build_hs4x4(hs_start, hmid)
-        sm = simulate_workout_stream(sw, cp, wp, p5, bw, work_block_watts=swb)
+        sm = simulate_workout_stream(sw, cp, wp, p5, bw, work_block_watts=swb, creatine_flag=creatine_flag)
         if sm["w_bal_min_kj"] * 1000.0 > target_res_j:
             h_lo = hmid
         else:
             h_hi = hmid
     hs_hold = int(round(0.5 * (h_lo + h_hi)))
     hs_w, hs_wb = _build_hs4x4(hs_start, hs_hold)
-    hs_sim = simulate_workout_stream(hs_w, cp, wp, p5, bw, work_block_watts=hs_wb)
+    hs_sim = simulate_workout_stream(hs_w, cp, wp, p5, bw, work_block_watts=hs_wb, creatine_flag=creatine_flag)
 
     # 5. Guardrail #3a: Controlled 1:4 Lactate-Shuttle (`6x [1m Over / 4m Under]`)
     # Anchor `4m Under` at `80-86% CP` (near LT1) for max aerobic ATP & MCT1 lactate clearance;
     # bound `1m Over` to controlled `15-18% W'` pulse per 1m bout (never 460-500W IIx blast!)
-    lt1_w = p2.get("p_lt1_w") or int(round(cp * 0.78))
+    lt1_base = p2.get("p_lt1_w")
+    lt1_w = (float(lt1_base) * scale_ratio) if lt1_base else (cp * 0.78)
     sh_under = int(round(max(cp * 0.80, min(cp * 0.86, lt1_w * 1.05))))
     # 1m Over burns ~16-18% of W' per bout, clamped <= 0.92 * P_5m and <= 1.28 * CP
     over_target_j = min(0.17 * wp, 0.28 * cp * 60.0)
@@ -953,46 +1032,58 @@ def solve_individual_interval_prescriptions(
     for _ in range(6):
         sh_w.extend([sh_over] * 60 + [sh_under] * 240)
         sh_wb.extend([sh_over] * 60 + [sh_under] * 240)
-    sh_sim = simulate_workout_stream(sh_w, cp, wp, p5, bw, work_block_watts=sh_wb)
+    sh_sim = simulate_workout_stream(sh_w, cp, wp, p5, bw, work_block_watts=sh_wb, creatine_flag=creatine_flag)
 
     # 6. Sub-Threshold / MLSS Builder (`4x10m @ MLSS`)
-    mlss_w = p2.get("p_mlss_w") or int(round(cp * 0.95))
+    mlss_base = p2.get("p_mlss_w")
+    mlss_w = int(round(float(mlss_base) * scale_ratio)) if mlss_base else int(round(cp * 0.95))
 
     return {
+        "cp_fresh_w": round(cp_fresh, 1),
+        "wp_fresh_kj": round(wp_fresh / 1000.0, 1),
+        "cp_eff_w": round(cp, 1),
+        "wp_eff_kj": round(wp / 1000.0, 1),
+        "cp_drop_pct": eff["cp_drop_pct"],
+        "wp_drop_pct": eff["wp_drop_pct"],
+        "prior_kj": round(float(prior_kj or 0.0), 0),
+        "cho_g_h": round(float(cho_g_h if cho_g_h is not None else 60.0), 1),
+        "form_pct": round(float(form_pct or 0.0), 1),
         "target_reserve_kj": target_res_kj,
         "iix_cap_w": int(round(p_on_iix_cap)),
         "re_entry_opener": {
             "label": "Re-Entry Threshold-Opener 30/15 Float (intermittent CP, NOT VO2max)",
-            "on_w": op_on, "on_pct": int(round(op_on / cp * 100)),
-            "off_w": op_off, "off_pct": int(round(op_off / cp * 100)),
+            "on_w": op_on, "on_pct": int(round(op_on / cp_fresh * 100)),
+            "off_w": op_off, "off_pct": int(round(op_off / cp_fresh * 100)),
             "block_avg_w": op_sim["work_block_avg_w"],
             "w_bal_min_pct": op_sim["w_bal_min_pct"],
             "t90_min": op_sim["time_ge_90_vo2max_min"],
-            "dsl": f"3x (13x 30s@{int(round(op_on / cp * 100))}% / 15s@{int(round(op_off / cp * 100))}%)",
+            "dsl": f"3x (13x 30s@{op_on}W / 15s@{op_off}W) / 5m@{int(round(cp * 0.52))}W",
         },
         "vo2max_float_30_15": {
             "label": "VO2max Float 30/15 (3x13, W'-scaled)",
-            "on_w": fl_on, "on_pct": int(round(fl_on / cp * 100)),
-            "off_w": fl_off, "off_pct": int(round(fl_off / cp * 100)),
+            "on_w": fl_on, "on_pct": int(round(fl_on / cp_fresh * 100)),
+            "off_w": fl_off, "off_pct": int(round(fl_off / cp_fresh * 100)),
             "block_avg_w": fl_sim["work_block_avg_w"],
             "w_bal_min_pct": fl_sim["w_bal_min_pct"],
             "w_bal_min_kj": fl_sim["w_bal_min_kj"],
             "t90_min": fl_sim["time_ge_90_vo2max_min"],
-            "dsl": f"13x 30s@{int(round(fl_on / cp * 100))}% / 15s@{int(round(fl_off / cp * 100))}%",
+            "dsl": f"3x (13x 30s@{fl_on}W / 15s@{fl_off}W) / 5m@{int(round(cp * 0.52))}W",
         },
         "vo2max_classic_30_15": {
             "label": "VO2max Classic 30/15 (auto-float if IIx-capped)",
-            "on_w": cl_on, "on_pct": int(round(cl_on / cp * 100)),
-            "off_w": cl_off, "off_pct": int(round(cl_off / cp * 100)),
+            "on_w": cl_on, "on_pct": int(round(cl_on / cp_fresh * 100)),
+            "off_w": cl_off, "off_pct": int(round(cl_off / cp_fresh * 100)),
             "iix_capped": cl_capped,
             "block_avg_w": cl_sim["work_block_avg_w"],
             "w_bal_min_pct": cl_sim["w_bal_min_pct"],
+            "w_bal_min_kj": cl_sim["w_bal_min_kj"],
             "t90_min": cl_sim["time_ge_90_vo2max_min"],
+            "dsl": f"3x (13x 30s@{cl_on}W / 15s@{cl_off}W) / 5m@{int(round(cp * 0.52))}W",
         },
         "vo2max_hard_start_4x4": {
             "label": "VO2max Hard-Start 4x4m (2-Stage PCr+W' solved, 5m rest)",
-            "start_w": hs_start, "start_pct": int(round(hs_start / cp * 100)),
-            "hold_w": hs_hold, "hold_pct": int(round(hs_hold / cp * 100)),
+            "start_w": hs_start, "start_pct": int(round(hs_start / cp_fresh * 100)),
+            "hold_w": hs_hold, "hold_pct": int(round(hs_hold / cp_fresh * 100)),
             "block_avg_w": hs_sim["work_block_avg_w"],
             "w_bal_min_pct": hs_sim["w_bal_min_pct"],
             "w_bal_min_kj": hs_sim["w_bal_min_kj"],
@@ -1002,14 +1093,15 @@ def solve_individual_interval_prescriptions(
         },
         "lactate_shuttle_1_4": {
             "label": "1:4 Lactate-Shuttle Over/Under (6x, Under@80-86% CP, Over=15-20% W' pulse)",
-            "over_w": sh_over, "over_pct": int(round(sh_over / cp * 100)),
-            "under_w": sh_under, "under_pct": int(round(sh_under / cp * 100)),
+            "over_w": sh_over, "over_pct": int(round(sh_over / cp_fresh * 100)),
+            "under_w": sh_under, "under_pct": int(round(sh_under / cp_fresh * 100)),
             "w_bal_min_pct": sh_sim["w_bal_min_pct"],
-            "dsl": f"6x 1m@{int(round(sh_over / cp * 100))}% / 4m@{int(round(sh_under / cp * 100))}%",
+            "dsl": f"6x 1m@{sh_over}W / 4m@{sh_under}W",
         },
         "sub_threshold": {
             "label": "Sub-Threshold / MLSS Builder (4x10m)",
-            "target_w": mlss_w, "target_pct": int(round(mlss_w / cp * 100)),
+            "target_w": mlss_w, "target_pct": int(round(mlss_w / cp_fresh * 100)),
+            "dsl": f"4x 10m@{mlss_w}W / 4m@{int(round(cp * 0.54))}W",
         },
     }
 

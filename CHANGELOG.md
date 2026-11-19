@@ -2,6 +2,23 @@
 
 Written for users: `/atlas-update` shows the sections between the installed and the new version.
 
+## [1.4.6] - 2026-11-19
+
+- **Direct `--solve` 1-Hz Bisection Solver & Token-Saving Helpers (`atlas.py`, `pillars_engine.py`, `coach.md`):**
+  - **One-Call Pre-Fatigue & Form Solver (`atlas.py coach simulate --solve`):** Solves individualized 1-Hz `W'bal` + `VO2(t)` targets (`Float 30/15`, `Classic 30/15`, `Hard-Start 4x4m`, `1:4 Lactate-Shuttle`, `MLSS`) directly under `--prior-kj` / `--preload-kj`, CSV batch `--cho-g-h` (e.g. `42.5,90`), and `--form-pct` (e.g. `0,-2`) alongside a Fresh baseline — eliminating manual trial-and-error bisection calls.
+  - **Atomic Write Helpers & Context Date Header:** Adds `atlas.py coach set-profile` and `atlas.py coach add-rule` for single-command profile/playbook updates without extra file reads, plus `today: <Weekday> YYYY-MM-DD KW <W>` directly in the `coach context` header.
+- **Physics & Parser Bugfixes (`atlas_hook.py`, `pillars_engine.py`, `coach_connectors.py`):**
+  - **Nested-Set DSL Parser & Zero Silent Drops:** `parse_workout_spec()` now parses `3x (13x 30s@394W / 15s@206W) / 4m@150W` and `3x13x 30s@394W / 15s@206W` natively (including balanced nested parentheses inside calendar lines) and reports `unparsed_tokens` loudly in `coach simulate` & `coach push` instead of silently falling back to `RECOVERY_Z1`.
+  - **Extreme-Diesel `FatMax` Calibration:** Caps the upper end of `f(CP, vLamax_met)` at `<= 76.5% CP` and reconciles low-`vLamax` (`< 0.45`) athletes with Mader's stoichiometric `95%-MFO` band and `<= 94% LT1` headroom so `FatMax` never collides with `LT1`.
+  - **Diesel Safety Floor in `simulate_workout_stream()`:** Fixes inverted `min(3.0, 0.15 * W')` guard to `min(0.30 * W', max(0.10 * W', 3.0))` so small-`W'` Diesel profiles receive the full `3.0 kJ` blowout floor without false-positive blowouts on large-`W'` athletes.
+  - **`creatine_flag` Biophysical Calibration:** Wires `creatine: true` into Meixner `t_alac` (`+0.35 s`) and Chorley fast PCr pool fraction (`fc_frac = 0.43` vs. `0.40`).
+  - **Sub-Threshold (`4x10m @ MLSS`) Classification Fix:** Excludes long passive recovery intervals (`> 60 s`) from `work_block_watts` in `expand_spec_to_1hz_watts()` so `4x10m @ 95% CP` is classified as `THRESHOLD_OR_SHUTTLE_OPENER` rather than `AEROBIC_BASE_Z2`.
+
+## [1.4.5] - 2026-11-19
+
+- **Inverse Mader `vLamax_met`, Dynamic Sub-CP & 1-Hz `W'bal`/`VO2(t)` Solver (`pillars_engine.py`, `coach_engine.py`, `atlas.py`, `coach.md`):**
+  - Separates metabolic `vLamax_met` (inverse Mader equilibrium) from the alactic 15s sprint proxy, computes phenotype-scaled `f(CP, vLamax_met)` Sub-CP anchors (`FatMax`, `LT1`, `MLSS`), adds constrained 1-Hz interval prescriptions (`[3B_prescriptions]`), `atlas.py coach simulate` with pre-fatigue `(prior_kj, cho_g_h)`, and the 1-Hz `coach push` Compiler-Guard.
+
 ## [1.4.4] - 2026-11-18
 
 - **Maximal-Effort Durability Validity Gate (`pillars_engine.py`, `coach_engine.py`, `atlas.py`, `coach.md`):**
