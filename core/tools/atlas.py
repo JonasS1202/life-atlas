@@ -2097,7 +2097,16 @@ def _mmp_from_watts(watts):
 
 
 def _compute_stream_metrics(
-    streams, ftp_watts=275, weight_kg=67.0, sport="cycling", cp_watts=None, w_prime_j=None, device_watts=None
+    streams,
+    ftp_watts=275,
+    weight_kg=67.0,
+    sport="cycling",
+    cp_watts=None,
+    w_prime_j=None,
+    device_watts=None,
+    title="",
+    creatine_flag=None,
+    tau_w_mult=1.0,
 ):
     """Compute full 1Hz physics & physiological stream metrics via coach_engine."""
     return coach_engine.compute_stream_metrics(
@@ -2108,6 +2117,9 @@ def _compute_stream_metrics(
         cp_watts=cp_watts,
         w_prime_j=w_prime_j,
         device_watts=device_watts,
+        title=title,
+        creatine_flag=creatine_flag,
+        tau_w_mult=tau_w_mult,
     )
 
 
@@ -2626,6 +2638,9 @@ def _coach_sync(root, brain, hk, days=90, mock_file=None, wellness_mock=None, ex
             m_calc = _compute_stream_metrics(
                 streams, ftp_watts=ftp_w, weight_kg=weight_kg, sport=sport,
                 cp_watts=init_cp, w_prime_j=init_wp_j, device_watts=device_watts,
+                title=str(entry.get("name") or ""),
+                creatine_flag=prof_info.get("creatine_flag"),
+                tau_w_mult=float(prof_info.get("tau_w_mult") or 1.0),
             )
             entry.update(m_calc)
 
@@ -2666,6 +2681,15 @@ def _coach_sync(root, brain, hk, days=90, mock_file=None, wellness_mock=None, ex
     eff_cs_final = float(cs_sol["cs_mps"]) if (cs_sol["valid"] and cs_sol["cs_mps"]) else prof_info.get("cs_mps")
 
     if cp_sol["valid"] and synced_streams_mem:
+        tau_sync = coach_engine.resolve_individual_tau_w_mult(
+            profile=prof_info,
+            activities=all_acts,
+            cp_watts=eff_cp_final,
+            w_prime_j=eff_wp_final,
+            creatine_flag=prof_info.get("creatine_flag"),
+            today=today,
+        )
+        eff_tau_sync = float(tau_sync.get("tau_w_mult") or 1.0)
         for a in all_acts:
             aid = str(a.get("id") or "")
             if aid in synced_streams_mem and coach_engine.is_valid_cycling_power_activity(a):
@@ -2677,6 +2701,9 @@ def _coach_sync(root, brain, hk, days=90, mock_file=None, wellness_mock=None, ex
                     cp_watts=eff_cp_final,
                     w_prime_j=eff_wp_final,
                     device_watts=a.get("device_watts"),
+                    title=str(a.get("name") or ""),
+                    creatine_flag=prof_info.get("creatine_flag"),
+                    tau_w_mult=eff_tau_sync,
                 ))
 
     # Score Plan-vs-Actual Interval Execution & Z2 Discipline against scheduled calendar workouts
@@ -3339,6 +3366,14 @@ def _coach_push(root, brain, hk, days=14, execute=True, mock_dir=None):
     )
     eff_p5m = float(curves["fresh"]["5m"].get("90d") or 0) or None
     eff_cs = float(cs_sol["cs_mps"]) if (cs_sol["valid"] and cs_sol["cs_mps"]) else prof_info.get("cs_mps")
+    tau_push = coach_engine.resolve_individual_tau_w_mult(
+        profile=prof_info,
+        activities=c_state.get("activities", []),
+        cp_watts=float(eff_ftp) if eff_ftp else None,
+        w_prime_j=eff_wp_j,
+        creatine_flag=prof_info.get("creatine_flag"),
+    )
+    eff_tau_push = float(tau_push.get("tau_w_mult") or 1.0)
 
     idx = hk.load_index()
     cal_items = hk.calendar_items(idx, days=max(days, 30), past_days=7, include_done=True)
@@ -3356,6 +3391,7 @@ def _coach_push(root, brain, hk, days=14, execute=True, mock_dir=None):
         p_5min_w=eff_p5m,
         mass_kg=float(prof_info.get("weight_kg") or weight_kg or 75.0),
         creatine_flag=prof_info.get("creatine_flag"),
+        base_tau_w_mult=eff_tau_push,
     )
     if execute:
         hk.render_calendar_html(idx, start_server=False)
@@ -3416,9 +3452,12 @@ def _coach_simulate(
     grade_csv=None,
     morin_spec=None,
     re_spec=None,
+    tau_w_mult_override=None,
+    fit_tau_spec=None,
 ):
     """Run deterministic 1-Hz Chorley W'bal + 1st-order VO2(t) simulation, inverse `--solve` bisection,
-    environment/hardware/pre-fatigue scaling, OR Running Equivalence Bridge (`CS/D'`, Minetti, Morin `k_leg`, `RE`)."""
+    `--fit-tau` individual W'-reconstitution calibration, environment/hardware/pre-fatigue scaling,
+    OR Running Equivalence Bridge (`CS/D'`, Minetti, Morin `k_leg`, `RE`)."""
     ftp_w, weight_kg = _extract_profile_numbers(brain, hk)
     prof_p = os.path.join(brain, "coach", "profile.md")
     prof_txt = read(prof_p) if os.path.isfile(prof_p) else ""
@@ -3438,15 +3477,65 @@ def _coach_simulate(
     height_cm = float(prof.get("height_cm") or 180.0)
     v15_drop = (sp.get("pillar5_durability") or {}).get("verified_drop_15kj_pct")
     p2_met = sp.get("pillar2_metabolic") or {}
+    p3_kin = sp.get("pillar3_kinetics") or {}
     p4_myo = sp.get("pillar4_myotype") or {}
     p6_loc = sp.get("pillar6_locomotion") or {}
     creatine_flag = prof.get("creatine_flag")
+    eff_base_tau = float(tau_w_mult_override) if tau_w_mult_override is not None else float(p3_kin.get("tau_w_mult") or 1.0)
+    eff_base_tau = max(0.35, min(2.50, eff_base_tau))
     eff_sex = str(sex or prof.get("sex") or "male").strip().lower()
     if eff_sex in ("f", "w", "weiblich"):
         eff_sex = "female"
     elif eff_sex in ("m", "männlich"):
         eff_sex = "male"
     indoor_off = float(p6_loc.get("indoor_cp_offset_w") if p6_loc.get("indoor_cp_offset_w") is not None else -19.0)
+
+    # Individual W'-Reconstitution (`tau_w_mult`) Inverse Calibration (`--fit-tau "3m=465,2m=150,3m=390"`)
+    if fit_tau_spec:
+        def _parse_dur_s(tok_d):
+            s = str(tok_d or "").strip().lower()
+            m_d = re.match(r"^(\d+(?:[.,]\d+)?)\s*(m|min|s|sec)?$", s)
+            if not m_d:
+                return 0.0
+            val = float(m_d.group(1).replace(",", "."))
+            unit_s = m_d.group(2) or "s"
+            return val * 60.0 if unit_s.startswith("m") else val
+
+        chunks = [c.strip() for c in str(fit_tau_spec).split(",") if c.strip()]
+        if len(chunks) != 3 or not all("=" in c for c in chunks):
+            sys.exit('coach simulate --fit-tau expects 3 comma-separated `dur=watts` pairs, e.g. `"3m=465,2m=150,3m=390"`')
+        parsed_b = []
+        for ch in chunks:
+            dk, dv = ch.split("=", 1)
+            dur_s = _parse_dur_s(dk)
+            w_val = float(re.sub(r"[^0-9.,]", "", dv).replace(",", "."))
+            parsed_b.append((dur_s, w_val))
+        fit = coach_engine.fit_tau_w_mult_from_bouts(
+            b1_dur_s=parsed_b[0][0],
+            b1_avg_w=parsed_b[0][1],
+            rec_dur_s=parsed_b[1][0],
+            rec_avg_w=parsed_b[1][1],
+            b2_dur_s=parsed_b[2][0],
+            b2_avg_w=parsed_b[2][1],
+            cp_watts=cp_w,
+            w_prime_j=wp_j,
+            creatine_flag=creatine_flag,
+        )
+        say(f"=== INDIVIDUAL W'-RECONSTITUTION CALIBRATION (CP={cp_w:.0f}W | W'={wp_j/1000.0:.1f}kJ | Creatine={creatine_flag}) ===")
+        if not fit.get("valid"):
+            say(f"  [!] Invalid reconstitution test: {fit.get('reason')}")
+            return fit
+        say(f"  Bouts: {int(parsed_b[0][0])}s@{parsed_b[0][1]:.0f}W ({fit['w1_depletion_pct']}% W') -> "
+            f"{fit['rec_dur_s']}s@{parsed_b[1][1]:.0f}W ({fit['rec_pct_cp']}% CP) -> "
+            f"{int(parsed_b[2][0])}s@{parsed_b[2][1]:.0f}W ({fit['w2_reconst_pct']}% W' vs. default {fit['pred_reconst_pct_default']}%)")
+        say(f"  Solved: tau_w_mult={fit['tau_w_mult']}x (confidence={fit['confidence']}) | "
+            f"Chorley @50%CP: tau_FC={fit['tau_fc_50pct_s']}s, tau_SC={fit['tau_sc_50pct_s']}s")
+        if fit.get("warning"):
+            say(f"  [!] {fit['warning']}")
+        say(f"  Save to profile: `atlas.py coach set-profile --tau-w-mult {fit['tau_w_mult']} --execute`")
+        if not solve_proto and not dsl_spec and not date_str:
+            return fit
+        eff_base_tau = float(fit["tau_w_mult"])
 
     # Running Equivalence Bridge mode (`--run-splits`, `--grade`, `--morin`, `--re`)
     if run_splits or grade_csv is not None or morin_spec or re_spec:
@@ -3572,7 +3661,7 @@ def _coach_simulate(
                 if not scenarios or lbl != "Fresh Baseline":
                     scenarios.append((lbl, 0.0, 0.0, cho_vals[0], fv, True))
 
-        say(f"=== 1-HZ INVERSE PRESCRIPTION SOLVER (Anchor: CP={cp_w:.0f}W | W'={wp_j/1000.0:.1f}kJ | 5m={int(p5_w) if p5_w else '—'}W | Mass={mass_kg:.1f}kg | Sex={eff_sex} | Creatine={creatine_flag}) ===")
+        say(f"=== 1-HZ INVERSE PRESCRIPTION SOLVER (Anchor: CP={cp_w:.0f}W | W'={wp_j/1000.0:.1f}kJ | 5m={int(p5_w) if p5_w else '—'}W | Mass={mass_kg:.1f}kg | Sex={eff_sex} | Creatine={creatine_flag} | tau_w_mult={eff_base_tau:.2f}x) ===")
         results = []
         for s_lbl, s_kj, s_sup, s_cho, s_form, apply_env in scenarios:
             rx = coach_engine.solve_individual_interval_prescriptions(
@@ -3595,6 +3684,7 @@ def _coach_simulate(
                 indoor=e_indoor if apply_env else False,
                 indoor_cp_offset_w=indoor_off,
                 drivetrain_loss_pct=e_dt if apply_env else 0.0,
+                base_tau_w_mult=eff_base_tau,
             )
             results.append((s_lbl, rx))
             rec10_sc = round((1.0 - math.exp(-600.0 / max(1.0, rx["tau_sc_50pct_s"]))) * 100.0, 1)
@@ -3648,6 +3738,7 @@ def _coach_simulate(
             indoor=e_indoor,
             indoor_cp_offset_w=indoor_off,
             drivetrain_loss_pct=e_dt,
+            base_tau_w_mult=eff_base_tau,
         )
         t_fc, t_sc = coach_engine.chorley_recovery_taus(50.0, tau_mult=eff["tau_w_mult"])
         rec10 = round((1.0 - math.exp(-600.0 / t_sc)) * 100.0, 1)
@@ -3686,9 +3777,10 @@ def _coach_simulate(
         indoor=e_indoor,
         indoor_cp_offset_w=indoor_off,
         drivetrain_loss_pct=e_dt,
+        base_tau_w_mult=eff_base_tau,
     )
     say(f"=== 1-HZ BIOPHYSICAL WORKOUT SIMULATION ({title}) ===")
-    say(f"  Input Anchor: CP={cp_w:.0f}W | W'={wp_j/1000.0:.1f}kJ | 5m={int(p5_w) if p5_w else '—'}W | Mass={mass_kg:.1f}kg | Sex={eff_sex} | Creatine={creatine_flag}")
+    say(f"  Input Anchor: CP={cp_w:.0f}W | W'={wp_j/1000.0:.1f}kJ | 5m={int(p5_w) if p5_w else '—'}W | Mass={mass_kg:.1f}kg | Sex={eff_sex} | Creatine={creatine_flag} | tau_w_mult={eff_base_tau:.2f}x")
     if spec.get("unparsed_tokens"):
         say(f"  [!] UNPARSED DSL TOKEN(S): {', '.join(spec['unparsed_tokens'])} — check workout syntax!")
     if has_env or abs(form_vals[0]) > 1e-6:
@@ -3717,6 +3809,7 @@ def _coach_set_profile(
     creatine=None,
     age=None,
     sex=None,
+    tau_w_mult=None,
     execute=False,
 ):
     """Atomic token-saving helper to update biometric/calibration fields in `brain/coach/profile.md`."""
@@ -3788,9 +3881,19 @@ def _coach_set_profile(
         else:
             txt = _upsert_fm(txt, "kfa_pct", f"{k_f:.1f}")
         changes.append(f"kfa_pct={k_f:.1f}")
+    if tau_w_mult is not None:
+        tw_f = float(tau_w_mult)
+        if not (0.35 <= tw_f <= 2.50):
+            sys.exit("coach set-profile: `--tau-w-mult` must be between 0.35 and 2.50")
+        txt = _upsert_fm(txt, "tau_w_mult", f"{tw_f:.2f}")
+        txt = _upsert_fm(txt, "tau_w_date", today_iso)
+        tw_row = f"| **W'-Erholung (`tau_w_mult`)** | {tw_f:.2f}x | Kalibriert (Stand: {today_iso}) |"
+        if re.search(r"(?im)^\|[^\n]*(?:tau_w|w'-erholung|w' recovery|reconstitution)[^\n]*\|$", txt):
+            txt = re.sub(r"(?im)^\|[^\n]*(?:tau_w|w'-erholung|w' recovery|reconstitution)[^\n]*\|$", tw_row, txt, count=1)
+        changes.append(f"tau_w_mult={tw_f:.2f} (date={today_iso})")
 
     if not changes:
-        sys.exit("coach set-profile requires at least one flag: --rhr, --hr-max, --weight, --kfa, --creatine, --age, --sex")
+        sys.exit("coach set-profile requires at least one flag: --rhr, --hr-max, --weight, --kfa, --creatine, --age, --sex, --tau-w-mult")
 
     txt = re.sub(r"(?m)^Stand:\s*\d{4}-\d{2}-\d{2}\.", f"Stand: {today_iso}.", txt, count=1)
     if execute:
@@ -3865,19 +3968,61 @@ def _coach_compare_epochs(brain, hk, epoch_a, epoch_b):
     say(f"\n--- Epoch B ({epoch_b}) ---\n" + coach_engine.format_seven_pillar_blocks(tel_b, include_actions=False))
 
 
-def _coach_field_test(root, brain, hk, unit, date_str=None, execute=True):
-    """Schedule a standardized 7-Pillar field test (Unit 1, Unit 2, Durability Preload, or LSCT) into calendar/README.md."""
+def _coach_field_test(root, brain, hk, unit, date_str=None, execute=True, depth_override=None):
+    """Schedule a standardized 7-Pillar field test (`1`, `1-std`, `reconst`/`1-pro`, `2`, `2a`, `2b`, `preload`, `lsct`)
+    into `calendar/README.md`, automatically adapting Unit 1 to athlete depth (`pro` vs. `standard`) and advising
+    Fast Myotypes to split `5m` & `12m` across separate days (`2a` + `2b`)."""
     _coach_init(root, brain, hk, execute=execute, quiet=True)
     d_iso = (date_str or (dt.date.today() + dt.timedelta(days=1)).isoformat())[:10]
+
+    # Resolve athlete depth & Myotype safely (fail-open to `standard`)
+    eff_depth = "standard"
+    is_fast_myo = False
+    z_myo = None
+    wp_kj = None
+    try:
+        ftp_w, weight_kg = _extract_profile_numbers(brain, hk)
+        prof_p = os.path.join(brain, "coach", "profile.md")
+        prof_txt = read(prof_p) if os.path.isfile(prof_p) else ""
+        c_state = hk.load_coach_state()
+        tel = coach_engine.build_coach_telemetry(
+            prof_txt,
+            c_state.get("activities", []),
+            fallback_ftp=ftp_w,
+            fallback_weight=weight_kg,
+            explicit_depth=depth_override if depth_override in ("simple", "standard", "pro") else None,
+        )
+        eff_depth = str(tel.get("depth") or "standard").lower()
+        sp = tel.get("seven_pillars") or {}
+        z_myo = (sp.get("pillar4_myotype") or {}).get("myotype_z_score")
+        wp_kj = tel.get("effective_w_prime_kj")
+        is_fast_myo = bool((z_myo is not None and float(z_myo) > 0.5) or (wp_kj is not None and float(wp_kj) >= 24.0))
+    except Exception:
+        if depth_override in ("simple", "standard", "pro"):
+            eff_depth = depth_override
+
+    unit1_pro = (
+        f"- [ ] {d_iso} 17:30 [workout:cycling] Field-Test Unit 1 (Pro): 15s Sprint & 3m/2m/3m W'-Reconstitution (Slope-Mode) "
+        f"(65m | 15m WU 55-75%, 1x 15s@200% / 5m@50%, 20m Z1@52%, 1x 3m@135% / 2m@50%, 1x 3m@130% / 10m@50%, 10m CD 60-45%)"
+    )
+    unit1_std = (
+        f"- [ ] {d_iso} 17:30 [workout:cycling] Field-Test Unit 1: 15s Sprint & 3m All-Out Anchor (Slope-Mode) "
+        f"(58m | 15m WU 55-75%, 1x 15s@200% / 5m@50%, 20m Z1@52%, 1x 3m@135% / 8m@50%, 10m CD 60-45%)"
+    )
     templates = {
-        "1": f"- [ ] {d_iso} 17:30 [workout:cycling] Field-Test Unit 1: Sprint, C_max & W'-Reconstitution (65m | 15m WU 55-75%, 1x 15s@200% / 5m@50%, 20m Z1@52%, 1x 3m@135% / 2m@50%, 1x 3m@130% / 10m@50%, 10m CD 60-45%)",
+        "1": unit1_pro if eff_depth == "pro" else unit1_std,
+        "1-std": unit1_std,
+        "1-pro": unit1_pro,
+        "reconst": unit1_pro,
         "2": f"- [ ] {d_iso} 17:30 [workout:cycling] Field-Test Unit 2: Aerobic Roof & CP Anchor 5m+12m (75m | 15m WU 55-75%, 1x 5m@122% / 32m@52%, 1x 12m@105% / 5m@50%, 6m CD 60-45%)",
+        "2a": f"- [ ] {d_iso} 17:30 [workout:cycling] Field-Test Unit 2a: Fresh 12m All-Out CP Anchor (Slope-Mode) (55m | 15m WU 55-75%, 1x 12m@105% / 8m@50%, 20m CD 62-48%)",
+        "2b": f"- [ ] {d_iso} 10:30 [workout:cycling] Field-Test Unit 2b: Fresh 5m All-Out VO2max Roof (Slope-Mode) (65m | 15m WU 55-75%, 1x 5m@122% / 10m@50%, 25m Z2@65%, 10m CD 60-45%)",
         "preload": f"- [ ] {d_iso} 10:00 [workout:cycling] Field-Test Unit 3: Durability Preload 25kJ/kg + 5m All-Out (165m | 20m WU 55-72%, 60m Z2@68%, 3x 8m@103% / 4m@55%, 34m Z2@68%, 1x 5m@120% / 10m@50%)",
         "lsct": f"- [ ] {d_iso} 17:30 [workout:cycling] LSCT Submaximal Monitoring + Base (60m | 6m@58%, 6m@78%, 3m@92%, 2m@40%, 35m Z2@68%, 8m CD 60-45%)",
     }
     u_key = str(unit or "1").lower()
     if u_key not in templates:
-        sys.exit("coach field-test requires `--unit 1|2|preload|lsct`")
+        sys.exit("coach field-test requires `--unit 1|1-std|reconst|2|2a|2b|preload|lsct`")
     line = templates[u_key]
     cal_path = os.path.join(brain, "calendar", "README.md")
     if execute and os.path.isfile(cal_path):
@@ -3891,7 +4036,12 @@ def _coach_field_test(root, brain, hk, unit, date_str=None, execute=True):
             txt = txt.rstrip() + f"\n\n## Timeline\n\n{line}\n"
         write(cal_path, txt)
         _coach_push(root, brain, hk, days=21, execute=True)
-    say(f"coach field-test ({'scheduled' if execute else 'dry-run'}): {line}")
+    say(f"coach field-test ({'scheduled' if execute else 'dry-run'}, depth={eff_depth}): {line}")
+    if u_key == "2" and is_fast_myo:
+        say(
+            f"  [!] Fast-Myotype Advisory (Z_Myo={z_myo}, W'={wp_kj}kJ): combining 5m + 12m in one session can depress 12m CP by 3-6% due to peripheral SR fatigue. "
+            "Prefer `--unit 2a` (fresh 12m) + 48-72h recovery + `--unit 2b` (fresh 5m) when a full test week is available."
+        )
 
 
 def cmd_coach(args):
@@ -4011,6 +4161,8 @@ def cmd_coach(args):
             grade_csv=getattr(args, "grade", None),
             morin_spec=getattr(args, "morin", None),
             re_spec=getattr(args, "re", None),
+            tau_w_mult_override=getattr(args, "tau_w_mult", None),
+            fit_tau_spec=getattr(args, "fit_tau", None),
         )
     elif action == "set-profile":
         _coach_set_profile(
@@ -4024,6 +4176,7 @@ def cmd_coach(args):
             creatine=getattr(args, "creatine", None),
             age=getattr(args, "age", None),
             sex=getattr(args, "sex", None),
+            tau_w_mult=getattr(args, "tau_w_mult", None),
             execute=args.execute,
         )
     elif action == "add-rule":
@@ -4036,7 +4189,15 @@ def cmd_coach(args):
             execute=args.execute,
         )
     elif action == "field-test":
-        _coach_field_test(root, brain, hk, unit=getattr(args, "unit", "1"), date_str=args.date, execute=args.execute)
+        _coach_field_test(
+            root,
+            brain,
+            hk,
+            unit=getattr(args, "unit", "1"),
+            date_str=args.date,
+            execute=args.execute,
+            depth_override=getattr(args, "depth", None),
+        )
     else:
         _coach_context(
             root,
@@ -5579,6 +5740,8 @@ def main():
     p.add_argument("--cp", type=float, default=None, help="optional CP override (W) for hypothetical `simulate` scenarios")
     p.add_argument("--w-prime", type=float, default=None, help="optional W' override (kJ) for hypothetical `simulate` scenarios")
     p.add_argument("--mass-kg", type=float, default=None, help="optional body mass override (kg) for hypothetical `simulate` scenarios")
+    p.add_argument("--tau-w-mult", type=float, default=None, help="individual Chorley W'-reconstitution multiplier (0.35-2.50) for `set-profile` or `simulate`")
+    p.add_argument("--fit-tau", help="invert 2-bout W'-reconstitution test into `tau_w_mult` in `simulate` (e.g. `3m=465,2m=150,3m=390`)")
     p.add_argument("--run-splits", help="running split times for OLS CS/D' bridge (e.g. `1k=3:20,3k=10:55,5k=18:29`)")
     p.add_argument("--grade", default=None, help="running grade decimal(s) for Minetti C_r(g) (e.g. `-0.12` or `0,-0.12,+0.12`)")
     p.add_argument("--morin", help="Morin leg-spring stiffness input(s) (e.g. `v=4.0,tc=0.22,tf=0.14;v=4.0,tc=0.26,tf=0.10`)")
@@ -5614,7 +5777,7 @@ def main():
     p.add_argument("--sport", help="sport filter (`cycling`, `running`, `strength`) for `history`")
     p.add_argument("--epoch-a", help="first date window `YYYY-MM-DD..YYYY-MM-DD` for `compare`")
     p.add_argument("--epoch-b", help="second date window `YYYY-MM-DD..YYYY-MM-DD` for `compare`")
-    p.add_argument("--unit", default="1", help="field-test protocol (`1`, `2`, `preload`, `lsct`) for `field-test`")
+    p.add_argument("--unit", default="1", help="field-test protocol (`1`, `1-std`, `reconst`, `2`, `2a`, `2b`, `preload`, `lsct`) for `field-test`")
     p.add_argument("--all-14d", action="store_true", help="compile all cycling workouts in the next 14 days")
     p.add_argument("--mock-file", help="offline Strava JSON fixture for `sync`")
     p.add_argument("--wellness-mock", help="offline Garmin/Intervals wellness JSON fixture for `sync`")

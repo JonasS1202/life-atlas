@@ -2276,6 +2276,29 @@ class UiReleaseV11(AtlasCase):
         self.assertIn("TRUE_VO2MAX_SEVERE", sim_ns)
         self.assertNotIn("UNPARSED DSL", sim_ns)
 
+        # 7. v1.4.8: Depth-adaptive Unit 1 (pro vs standard), Fast-Myotype 2a/2b split & `--fit-tau` / `--tau-w-mult`
+        ft_pro = self.atlas("coach", "field-test", "--unit", "1", "--depth", "pro", "--date", "2026-12-01").stdout
+        self.assertIn("3m/2m/3m W'-Reconstitution", ft_pro)
+        ft_std = self.atlas("coach", "field-test", "--unit", "1", "--depth", "standard", "--date", "2026-12-01").stdout
+        self.assertIn("15s Sprint & 3m All-Out Anchor", ft_std)
+        self.assertNotIn("3m/2m/3m", ft_std)
+        ft_2a = self.atlas("coach", "field-test", "--unit", "2a", "--date", "2026-12-03").stdout
+        self.assertIn("Fresh 12m All-Out CP Anchor", ft_2a)
+        ft_2b = self.atlas("coach", "field-test", "--unit", "2b", "--date", "2026-12-06").stdout
+        self.assertIn("Fresh 5m All-Out VO2max Roof", ft_2b)
+        ft_2_warn = self.atlas("coach", "field-test", "--unit", "2", "--date", "2026-12-03").stdout
+        self.assertIn("Fast-Myotype Advisory", ft_2_warn)
+
+        fit_out = self.atlas("coach", "simulate", "--fit-tau", "3m=468,2m=147,3m=385").stdout
+        self.assertIn("INDIVIDUAL W'-RECONSTITUTION CALIBRATION", fit_out)
+        self.assertIn("tau_w_mult=", fit_out)
+        self.atlas("coach", "set-profile", "--tau-w-mult", "1.18", "--execute")
+        prof_tau = self.read(os.path.join(self.brain, "coach", "profile.md"))
+        self.assertIn("tau_w_mult: 1.18", prof_tau)
+        self.assertIn("tau_w_date:", prof_tau)
+        ctx_tau = self.atlas("coach", "context", "--mode", "daily", "--depth", "pro", "--no-sync").stdout
+        self.assertIn("tau_mult=1.18x, profile", ctx_tau)
+
 
 if __name__ == "__main__":
     os.makedirs(BASE_DIR, exist_ok=True)

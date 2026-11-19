@@ -24,13 +24,16 @@ from .pillars_engine import (  # noqa: F401
     compute_morin_leg_stiffness,
     compute_running_effectiveness,
     compute_townsend_altitude,
+    detect_w_reconstitution_test,
     evaluate_workout_execution,
     expand_spec_to_1hz_watts,
     filter_power_spikes,
+    fit_tau_w_mult_from_bouts,
     format_seven_pillar_blocks,
     minetti_running_cost_j_kg_m,
     predict_omnipd_power,
     query_coach_history,
+    resolve_individual_tau_w_mult,
     simulate_workout_stream,
     solve_individual_interval_prescriptions,
     solve_running_cs_d_prime,
@@ -176,6 +179,8 @@ def parse_athlete_profile(profile_text: str, fallback_ftp: int | None = None, fa
         "has_explicit_ftp": False,
         "cp_w": None,
         "w_prime_kj": None,
+        "tau_w_mult": None,
+        "tau_w_date": None,
         "cs_mps": None,
         "d_prime_m": None,
         "lt2_pace_spk": None,
@@ -248,6 +253,18 @@ def parse_athlete_profile(profile_text: str, fallback_ftp: int | None = None, fa
     m_acc = re.search(r"(?im)^accountability\s*:\s*([a-z0-9_-]+)\b", profile_text)
     if m_acc:
         info["accountability"] = m_acc.group(1).lower()
+    m_tw = re.search(r"(?im)^tau_w_mult\s*:\s*(\d+(?:[.,]\d+)?)\s*x?\b", profile_text)
+    if m_tw:
+        try:
+            tw_v = float(m_tw.group(1).replace(",", "."))
+            if 0.35 <= tw_v <= 2.50:
+                info["tau_w_mult"] = round(tw_v, 2)
+                explicit_fields.add("tau_w_mult")
+        except ValueError:
+            pass
+    m_twd = re.search(r"(?im)^tau_w_date\s*:\s*(\d{4}-\d{2}-\d{2})\b", profile_text)
+    if m_twd:
+        info["tau_w_date"] = m_twd.group(1)
 
     in_rules = False
     for raw_line in profile_text.splitlines():
@@ -354,6 +371,20 @@ def parse_athlete_profile(profile_text: str, fallback_ftp: int | None = None, fa
             if m_off:
                 info["indoor_cp_offset_w"] = int(m_off.group(1))
                 explicit_fields.add("indoor_cp_offset_w")
+
+        elif "tau_w" in k_low or "w'-erholung" in k_low or "w' recovery" in k_low or "reconstitution" in k_low:
+            m_tw_t = re.search(r"(\d+(?:[.,]\d+)?)\s*x?\b", v_low)
+            if m_tw_t:
+                try:
+                    tw_v = float(m_tw_t.group(1).replace(",", "."))
+                    if 0.35 <= tw_v <= 2.50:
+                        info["tau_w_mult"] = round(tw_v, 2)
+                        explicit_fields.add("tau_w_mult")
+                except ValueError:
+                    pass
+            m_td_t = re.search(r"(\d{4}-\d{2}-\d{2})", full_row)
+            if m_td_t and not info.get("tau_w_date"):
+                info["tau_w_date"] = m_td_t.group(1)
 
         elif "coach" in k_low and ("stil" in k_low or "style" in k_low or "persona" in k_low or "ton" in k_low):
             if any(w in v_low for w in ("world-tour", "direkt", "direct", "strict", "fordernd", "hart")):
@@ -1338,6 +1369,9 @@ def compute_stream_metrics(
     cp_watts: float | None = None,
     w_prime_j: float | None = None,
     device_watts: bool | None = None,
+    title: str = "",
+    creatine_flag: bool | None = None,
+    tau_w_mult: float = 1.0,
 ) -> dict[str, Any]:
     """Full 0-token 1Hz stream analyzer for cycling & running.
 
@@ -1408,9 +1442,15 @@ def compute_stream_metrics(
         if dur_tiers:
             out["peaks_durability"] = dur_tiers
 
-        # Skiba W'bal + Chorley Dynamic Bi-Exponential W'bal 1Hz ODEs
+        # Skiba W'bal + Chorley Dynamic Bi-Exponential W'bal 1Hz ODEs + 3m/2m/3m Reconstitution Detection
         wbal = compute_skiba_w_bal(watts, cp_watts=eff_cp, w_prime_j=eff_wp)
-        chorley = pillars_engine.compute_chorley_w_bal(watts, cp_watts=eff_cp, w_prime_j=eff_wp)
+        chorley = pillars_engine.compute_chorley_w_bal(
+            watts,
+            cp_watts=eff_cp,
+            w_prime_j=eff_wp,
+            fc_fraction=(0.43 if creatine_flag is True else 0.40),
+            tau_mult=float(tau_w_mult or 1.0),
+        )
         if wbal.get("w_bal_min_pct") is not None:
             out["w_bal_min_pct"] = wbal["w_bal_min_pct"]
             out["matches_burned"] = wbal["matches_burned"]
@@ -1418,6 +1458,15 @@ def compute_stream_metrics(
         if chorley.get("w_bal_min_pct") is not None:
             out["w_bal_chorley_min_pct"] = chorley["w_bal_min_pct"]
             out["kj_sub_cp"] = chorley["kj_sub_cp"]
+        rec_test = pillars_engine.detect_w_reconstitution_test(
+            watts,
+            cp_watts=eff_cp,
+            w_prime_j=eff_wp,
+            creatine_flag=creatine_flag,
+            title=title,
+        )
+        if rec_test:
+            out["w_reconst_test"] = rec_test
 
         # Steady-state filtered Pw:Hr decoupling
         if len(hr) == n:
@@ -2534,9 +2583,28 @@ def build_coach_telemetry(
         creatine_flag=prof.get("creatine_flag"),
     )
     p3 = pillars_engine.compute_cp_see_and_omnipd(mmp_90d, cp_model)
-    tau_fc_50, tau_sc_50 = pillars_engine.chorley_recovery_taus(50.0)
-    p3["tau_fc_50pct_s"] = round(tau_fc_50, 1)
-    p3["tau_sc_50pct_s"] = round(tau_sc_50, 1)
+    tau_res = pillars_engine.resolve_individual_tau_w_mult(
+        profile=prof,
+        activities=sorted_acts,
+        cp_watts=float(eff_cp) if eff_cp else None,
+        w_prime_j=eff_wp_j,
+        creatine_flag=prof.get("creatine_flag"),
+        today=ref_today,
+    )
+    eff_base_tau = float(tau_res["tau_w_mult"])
+    tau_fc_50, tau_sc_50 = pillars_engine.chorley_recovery_taus(50.0, tau_mult=eff_base_tau)
+
+    def _attach_tau_fields(target_p3: dict[str, Any]) -> None:
+        target_p3["tau_fc_50pct_s"] = round(tau_fc_50, 1)
+        target_p3["tau_sc_50pct_s"] = round(tau_sc_50, 1)
+        target_p3["tau_w_mult"] = tau_res["tau_w_mult"]
+        target_p3["tau_w_source"] = tau_res["source"]
+        target_p3["tau_w_date"] = tau_res["date"]
+        target_p3["tau_w_age_days"] = tau_res["age_days"]
+        target_p3["tau_w_stale"] = bool(tau_res["stale"])
+        target_p3["tau_w_reconst_pct"] = tau_res.get("w2_reconst_pct")
+
+    _attach_tau_fields(p3)
 
     recent_k_leg = next(
         (float(a["run_k_leg_kn_m"]) for a in sorted_acts if str(a.get("sport") or "").lower() == "running" and a.get("run_k_leg_kn_m")),
@@ -2553,8 +2621,7 @@ def build_coach_telemetry(
     # Re-evaluate OmniPD decay fallback with Myotype Z-score when no 60m empirical anchor exists
     if p3.get("omni_decay_source") != "empirical_60m" and p4.get("myotype_z_score") is not None:
         p3 = pillars_engine.compute_cp_see_and_omnipd(mmp_90d, cp_model, myotype_z=p4.get("myotype_z_score"))
-        p3["tau_fc_50pct_s"] = round(tau_fc_50, 1)
-        p3["tau_sc_50pct_s"] = round(tau_sc_50, 1)
+        _attach_tau_fields(p3)
     p3_rx = pillars_engine.solve_individual_interval_prescriptions(
         cp_watts=float(eff_cp) if eff_cp else None,
         w_prime_j=eff_wp_j,
@@ -2563,6 +2630,7 @@ def build_coach_telemetry(
         p4_myotype=p4,
         mass_kg=body.get("mass_kg_7d"),
         creatine_flag=prof.get("creatine_flag"),
+        base_tau_w_mult=eff_base_tau,
     )
     p5 = pillars_engine.compute_pillar5_durability_and_tid(
         activities=sorted_acts,
@@ -2623,6 +2691,10 @@ def build_coach_telemetry(
         dna_snapshot=dna_snap,
         pillar5=p5,
         today=ref_today,
+        pillar3=p3,
+        pillar4=p4,
+        effective_w_prime_kj=round(eff_wp_j / 1000.0, 1) if eff_wp_j else None,
+        depth=depth,
     )
 
     return {

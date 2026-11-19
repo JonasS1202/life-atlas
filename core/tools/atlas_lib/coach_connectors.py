@@ -830,6 +830,7 @@ def sync_calendar_workouts_to_devices(
     p_5min_w: float | None = None,
     mass_kg: float | None = None,
     creatine_flag: bool | None = None,
+    base_tau_w_mult: float = 1.0,
 ) -> dict[str, Any]:
     """Compile `.zwo` + `.fit` files, run 1-Hz W'bal/VO2 Compiler-Guard, archive superseded files, and sync to devices."""
     ref_today = today or dt.date.today()
@@ -911,6 +912,7 @@ def sync_calendar_workouts_to_devices(
                     title=str(spec.get("title") or it.get("what") or ""),
                     work_block_watts=wb_arr,
                     creatine_flag=creatine_flag,
+                    base_tau_w_mult=base_tau_w_mult,
                 )
                 sim["date"] = d_iso
                 sim["title"] = str(spec.get("title") or "Workout")

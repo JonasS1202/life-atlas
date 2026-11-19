@@ -543,7 +543,7 @@ def predict_omnipd_power(
 def chorley_recovery_taus(pct_d_cp: float, tau_mult: float = 1.0) -> tuple[float, float]:
     """Chorley et al. (2023) bi-exponential `W'` recovery time constants `(tau_FC_s, tau_SC_s)`."""
     d_pct = max(0.0, min(100.0, float(pct_d_cp)))
-    mult = max(0.5, min(2.5, float(tau_mult or 1.0)))
+    mult = max(0.35, min(2.5, float(tau_mult or 1.0)))
     tau_fc = (45.0 * math.exp(-0.014 * d_pct) + 9999.0 * math.exp(-0.811 * d_pct)) * mult
     tau_sc = (9999.0 * math.exp(-0.098 * d_pct) + 429.0) * mult
     return tau_fc, tau_sc
@@ -637,6 +637,422 @@ def compute_chorley_w_bal(
         "kj_sub_cp": round(total_sub_j / 1000.0, 1),
         "tau_fc_50pct_s": round(tau_fc_50, 1),
         "tau_sc_50pct_s": round(tau_sc_50, 1),
+    }
+
+
+def fit_tau_w_mult_from_bouts(
+    b1_dur_s: float,
+    b1_avg_w: float,
+    rec_dur_s: float,
+    rec_avg_w: float,
+    b2_dur_s: float,
+    b2_avg_w: float,
+    cp_watts: float,
+    w_prime_j: float,
+    creatine_flag: bool | None = None,
+    b1_stream: list[float] | None = None,
+    rec_stream: list[float] | None = None,
+    b2_above_cp_j: float | None = None,
+) -> dict[str, Any]:
+    """Deterministically invert the 1-Hz Chorley bi-exponential `W'bal` ODE on a 2-bout maximal
+    reconstitution test (e.g. `3m All-Out + 2m Z1 + 3m All-Out`) to solve individual `tau_w_mult`.
+
+    Uses the exact same fast/slow pool split (`fc_frac = 0.43` with creatine, `0.40` without) and
+    depletion/recovery ODE as `simulate_workout_stream()` and `solve_individual_interval_prescriptions()`.
+    """
+    cp = float(cp_watts or 0.0)
+    wp = float(w_prime_j or 0.0)
+    if cp < 80.0 or wp < 4000.0:
+        return {"valid": False, "reason": "invalid_cp_w_prime"}
+    d1 = int(round(float(b1_dur_s or 0.0)))
+    dr = int(round(float(rec_dur_s or 0.0)))
+    d2 = int(round(float(b2_dur_s or 0.0)))
+    if d1 < 120 or d2 < 90 or not (30 <= dr <= 600):
+        return {"valid": False, "reason": "invalid_bout_durations"}
+
+    s1 = [max(0.0, float(w or 0.0)) for w in b1_stream] if b1_stream else [max(0.0, float(b1_avg_w or 0.0))] * d1
+    sr = [max(0.0, float(w or 0.0)) for w in rec_stream] if rec_stream else [max(0.0, float(rec_avg_w or 0.0))] * dr
+    rec_mean = (sum(sr) / len(sr)) if sr else float(rec_avg_w or 0.0)
+    if rec_mean >= 0.90 * cp:
+        return {"valid": False, "reason": "recovery_too_hard_ge_90pct_cp"}
+
+    w1_obs_j = sum(max(0.0, w - cp) for w in s1)
+    w2_obs_j = float(b2_above_cp_j) if b2_above_cp_j is not None else max(0.0, float(b2_avg_w or 0.0) - cp) * d2
+    if w1_obs_j < 0.70 * wp:
+        return {
+            "valid": False,
+            "reason": f"bout1_submaximal ({round((w1_obs_j / wp) * 100.0, 1)}% W' < 70% gate)",
+        }
+    if w2_obs_j < 0.15 * wp or w2_obs_j > 0.98 * wp:
+        return {
+            "valid": False,
+            "reason": f"bout2_out_of_range ({round((w2_obs_j / wp) * 100.0, 1)}% W')",
+        }
+
+    fc_frac = 0.43 if creatine_flag is True else 0.40
+    fc_amp = fc_frac * wp
+    sc_amp = (1.0 - fc_frac) * wp
+
+    def _pred_w_avail(mult: float) -> float:
+        fc_bal = fc_amp
+        sc_bal = sc_amp
+        for p in s1:
+            if p > cp:
+                burn = p - cp
+                take_fc = min(fc_bal, burn * 0.65)
+                rem = burn - take_fc
+                take_sc = min(sc_bal, rem)
+                leftover = rem - take_sc
+                if leftover > 0.0:
+                    take_fc = min(fc_bal, take_fc + leftover)
+                fc_bal = max(0.0, min(fc_amp, fc_bal - take_fc))
+                sc_bal = max(0.0, min(sc_amp, sc_bal - take_sc))
+            else:
+                pct_d = max(0.0, min(100.0, ((cp - p) / cp) * 100.0))
+                t_fc, t_sc = chorley_recovery_taus(pct_d, tau_mult=mult)
+                fc_bal = max(0.0, min(fc_amp, fc_amp - (fc_amp - fc_bal) * math.exp(-1.0 / max(15.0, t_fc))))
+                sc_bal = max(0.0, min(sc_amp, sc_amp - (sc_amp - sc_bal) * math.exp(-1.0 / max(60.0, t_sc))))
+        for p in sr:
+            if p > cp:
+                burn = p - cp
+                take_fc = min(fc_bal, burn * 0.65)
+                rem = burn - take_fc
+                take_sc = min(sc_bal, rem)
+                leftover = rem - take_sc
+                if leftover > 0.0:
+                    take_fc = min(fc_bal, take_fc + leftover)
+                fc_bal = max(0.0, min(fc_amp, fc_bal - take_fc))
+                sc_bal = max(0.0, min(sc_amp, sc_bal - take_sc))
+            else:
+                pct_d = max(0.0, min(100.0, ((cp - p) / cp) * 100.0))
+                t_fc, t_sc = chorley_recovery_taus(pct_d, tau_mult=mult)
+                fc_bal = max(0.0, min(fc_amp, fc_amp - (fc_amp - fc_bal) * math.exp(-1.0 / max(15.0, t_fc))))
+                sc_bal = max(0.0, min(sc_amp, sc_amp - (sc_amp - sc_bal) * math.exp(-1.0 / max(60.0, t_sc))))
+        return fc_bal + sc_bal
+
+    lo, hi = 0.35, 2.50
+    pred_fast = _pred_w_avail(lo)
+    pred_slow = _pred_w_avail(hi)
+    pred_def = _pred_w_avail(1.0)
+    clamped = False
+    warnings_l: list[str] = []
+
+    if w1_obs_j > 1.25 * wp:
+        warnings_l.append(
+            f"Bout 1 burned {round((w1_obs_j / wp) * 100.0, 1)}% of current W' — update CP/W' anchors first"
+        )
+
+    if w2_obs_j >= pred_fast:
+        best_mult = lo
+        clamped = True
+        warnings_l.append(
+            f"Reconstitution {round((w2_obs_j / wp) * 100.0, 1)}% exceeds fast bound ({round((pred_fast / wp) * 100.0, 1)}% @ {lo}x) — check if CP is underestimated"
+        )
+    elif w2_obs_j <= pred_slow:
+        best_mult = hi
+        clamped = True
+        warnings_l.append(
+            f"Reconstitution {round((w2_obs_j / wp) * 100.0, 1)}% below slow bound ({round((pred_slow / wp) * 100.0, 1)}% @ {hi}x) — check Bout 2 exhaustion or peripheral fatigue"
+        )
+    else:
+        for _ in range(40):
+            mid = 0.5 * (lo + hi)
+            if _pred_w_avail(mid) > w2_obs_j:
+                lo = mid
+            else:
+                hi = mid
+        best_mult = 0.5 * (lo + hi)
+
+    best_mult_r = round(best_mult, 2)
+    tau_fc_50, tau_sc_50 = chorley_recovery_taus(50.0, tau_mult=best_mult_r)
+    conf = "high" if (w1_obs_j >= 0.85 * wp and not clamped and not warnings_l) else "medium"
+    return {
+        "valid": True,
+        "tau_w_mult": best_mult_r,
+        "tau_fc_50pct_s": round(tau_fc_50, 1),
+        "tau_sc_50pct_s": round(tau_sc_50, 1),
+        "w1_depletion_pct": round((w1_obs_j / wp) * 100.0, 1),
+        "w2_reconst_pct": round((w2_obs_j / wp) * 100.0, 1),
+        "pred_reconst_pct_default": round((pred_def / wp) * 100.0, 1),
+        "rec_dur_s": dr,
+        "rec_pct_cp": round((rec_mean / cp) * 100.0, 1),
+        "clamped": clamped,
+        "warning": "; ".join(warnings_l) if warnings_l else None,
+        "confidence": conf,
+    }
+
+
+def detect_w_reconstitution_test(
+    watts: list[float],
+    cp_watts: float,
+    w_prime_j: float,
+    creatine_flag: bool | None = None,
+    title: str = "",
+) -> dict[str, Any] | None:
+    """Detect a maximal 2-bout `W'`-reconstitution field test (e.g. `3m All-Out + 2m Z1 + 3m All-Out`)
+    inside a 1-Hz cycling power stream, with strict multi-set interval rejection (`4x3m`, etc.).
+
+    Stores raw bout averages/durations so Stage 1 can dynamically re-solve `tau_w_mult` whenever
+    90-day `(CP, W')` updates across the season.
+    """
+    cp = float(cp_watts or 0.0)
+    wp = float(w_prime_j or 0.0)
+    n = len(watts or [])
+    if n < 360 or cp < 80.0 or wp < 4000.0:
+        return None
+
+    clean = [max(0.0, float(w or 0.0)) for w in watts]
+    # 10s rolling mean to cleanly segment supra-CP bouts without micro-noise splits
+    win = 10
+    pref = [0.0] * (n + 1)
+    for i, w in enumerate(clean):
+        pref[i + 1] = pref[i] + w
+    p10 = [(pref[min(n, i + 1)] - pref[max(0, i + 1 - win)]) / min(win, i + 1) for i in range(n)]
+
+    # Build contiguous bouts where p10 >= 0.98 * CP, bridging dips <= 8s
+    raw_bouts: list[list[int]] = []
+    in_b = False
+    st = 0
+    for i, v in enumerate(p10):
+        if v >= 0.98 * cp:
+            if not in_b:
+                st = i
+                in_b = True
+        else:
+            if in_b:
+                raw_bouts.append([st, i])
+                in_b = False
+    if in_b:
+        raw_bouts.append([st, n])
+
+    merged: list[list[int]] = []
+    for seg in raw_bouts:
+        if merged and (seg[0] - merged[-1][1]) <= 8:
+            merged[-1][1] = seg[1]
+        else:
+            merged.append(seg)
+
+    # Snap each bout's start/end to exact 1-second supra-CP boundaries (eliminates rolling-window lag)
+    bouts: list[dict[str, Any]] = []
+    for s0, e0 in merged:
+        while s0 > 0 and clean[s0 - 1] >= cp:
+            s0 -= 1
+        while s0 < e0 and clean[s0] < cp:
+            s0 += 1
+        while e0 < n and clean[e0] >= cp:
+            e0 += 1
+        while e0 > s0 and clean[e0 - 1] < cp:
+            e0 -= 1
+        dur = e0 - s0
+        if dur < 105 or dur > 270:
+            continue
+        sub = clean[s0:e0]
+        w_above = sum(max(0.0, w - cp) for w in sub)
+        if w_above < 0.20 * wp:
+            continue
+        bouts.append({
+            "start": s0,
+            "end": e0,
+            "dur": dur,
+            "avg_w": sum(sub) / dur,
+            "w_above_j": w_above,
+        })
+
+    if len(bouts) < 2:
+        return None
+
+    low_title = str(title or "").lower()
+    title_hint = any(k in low_title for k in ("reconst", "tau", "field-test", "field test", "3m/2m/3m", "3m+2m+3m", "unit 1"))
+    min_b1_dur = 120 if title_hint else 150
+
+    best_cand: tuple[float, dict[str, Any]] | None = None
+    for idx in range(len(bouts) - 1):
+        b1 = bouts[idx]
+        b2 = bouts[idx + 1]
+        if not (min_b1_dur <= b1["dur"] <= 240):
+            continue
+        if not (105 <= b2["dur"] <= 240):
+            continue
+        if b1["w_above_j"] < 0.70 * wp:
+            continue
+        if not (0.25 * wp <= b2["w_above_j"] <= 0.95 * wp):
+            continue
+        rec_s = b2["start"] - b1["end"]
+        if not (60 <= rec_s <= 300):
+            continue
+        rec_seg = clean[b1["end"]:b2["start"]]
+        rec_avg = sum(rec_seg) / len(rec_seg)
+        if rec_avg > 0.80 * cp:
+            continue
+
+        # Anti-false-positive multi-set interval guard: reject 3x3m / 4x3m workouts
+        has_prev_set = (
+            idx > 0
+            and (b1["start"] - bouts[idx - 1]["end"]) <= 600
+            and bouts[idx - 1]["w_above_j"] >= 0.30 * wp
+        )
+        has_next_set = (
+            (idx + 2) < len(bouts)
+            and (bouts[idx + 2]["start"] - b2["end"]) <= 600
+            and bouts[idx + 2]["w_above_j"] >= 0.30 * wp
+        )
+        if has_prev_set or has_next_set:
+            continue
+
+        fit = fit_tau_w_mult_from_bouts(
+            b1_dur_s=b1["dur"],
+            b1_avg_w=b1["avg_w"],
+            rec_dur_s=rec_s,
+            rec_avg_w=rec_avg,
+            b2_dur_s=b2["dur"],
+            b2_avg_w=b2["avg_w"],
+            cp_watts=cp,
+            w_prime_j=wp,
+            creatine_flag=creatine_flag,
+            b1_stream=clean[b1["start"]:b1["end"]],
+            rec_stream=rec_seg,
+            b2_above_cp_j=b2["w_above_j"],
+        )
+        if not fit.get("valid"):
+            continue
+
+        score = b1["w_above_j"] + (0.25 * wp if title_hint else 0.0)
+        rec_obj = {
+            "b1_dur_s": int(b1["dur"]),
+            "b1_avg_w": round(b1["avg_w"], 1),
+            "rec_dur_s": int(rec_s),
+            "rec_avg_w": round(rec_avg, 1),
+            "b2_dur_s": int(b2["dur"]),
+            "b2_avg_w": round(b2["avg_w"], 1),
+            "w1_depletion_pct": fit["w1_depletion_pct"],
+            "w2_reconst_pct": fit["w2_reconst_pct"],
+            "tau_w_mult_at_sync": fit["tau_w_mult"],
+            "confidence": fit["confidence"],
+            "clamped": bool(fit.get("clamped")),
+            "title_hint": title_hint,
+        }
+        if best_cand is None or score > best_cand[0]:
+            best_cand = (score, rec_obj)
+
+    return best_cand[1] if best_cand else None
+
+
+def resolve_individual_tau_w_mult(
+    profile: dict[str, Any] | None,
+    activities: list[dict[str, Any]] | None,
+    cp_watts: float | None,
+    w_prime_j: float | None,
+    creatine_flag: bool | None = None,
+    today: dt.date | None = None,
+    stale_after_days: int = 90,
+) -> dict[str, Any]:
+    """Resolve active individual `tau_w_mult` with seasonal freshness tracking.
+
+    Priority:
+      1. Re-solves any detected `w_reconst_test` in recent cycling activities (`<= 150d`) against the
+         CURRENT 90-day `(CP, W')` so seasonal CP/W' updates automatically keep `tau_w_mult` consistent.
+      2. Compares against explicit `tau_w_mult` (+ optional `tau_w_date`) in `coach/profile.md`;
+         the newer dated calibration wins.
+      3. Falls back cleanly to `1.0` (`population_default`, Chorley 2023) when uncalibrated.
+    """
+    ref_today = today or dt.date.today()
+    prof = profile or {}
+
+    def _parse_iso(d_val: Any) -> dt.date | None:
+        s = str(d_val or "")[:10]
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
+            try:
+                return dt.date.fromisoformat(s)
+            except ValueError:
+                return None
+        return None
+
+    # 1. Latest valid stream reconstitution test within 150 days (re-solved against current CP/W')
+    stream_cand: dict[str, Any] | None = None
+    if cp_watts and float(cp_watts) >= 80.0 and w_prime_j and float(w_prime_j) >= 4000.0:
+        sorted_acts = sorted(
+            [a for a in (activities or []) if isinstance(a, dict) and isinstance(a.get("w_reconst_test"), dict)],
+            key=lambda x: str(x.get("date") or ""),
+            reverse=True,
+        )
+        for act in sorted_acts:
+            d_act = _parse_iso(act.get("date"))
+            if d_act is None:
+                continue
+            age = (ref_today - d_act).days
+            if age < -1 or age > 150:
+                continue
+            rt = act["w_reconst_test"]
+            fit = fit_tau_w_mult_from_bouts(
+                b1_dur_s=rt.get("b1_dur_s", 0),
+                b1_avg_w=rt.get("b1_avg_w", 0),
+                rec_dur_s=rt.get("rec_dur_s", 0),
+                rec_avg_w=rt.get("rec_avg_w", 0),
+                b2_dur_s=rt.get("b2_dur_s", 0),
+                b2_avg_w=rt.get("b2_avg_w", 0),
+                cp_watts=float(cp_watts),
+                w_prime_j=float(w_prime_j),
+                creatine_flag=creatine_flag,
+            )
+            if fit.get("valid"):
+                stream_cand = {
+                    "tau_w_mult": fit["tau_w_mult"],
+                    "source": "reconstitution_test",
+                    "date": d_act.isoformat(),
+                    "date_obj": d_act,
+                    "age_days": max(0, age),
+                    "stale": age > stale_after_days,
+                    "w2_reconst_pct": fit["w2_reconst_pct"],
+                    "confidence": fit["confidence"],
+                    "warning": fit.get("warning"),
+                }
+                break
+
+    # 2. Explicit profile override (`tau_w_mult` + optional `tau_w_date`)
+    prof_cand: dict[str, Any] | None = None
+    raw_pm = prof.get("tau_w_mult")
+    if raw_pm is not None:
+        try:
+            pm = max(0.35, min(2.50, float(raw_pm)))
+            d_prof = _parse_iso(prof.get("tau_w_date"))
+            age_p = max(0, (ref_today - d_prof).days) if d_prof else None
+            prof_cand = {
+                "tau_w_mult": round(pm, 2),
+                "source": "profile",
+                "date": d_prof.isoformat() if d_prof else None,
+                "date_obj": d_prof,
+                "age_days": age_p,
+                "stale": bool(age_p is not None and age_p > stale_after_days),
+                "w2_reconst_pct": None,
+                "confidence": "manual",
+                "warning": None,
+            }
+        except (TypeError, ValueError):
+            prof_cand = None
+
+    chosen: dict[str, Any] | None = None
+    if stream_cand and prof_cand:
+        if prof_cand["date_obj"] and prof_cand["date_obj"] >= stream_cand["date_obj"]:
+            chosen = prof_cand
+        else:
+            chosen = stream_cand
+    elif stream_cand:
+        chosen = stream_cand
+    elif prof_cand:
+        chosen = prof_cand
+
+    if chosen:
+        chosen.pop("date_obj", None)
+        return chosen
+    return {
+        "tau_w_mult": 1.0,
+        "source": "population_default",
+        "date": None,
+        "age_days": None,
+        "stale": False,
+        "w2_reconst_pct": None,
+        "confidence": "default",
+        "warning": None,
     }
 
 
@@ -748,6 +1164,7 @@ def compute_effective_cp_w_prime(
     indoor: bool = False,
     indoor_cp_offset_w: float = -19.0,
     drivetrain_loss_pct: float = 0.0,
+    base_tau_w_mult: float = 1.0,
 ) -> dict[str, float]:
     """Apply intensity-weighted pre-fatigue (`w_sub` vs. `w_sup` + sex scaling), daily form (`form_pct`),
     Townsend altitude, heat/acclimatization, indoor physiology offset, and drivetrain loss to `(CP, W')`."""
@@ -793,16 +1210,18 @@ def compute_effective_cp_w_prime(
     wp_eff = wp_base * (1.0 - sub_wp_drop) * (1.0 - sup_wp_drop)
 
     # 2. Townsend 2-Segment Altitude (`CP` >1500m, `W'` 100% up to 2760m, `tau_W'` 1.35-1.50x at 3000m)
-    tau_w_mult = 1.0
+    base_tau = max(0.35, min(2.5, float(base_tau_w_mult or 1.0)))
+    alt_tau_mult = 1.0
     alt_cp_loss_pct = 0.0
     alt_wp_pct = 100.0
     if elev_m and float(elev_m) > 1500.0:
         tw = compute_townsend_altitude(float(elev_m), cp_eff, wp_eff / 1000.0)
         alt_cp_loss_pct = float(tw.get("cp_loss_pct") or 0.0)
         alt_wp_pct = float(tw.get("w_prime_pct") or 100.0)
-        tau_w_mult = float(tw.get("tau_w_altitude_mult") or 1.0)
+        alt_tau_mult = float(tw.get("tau_w_altitude_mult") or 1.0)
         cp_eff *= (1.0 - alt_cp_loss_pct / 100.0)
         wp_eff *= (alt_wp_pct / 100.0)
+    tau_w_mult = max(0.35, min(2.5, base_tau * alt_tau_mult))
 
     # 3. Heat Stress & 14-day Heat Acclimatization (`-0.5%/°C` >25°C unacclimatized)
     heat_cp_loss_pct = 0.0
@@ -861,6 +1280,7 @@ def simulate_workout_stream(
     indoor_cp_offset_w: float = -19.0,
     drivetrain_loss_pct: float = 0.0,
     tau_w_mult: float | None = None,
+    base_tau_w_mult: float = 1.0,
 ) -> dict[str, Any]:
     """1-Hz deterministic Chorley bi-exponential `W'bal` (`W'_FC` + `W'_SC`), 1st-order `VO2(t)` kinetics
     with severe-domain slow component, intensity-weighted pre-fatigue `(w_sub, w_sup, cho_g_h, sex)`,
@@ -886,6 +1306,7 @@ def simulate_workout_stream(
         indoor=indoor,
         indoor_cp_offset_w=indoor_cp_offset_w,
         drivetrain_loss_pct=drivetrain_loss_pct,
+        base_tau_w_mult=base_tau_w_mult,
     )
     cp_eff = eff["cp_eff_w"]
     wp_eff = eff["wp_eff_j"]
@@ -1053,6 +1474,7 @@ def solve_individual_interval_prescriptions(
     indoor: bool = False,
     indoor_cp_offset_w: float = -19.0,
     drivetrain_loss_pct: float = 0.0,
+    base_tau_w_mult: float = 1.0,
 ) -> dict[str, Any]:
     """Constrained 1-Hz inverse `W'bal` + `VO2(t)` prescription solver individualized to `(CP, W', vLamax_met, Z_Myo)`
     with intensity-weighted pre-fatigue `(prior_kj, prior_sup_kj, cho_g_h, sex)`, environment/hardware offsets,
@@ -1092,6 +1514,7 @@ def solve_individual_interval_prescriptions(
         indoor=indoor,
         indoor_cp_offset_w=indoor_cp_offset_w,
         drivetrain_loss_pct=drivetrain_loss_pct,
+        base_tau_w_mult=base_tau_w_mult,
     )
     cp = eff["cp_eff_w"]
     wp = eff["wp_eff_j"]
@@ -2205,6 +2628,10 @@ def audit_missing_inputs_and_questions(
     dna_snapshot: dict[str, Any] | None,
     pillar5: dict[str, Any] | None = None,
     today: dt.date | None = None,
+    pillar3: dict[str, Any] | None = None,
+    pillar4: dict[str, Any] | None = None,
+    effective_w_prime_kj: float | None = None,
+    depth: str = "standard",
 ) -> dict[str, Any]:
     """Build Missing-Data Gate (`0_missing`), Autonomy Actions (`1_autonomy`), Accountability & Question Radar."""
     ref_today = today or dt.date.today()
@@ -2257,16 +2684,47 @@ def audit_missing_inputs_and_questions(
             "ask": "Supplementierst du aktuell Kreatin (ja/nein)?",
         })
 
-    # Field-test anchor calibration checks
+    # Field-test anchor calibration checks (Myotype- & depth-adaptive)
     calibration_gaps: list[str] = []
+    p3_k = pillar3 or {}
+    p4_m = pillar4 or {}
+    z_myo = p4_m.get("myotype_z_score")
+    wp_kj = effective_w_prime_kj if effective_w_prime_kj is not None else cp_model.get("w_prime_kj")
+    is_fast_myo = bool(
+        (z_myo is not None and float(z_myo) > 0.5)
+        or (wp_kj is not None and float(wp_kj) >= 24.0)
+    )
+    eff_depth = str(depth or "standard").lower()
+    u1_desc = "Unit 1 (Pro: 15s + 3m/2m/3m W'-Reconstitution)" if eff_depth == "pro" else "Unit 1 (15s + 3m All-Out)"
+
     if is_cyclist and not cp_model.get("valid"):
-        calibration_gaps.append(
-            f"CP/W' uncalibrated ({cp_model.get('quality_flag')}): schedule Field-Test Unit 2 (5m + 12m All-Out) or Unit 1 (15s + 3m)."
-        )
+        if is_fast_myo:
+            calibration_gaps.append(
+                f"CP/W' uncalibrated ({cp_model.get('quality_flag')}) & Fast Myotype (Z_Myo={z_myo}, W'={wp_kj}kJ): "
+                f"use 3-day test split (`--unit 1` [{u1_desc}] -> 48h -> `--unit 2a` [fresh 12m] -> 48-72h -> `--unit 2b` [fresh 5m]) "
+                "— do NOT combine 5m + 12m in one session (peripheral SR fatigue suppresses 12m by 3-6%)."
+            )
+        else:
+            calibration_gaps.append(
+                f"CP/W' uncalibrated ({cp_model.get('quality_flag')}): schedule Field-Test `--unit 2` (5m + 32m Z1 + 12m) or `--unit 1` ({u1_desc}); "
+                "for maximum accuracy in a full diagnostic week, split `--unit 2a` (12m) and `--unit 2b` (5m) across separate days."
+            )
     if is_cyclist and pillar2.get("sprint_anchor_status") in ("missing", "passive_lower_bound"):
         calibration_gaps.append(
-            "No true 15s maximal seated sprint anchor in recent data -> schedule Field-Test Unit 1 (6s C_max + 15s All-Out Sprint)."
+            f"No true 15s maximal seated sprint anchor in recent data -> schedule Field-Test {u1_desc} (`--unit 1`)."
         )
+    if is_cyclist and eff_depth == "pro" and cp_model.get("valid"):
+        tw_src = str(p3_k.get("tau_w_source") or "population_default")
+        if p3_k.get("tau_w_stale"):
+            calibration_gaps.append(
+                f"Individual `tau_w_mult` ({p3_k.get('tau_w_mult')}x, from {p3_k.get('tau_w_date')}, {p3_k.get('tau_w_age_days')}d old >90d) is STALE "
+                "-> re-calibrate in the next diagnostic week via `--unit 1` (Pro: 3m/2m/3m) or `coach simulate --fit-tau` as seasonal fitness progresses."
+            )
+        elif tw_src == "population_default":
+            calibration_gaps.append(
+                "Individual `tau_w_mult` uncalibrated (using Chorley 2023 population default 1.00x) "
+                "-> in `pro` mode, schedule `--unit 1` (15s + 3m/2m/3m W'-Reconstitution) or fit via `coach simulate --fit-tau` to individualize W'bal recovery."
+            )
     if is_cyclist and pillar5 and pillar5.get("durability_25kj_status") == "submax_untested":
         v15_drop = pillar5.get("verified_drop_15kj_pct")
         v15_note = f" (verified >15 kJ/kg drop is only {v15_drop}%!)" if v15_drop is not None else ""
@@ -2521,11 +2979,21 @@ def format_seven_pillar_blocks(telemetry: dict[str, Any], include_actions: bool 
             )
         if cp_m.get("cp_w") or telemetry.get("effective_cp_w"):
             omni_tag = f" ({p3.get('omni_decay_source')})" if p3.get("omni_decay_source") else ""
+            tw_m = p3.get("tau_w_mult")
+            tw_src = str(p3.get("tau_w_source") or "population_default")
+            tw_d = p3.get("tau_w_date")
+            tw_stale = " STALE >90d" if p3.get("tau_w_stale") else ""
+            if tw_src == "reconstitution_test":
+                tw_tag = f" [tau_mult={tw_m}x, test {tw_d}{tw_stale}]"
+            elif tw_src == "profile":
+                tw_tag = f" [tau_mult={tw_m}x, profile{(' ' + str(tw_d)) if tw_d else ''}{tw_stale}]"
+            else:
+                tw_tag = f" [tau_mult={tw_m or 1.0}x, default]"
             lines.append(
                 f"  [3_kinetics S3] CP={cp_m.get('cp_w') or telemetry.get('effective_cp_w')}W (SEE={p3.get('see_cp_pct') or '—'}%) | "
                 f"W'={cp_m.get('w_prime_kj') or telemetry.get('effective_w_prime_kj') or '—'}kJ | "
                 f"MPR={p3.get('mpr_w') or '—'}W | OmniPD_A={p3.get('omni_decay_a_w') or '—'}W{omni_tag} | "
-                f"Chorley tau_FC(50%CP)={p3.get('tau_fc_50pct_s') or 22.3}s, tau_SC={p3.get('tau_sc_50pct_s') or 503.5}s"
+                f"Chorley tau_FC(50%CP)={p3.get('tau_fc_50pct_s') or 22.3}s, tau_SC={p3.get('tau_sc_50pct_s') or 503.5}s{tw_tag}"
             )
         if p3_rx:
             op = p3_rx.get("re_entry_opener") or {}

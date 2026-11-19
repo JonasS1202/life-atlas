@@ -2,6 +2,16 @@
 
 Written for users: `/atlas-update` shows the sections between the installed and the new version.
 
+## [1.4.8] - 2026-11-19
+
+- **Individual `tau_w_mult` W'-Reconstitution Calibration & Seasonal Updates (`pillars_engine.py`, `coach_engine.py`, `coach_connectors.py`, `atlas.py`, `coach.md`):**
+  - **Exact 1-Hz Inverse Chorley Solver (`fit_tau_w_mult_from_bouts`):** Deterministically inverts the 1-Hz bi-exponential Chorley ODE (`W'_FC` + `W'_SC` with `creatine_flag` pool split) on 2-bout maximal reconstitution tests (`3m All-Out + 2m Z1 + 3m All-Out`) to calibrate an individual `tau_w_mult` (`0.35–2.50x`), exposed directly via `atlas.py coach simulate --fit-tau "3m=...,2m=...,3m=..."` and `atlas.py coach set-profile --tau-w-mult <val> --execute`.
+  - **Automatic Stream Detection & Dynamic Seasonal Re-Solve:** `compute_stream_metrics()` detects genuine 2-bout maximal reconstitution tests on 1-Hz cycling streams (with a multi-set interval guard rejecting normal `3x3m`/`4x3m` workouts) and stores the raw bout anchors so Stage 1 automatically re-solves `tau_w_mult` whenever 90-day `(CP, W')` updates across the season. Calibrations older than `90` days are flagged `STALE >90d` in `pro` mode; legacy profiles without `tau_w_mult` default cleanly to `1.00x` (100% backwards-compatible).
+  - **Full Pipeline Propagation:** Individual `tau_w_mult` multiplies cleanly with Townsend altitude hypoxia (`base_tau_w_mult * tau_w_altitude_mult`) across `[3_kinetics S3]`, `[3B_prescriptions]` (30/15s Float/Classic, Hard-Start 4x4m, 1:4 Shuttle), `coach simulate`, and the `coach push` 1-Hz Compiler-Guard.
+- **Depth-Adaptive `Unit 1` & Fast-Myotype 3-Day Field-Test Split (`atlas.py`, `pillars_engine.py`, `coach.md`):**
+  - **Depth-Adaptive `Unit 1`:** `atlas.py coach field-test --unit 1` automatically schedules `15s + 3m/2m/3m` (`W'`-Reconstitution) in `pro` mode and the streamlined `15s + 1x 3m All-Out` in `standard` mode (explicit overrides `--unit 1-std` and `--unit reconst` / `1-pro` always available).
+  - **Fast-Myotype 3-Day Test Split (`--unit 2a` & `--unit 2b`):** Adds fresh single-anchor protocols `--unit 2a` (`12m` CP anchor) and `--unit 2b` (`5m` VO2max roof). Whenever `Z_Myo > +0.5` or `W' >= 24 kJ`, the Calibration Gate (and a `--unit 2` advisory) automatically recommends the 3-day split (`Unit 1 -> 48h -> Unit 2a -> 48-72h -> Unit 2b`) instead of combining `5m + 12m` in one session (preventing 3–6% peripheral SR-fatigue suppression on the 12m anchor).
+
 ## [1.4.7] - 2026-11-19
 
 - **Complete 7-Pillar Physics Core Migration & Zero-Ad-Hoc `coach simulate` (`pillars_engine.py`, `coach_engine.py`, `atlas.py`, `coach.md`):**

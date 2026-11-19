@@ -481,5 +481,142 @@ class TestBlock5RunningBridgeRedsAndReadinessOverrides(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class TestBlock6TauReconstitutionAndMyotypeSplit(unittest.TestCase):
+    """Block 6: Exact inverse `tau_w_mult` calibration, stream detection, seasonal re-solve & Fast-Myotype 3-day test split."""
+
+    def test_fit_tau_w_mult_exact_roundtrip_and_guards(self):
+        cp, wp = 300.0, 30000.0
+        for true_mult in (0.65, 1.00, 1.45):
+            # Forward-simulate exact Chorley ODE for 180s all-out + 120s @ 50% CP
+            fc_amp = 0.43 * wp
+            sc_amp = 0.57 * wp
+            fc_bal, sc_bal = 0.0, 0.0  # fully depleted at end of 180s all-out
+            t_fc, t_sc = pe.chorley_recovery_taus(50.0, tau_mult=true_mult)
+            for _ in range(120):
+                fc_bal = fc_amp - (fc_amp - fc_bal) * math.exp(-1.0 / max(15.0, t_fc))
+                sc_bal = sc_amp - (sc_amp - sc_bal) * math.exp(-1.0 / max(60.0, t_sc))
+            w_avail = fc_bal + sc_bal
+            b2_avg = cp + w_avail / 180.0
+            fit = pe.fit_tau_w_mult_from_bouts(
+                b1_dur_s=180,
+                b1_avg_w=cp + wp / 180.0,
+                rec_dur_s=120,
+                rec_avg_w=0.50 * cp,
+                b2_dur_s=180,
+                b2_avg_w=b2_avg,
+                cp_watts=cp,
+                w_prime_j=wp,
+                creatine_flag=True,
+            )
+            self.assertTrue(fit["valid"], fit)
+            self.assertAlmostEqual(fit["tau_w_mult"], true_mult, delta=0.02, msg=f"mult={true_mult}: {fit}")
+            self.assertFalse(fit["clamped"])
+            self.assertEqual(fit["confidence"], "high")
+
+        # Submaximal Bout 1 (<70% W') must be rejected
+        bad = pe.fit_tau_w_mult_from_bouts(180, 340.0, 120, 150.0, 180, 340.0, cp_watts=cp, w_prime_j=wp)
+        self.assertFalse(bad["valid"])
+        self.assertIn("bout1_submaximal", bad["reason"])
+
+    def test_detect_stream_reconstitution_and_reject_multiset_intervals(self):
+        cp, wp = 300.0, 28000.0
+        # Genuine Unit 1 (Pro): 15m WU + 15s sprint + 20m Z1 + 3m All-Out + 2m Z1 + 3m All-Out + 10m CD
+        b1_w = cp + wp / 180.0
+        b2_w = cp + (0.60 * wp) / 180.0
+        pro_stream = (
+            [180.0] * 900
+            + [950.0] * 15
+            + [150.0] * 1200
+            + [b1_w] * 180
+            + [150.0] * 120
+            + [b2_w] * 180
+            + [150.0] * 600
+        )
+        det = pe.detect_w_reconstitution_test(pro_stream, cp_watts=cp, w_prime_j=wp, creatine_flag=True, title="Field-Test Unit 1 (Pro)")
+        self.assertIsNotNone(det)
+        self.assertEqual(det["b1_dur_s"], 180)
+        self.assertEqual(det["rec_dur_s"], 120)
+        self.assertEqual(det["b2_dur_s"], 180)
+        self.assertLess(det["tau_w_mult_at_sync"], 0.90)
+
+        # Normal 4x3m interval workout MUST NOT trigger false-positive reconstitution detection
+        iv_stream = [180.0] * 600
+        for _ in range(4):
+            iv_stream += [cp + 0.78 * wp / 180.0] * 180 + [150.0] * 180
+        iv_stream += [150.0] * 600
+        self.assertIsNone(pe.detect_w_reconstitution_test(iv_stream, cp_watts=cp, w_prime_j=wp, title="4x3m VO2max"))
+
+    def test_seasonal_resolve_staleness_and_altitude_multiplication(self):
+        today = dt.date(2026, 12, 15)
+        cp, wp = 300.0, 30000.0
+        # Legacy profile without tau_w_mult defaults cleanly to 1.0
+        def_res = pe.resolve_individual_tau_w_mult({}, [], cp_watts=cp, w_prime_j=wp, today=today)
+        self.assertEqual(def_res["tau_w_mult"], 1.0)
+        self.assertEqual(def_res["source"], "population_default")
+        self.assertFalse(def_res["stale"])
+
+        # Recent stream test dynamically re-solves against current CP/W' and beats stale profile
+        acts = [{
+            "date": "2026-12-01",
+            "w_reconst_test": {
+                "b1_dur_s": 180, "b1_avg_w": 467.0,
+                "rec_dur_s": 120, "rec_avg_w": 150.0,
+                "b2_dur_s": 180, "b2_avg_w": 405.0,
+            },
+        }]
+        res_fresh = pe.resolve_individual_tau_w_mult(
+            {"tau_w_mult": 1.30, "tau_w_date": "2026-08-01"},
+            acts, cp_watts=cp, w_prime_j=wp, creatine_flag=True, today=today,
+        )
+        self.assertEqual(res_fresh["source"], "reconstitution_test")
+        self.assertLess(res_fresh["tau_w_mult"], 0.85)
+        self.assertFalse(res_fresh["stale"])
+
+        # Test >90 days old is marked stale for seasonal re-calibration
+        res_stale = pe.resolve_individual_tau_w_mult(
+            {}, acts, cp_watts=cp, w_prime_j=wp, creatine_flag=True, today=dt.date(2027, 3, 20),
+        )
+        self.assertTrue(res_stale["stale"])
+        self.assertGreater(res_stale["age_days"], 90)
+
+        # Altitude multiplies base_tau_w_mult cleanly (1.20 * altitude_mult > 1.20)
+        eff_alt = pe.compute_effective_cp_w_prime(300.0, 30000.0, elev_m=2500.0, base_tau_w_mult=1.20)
+        self.assertAlmostEqual(eff_alt["tau_w_mult"], round(1.20 * 1.30, 2), places=2)
+
+        # Individual tau_w_mult propagates into interval prescriptions (slower recovery -> lower Hard-Start hold watts)
+        rx_fast = pe.solve_individual_interval_prescriptions(300.0, 30000.0, p_5min_w=420.0, base_tau_w_mult=0.70)
+        rx_slow = pe.solve_individual_interval_prescriptions(300.0, 30000.0, p_5min_w=420.0, base_tau_w_mult=1.50)
+        self.assertGreater(rx_fast["vo2max_hard_start_4x4"]["hold_w"], rx_slow["vo2max_hard_start_4x4"]["hold_w"])
+
+    def test_fast_myotype_3day_split_vs_slow_unit2_gate(self):
+        base_args = dict(
+            profile={"primary_sport": "cycling", "sex": "male", "age": 26, "creatine_flag": True, "explicit_fields": ["weight_kg", "kfa_pct", "height_cm", "rhr", "hr_max"]},
+            body={"mass_calibrated": True, "kfa_calibrated": True},
+            pillar2={"sprint_anchor_status": "calibrated"},
+            cp_model={"valid": False, "quality_flag": "insufficient anchors"},
+            readiness_stage2={},
+            playbook_info={"rules": [], "answered_keys": set(), "exists": True},
+            activities=[],
+            cal_items=[],
+            macro_info=None,
+            dna_snapshot=None,
+            today=dt.date(2026, 11, 19),
+        )
+        fast_audit = pe.audit_missing_inputs_and_questions(
+            **base_args, pillar4={"myotype_z_score": 2.4}, effective_w_prime_kj=30.0, depth="pro",
+        )
+        fast_txt = "\n".join(fast_audit["calibration_gaps"])
+        self.assertIn("--unit 2a", fast_txt)
+        self.assertIn("--unit 2b", fast_txt)
+        self.assertIn("do NOT combine 5m + 12m", fast_txt)
+
+        slow_audit = pe.audit_missing_inputs_and_questions(
+            **base_args, pillar4={"myotype_z_score": -1.2}, effective_w_prime_kj=14.0, depth="standard",
+        )
+        slow_txt = "\n".join(slow_audit["calibration_gaps"])
+        self.assertIn("--unit 2", slow_txt)
+        self.assertNotIn("do NOT combine 5m + 12m", slow_txt)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
