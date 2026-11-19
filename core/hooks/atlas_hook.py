@@ -680,15 +680,20 @@ def _zone_class(p):
     return "z6"
 
 
-def _norm_pwr(raw_val, default=0.70):
-    """Parse percentage ('75%', '102') or decimal ('0.75', '1.02') into a float factor (e.g. 0.75)."""
+def _norm_pwr(raw_val, default=0.70, ftp_watts=275):
+    """Parse percentage ('75%', '102'), watts ('388W'), or decimal ('0.75', '1.02') into a float factor."""
     if raw_val is None or raw_val == "":
         return default
+    s = str(raw_val).replace(",", ".").strip()
+    is_watts = s.lower().endswith("w")
+    num_s = s[:-1].strip() if (is_watts or s.endswith("%")) else s
     try:
-        v = float(str(raw_val).replace(",", ".").replace("%", "").strip())
+        v = float(num_s)
     except ValueError:
         return default
-    return round(v / 100.0, 3) if v > 3.0 else round(v, 3)
+    if is_watts:
+        return round(v / max(80.0, float(ftp_watts or 275)), 4)
+    return round(v / 100.0, 4) if v > 3.0 else round(v, 4)
 
 
 def _dur_sec(val_str, unit_str="m"):
@@ -746,49 +751,83 @@ def parse_workout_spec(what_text, subkind="cycling", ftp_watts=275, sport=None):
             if re.search(r"\d+\s*(?:m|min|s|x)\b", right, re.I):
                 title = left.strip(" ()")
                 spec_body = right.strip(" ()")
+        elif re.search(r"\b\d+\s*[x×]\s*(?:\(|\d)|\b\d+\s*(?:m|min|s)\s*(?:wu|cd|@|z[1-5])", clean_raw, re.I):
+            # Allow raw DSL strings directly (e.g., from `atlas.py coach simulate --dsl "..."`)
+            spec_body = clean_raw
 
     segments = []
     if spec_body:
         tokens = [t.strip() for t in re.split(r"[,;]+", spec_body) if t.strip()]
         for tok in tokens:
-            # 1. Warmup: `15m WU 55-75%` or `10m warmup 0.50->0.75`
+            # 0. Compound multi-stage intervals (e.g. Hard-Start: `4x (45s@420W + 3.25m@350W) / 5m@147W`)
+            m_cmp = re.match(
+                r"^(\d+)\s*[x×]\s*\(([^()]+)\)(?:\s*(?:/|rest|pause)\s*(\d+(?:[.,]\d+)?)\s*(m|min|s)?\s*(?:@\s*(\d+(?:[.,]\d+)?\s*[wW%]?))?)?$",
+                tok, re.I
+            )
+            if m_cmp:
+                rep = int(m_cmp.group(1))
+                inner = m_cmp.group(2)
+                raw_stages = [st.strip() for st in re.split(r"(?:\+|->|→)", inner) if st.strip()]
+                stages = []
+                for st_s in raw_stages:
+                    m_st_part = re.match(
+                        r"^(\d+(?:[.,]\d+)?)\s*(m|min|s)?\s*(?:@\s*(\d+(?:[.,]\d+)?\s*[wW%]?))?$",
+                        st_s, re.I
+                    )
+                    if m_st_part:
+                        s_sec = _dur_sec(m_st_part.group(1), m_st_part.group(2) or "m")
+                        s_p = _norm_pwr(m_st_part.group(3), 1.15, ftp_watts=ftp_watts)
+                        if s_sec > 0:
+                            stages.append({"sec": s_sec, "p": s_p})
+                if stages:
+                    off_sec = _dur_sec(m_cmp.group(3), m_cmp.group(4) or "m") if m_cmp.group(3) else 240
+                    off_p = _norm_pwr(m_cmp.group(5), 0.50, ftp_watts=ftp_watts)
+                    stg_lbl = "+".join(f"{st['sec']}s@{int(round(st['p']*100))}%" for st in stages)
+                    segments.append({
+                        "type": "compound_intervals", "repeat": rep, "stages": stages,
+                        "off_sec": off_sec, "off_p": off_p,
+                        "label": f"{rep}× ({stg_lbl}) / {off_sec // 60}m@{int(round(off_p * 100))}%",
+                    })
+                    continue
+
+            # 1. Warmup: `15m WU 55-75%` or `10m warmup 150W-200W`
             m_wu = re.match(
-                r"^(\d+(?:[.,]\d+)?)\s*(m|min|s|h)?\s*(?:wu|warm-?up)\s*(?:@\s*)?(\d+(?:[.,]\d+)?)?\s*%?\s*(?:[-–>to/]+\s*(\d+(?:[.,]\d+)?)\s*%?)?$",
+                r"^(\d+(?:[.,]\d+)?)\s*(m|min|s|h)?\s*(?:wu|warm-?up)\s*(?:@\s*)?(\d+(?:[.,]\d+)?\s*[wW%]?)?\s*(?:[-–>to/]+\s*(\d+(?:[.,]\d+)?\s*[wW%]?))?$",
                 tok, re.I
             )
             if m_wu:
                 sec = _dur_sec(m_wu.group(1), m_wu.group(2) or "m")
-                p_low = _norm_pwr(m_wu.group(3), 0.50)
-                p_high = _norm_pwr(m_wu.group(4), 0.75)
+                p_low = _norm_pwr(m_wu.group(3), 0.50, ftp_watts=ftp_watts)
+                p_high = _norm_pwr(m_wu.group(4), 0.75, ftp_watts=ftp_watts)
                 segments.append({"type": "warmup", "sec": sec, "p_low": p_low, "p_high": p_high,
                                  "label": f"{sec // 60}m WU {int(round(p_low * 100))}–{int(round(p_high * 100))}%"})
                 continue
 
             # 2. Cooldown: `10m CD 65-50%`
             m_cd = re.match(
-                r"^(\d+(?:[.,]\d+)?)\s*(m|min|s|h)?\s*(?:cd|cool-?down)\s*(?:@\s*)?(\d+(?:[.,]\d+)?)?\s*%?\s*(?:[-–>to/]+\s*(\d+(?:[.,]\d+)?)\s*%?)?$",
+                r"^(\d+(?:[.,]\d+)?)\s*(m|min|s|h)?\s*(?:cd|cool-?down)\s*(?:@\s*)?(\d+(?:[.,]\d+)?\s*[wW%]?)?\s*(?:[-–>to/]+\s*(\d+(?:[.,]\d+)?\s*[wW%]?))?$",
                 tok, re.I
             )
             if m_cd:
                 sec = _dur_sec(m_cd.group(1), m_cd.group(2) or "m")
-                p_low = _norm_pwr(m_cd.group(3), 0.65)
-                p_high = _norm_pwr(m_cd.group(4), 0.50)
+                p_low = _norm_pwr(m_cd.group(3), 0.65, ftp_watts=ftp_watts)
+                p_high = _norm_pwr(m_cd.group(4), 0.50, ftp_watts=ftp_watts)
                 segments.append({"type": "cooldown", "sec": sec, "p_low": p_low, "p_high": p_high,
                                  "label": f"{sec // 60}m CD {int(round(p_low * 100))}–{int(round(p_high * 100))}%"})
                 continue
 
-            # 3. Intervals: `4x 8m@102% / 4m@55%` or `3x15m @ 90% (5m @ 55%)` or `5x4m@112%`
+            # 3. Intervals: `4x 8m@102% / 4m@55%`, `13x 30s@388W / 15s@205W`, `5x4m@112%`
             m_iv = re.match(
-                r"^(\d+)\s*[x×]\s*(\d+(?:[.,]\d+)?)\s*(m|min|s)?\s*(?:@\s*(\d+(?:[.,]\d+)?)\s*%?)?"
-                r"(?:\s*(?:/|\(|with|rest|pause)\s*(\d+(?:[.,]\d+)?)\s*(m|min|s)?\s*(?:@\s*(\d+(?:[.,]\d+)?)\s*%?)?\s*\)?)?$",
+                r"^(\d+)\s*[x×]\s*(\d+(?:[.,]\d+)?)\s*(m|min|s)?\s*(?:@\s*(\d+(?:[.,]\d+)?\s*[wW%]?))?"
+                r"(?:\s*(?:/|\(|with|rest|pause)\s*(\d+(?:[.,]\d+)?)\s*(m|min|s)?\s*(?:@\s*(\d+(?:[.,]\d+)?\s*[wW%]?))?\s*\)?)?$",
                 tok, re.I
             )
             if m_iv:
                 rep = int(m_iv.group(1))
                 on_sec = _dur_sec(m_iv.group(2), m_iv.group(3) or "m")
-                on_p = _norm_pwr(m_iv.group(4), 0.95 if on_sec >= 480 else 1.10)
+                on_p = _norm_pwr(m_iv.group(4), 0.95 if on_sec >= 480 else 1.10, ftp_watts=ftp_watts)
                 off_sec = _dur_sec(m_iv.group(5), m_iv.group(6) or "m") if m_iv.group(5) else max(60, int(round(on_sec * 0.5)))
-                off_p = _norm_pwr(m_iv.group(7), 0.55)
+                off_p = _norm_pwr(m_iv.group(7), 0.55, ftp_watts=ftp_watts)
                 segments.append({
                     "type": "intervals", "repeat": rep, "on_sec": on_sec, "off_sec": off_sec,
                     "on_p": on_p, "off_p": off_p,
@@ -801,13 +840,13 @@ def parse_workout_spec(what_text, subkind="cycling", ftp_watts=275, sport=None):
 
             # 4. Ramp: `12m ramp 70-95%`
             m_rmp = re.match(
-                r"^(\d+(?:[.,]\d+)?)\s*(m|min|s)?\s*ramp\s*(?:@\s*)?(\d+(?:[.,]\d+)?)\s*%?\s*[-–>to/]+\s*(\d+(?:[.,]\d+)?)\s*%?$",
+                r"^(\d+(?:[.,]\d+)?)\s*(m|min|s)?\s*ramp\s*(?:@\s*)?(\d+(?:[.,]\d+)?\s*[wW%]?)\s*[-–>to/]+\s*(\d+(?:[.,]\d+)?\s*[wW%]?)$",
                 tok, re.I
             )
             if m_rmp:
                 sec = _dur_sec(m_rmp.group(1), m_rmp.group(2) or "m")
-                p_low = _norm_pwr(m_rmp.group(3), 0.65)
-                p_high = _norm_pwr(m_rmp.group(4), 0.95)
+                p_low = _norm_pwr(m_rmp.group(3), 0.65, ftp_watts=ftp_watts)
+                p_high = _norm_pwr(m_rmp.group(4), 0.95, ftp_watts=ftp_watts)
                 segments.append({"type": "ramp", "sec": sec, "p_low": p_low, "p_high": p_high,
                                  "label": f"{sec // 60}m Ramp {int(round(p_low * 100))}–{int(round(p_high * 100))}%"})
                 continue
@@ -819,9 +858,9 @@ def parse_workout_spec(what_text, subkind="cycling", ftp_watts=275, sport=None):
                 segments.append({"type": "freeride", "sec": sec, "label": f"{sec // 60}m FreeRide"})
                 continue
 
-            # 6. SteadyState: `19m Z2@68%` or `45m @ 70%` or `30m Z2`
+            # 6. SteadyState: `19m Z2@68%` or `45m @ 215W` or `30m Z2`
             m_st = re.match(
-                r"^(\d+(?:[.,]\d+)?)\s*(m|min|s|h)?\s*(?:[A-Za-z0-9_-]+\s*)?(?:@\s*(\d+(?:[.,]\d+)?)\s*%?)?$",
+                r"^(\d+(?:[.,]\d+)?)\s*(m|min|s|h)?\s*(?:[A-Za-z0-9_-]+\s*)?(?:@\s*(\d+(?:[.,]\d+)?\s*[wW%]?))?$",
                 tok, re.I
             )
             if m_st:
@@ -829,7 +868,7 @@ def parse_workout_spec(what_text, subkind="cycling", ftp_watts=275, sport=None):
                 low_tok = tok.lower()
                 def_p = 0.52 if "z1" in low_tok else (0.88 if ("z3" in low_tok or "ss" in low_tok or "tempo" in low_tok)
                         else (1.00 if "z4" in low_tok else (1.12 if "z5" in low_tok else 0.68)))
-                p = _norm_pwr(m_st.group(3), def_p)
+                p = _norm_pwr(m_st.group(3), def_p, ftp_watts=ftp_watts)
                 segments.append({"type": "steady", "sec": sec, "p": p,
                                  "label": f"{sec // 60}m @ {int(round(p * 100))}%"})
                 continue
@@ -877,6 +916,16 @@ def parse_workout_spec(what_text, subkind="cycling", ftp_watts=275, sport=None):
                                       "zone": _zone_class(seg["on_p"]), "label": f"ON {int(round(seg['on_p'] * 100))}%"})
                 visual_blocks.append({"min": round(seg["off_sec"] / 60.0, 1), "pct": int(round(seg["off_p"] * 100)),
                                       "zone": _zone_class(seg["off_p"]), "label": f"OFF {int(round(seg['off_p'] * 100))}%"})
+        elif st == "compound_intervals":
+            for r_i in range(seg["repeat"]):
+                for stg in seg.get("stages") or []:
+                    calc_sec += stg["sec"]
+                    visual_blocks.append({"min": round(stg["sec"] / 60.0, 1), "pct": int(round(stg["p"] * 100)),
+                                          "zone": _zone_class(stg["p"]), "label": f"ON {int(round(stg['p'] * 100))}%"})
+                if seg.get("off_sec") and r_i < seg["repeat"] - 1:
+                    calc_sec += seg["off_sec"]
+                    visual_blocks.append({"min": round(seg["off_sec"] / 60.0, 1), "pct": int(round(seg["off_p"] * 100)),
+                                          "zone": _zone_class(seg["off_p"]), "label": f"OFF {int(round(seg['off_p'] * 100))}%"})
         elif st == "freeride":
             calc_sec += seg["sec"]
             visual_blocks.append({"min": round(seg["sec"] / 60.0, 1), "pct": 68, "zone": "z2", "label": seg["label"]})
@@ -944,6 +993,12 @@ def compile_zwo_xml(spec_or_title, description="", parsed_spec=None, date_str=""
                 f'    <IntervalsT Repeat="{int(s["repeat"])}" OnDuration="{int(s["on_sec"])}" '
                 f'OffDuration="{int(s["off_sec"])}" OnPower="{s["on_p"]:.2f}" OffPower="{s["off_p"]:.2f}"/>'
             )
+        elif t == "compound_intervals":
+            for r_i in range(int(s["repeat"])):
+                for stg in s.get("stages") or []:
+                    lines.append(f'    <SteadyState Duration="{int(stg["sec"])}" Power="{stg["p"]:.2f}"/>')
+                if s.get("off_sec") and r_i < int(s["repeat"]) - 1:
+                    lines.append(f'    <SteadyState Duration="{int(s["off_sec"])}" Power="{s["off_p"]:.2f}"/>')
         elif t == "freeride":
             lines.append(f'    <FreeRide Duration="{int(s["sec"])}" FlatRoad="1"/>')
         else:
@@ -2053,10 +2108,10 @@ COACH_RX_DAILY = re.compile(
     r"(?i)\b(?:mein\s+workout|workout\s+heute|workout\s+morgen|was\s+trainier\w+\s+ich|heutiges?\s+(?:workout|training)|"
     r"im\s+training\b|training\s+heute|training\s+morgen|n[aä]chste\s+einheit|"
     r"soll\s+ich\s+(?:heute\s+)?(?:trainieren|fahren|laufen|auf\s+die\s+rolle)|"
-    r"auf\s+die\s+rolle|intervall-?training|\.zwo\b|\.fit\b|karoo\s+workout|ftp\s+test|feld-?test|lsct\b|"
+    r"auf\s+die\s+rolle|auf\s+der\s+rolle|intervall-?training|\.zwo\b|\.fit\b|karoo\s+workout|ftp\s+test|feld-?test|lsct\b|"
     r"sweet\s*spot\s+workout|tagesform\s+training|readiness\s+heute|7-?s[aä]ulen|"
-    r"w/kg|watt/kg|vlamax|vo2max|durability|fatmax|critical\s*power|w['’]?\s*bal)\b|"
-    r"\b(?:ftp|cp)\b.*\b(?:watt|w/kg|test|zone|schwelle|entfernt|aktuell|steigern)\b"
+    r"w/kg|watt/kg|wattzahl\w*|vlamax|laktat\w*|vo2max|durability|fatmax|critical\s*power|w['’]?\s*bal|5s-?peak|hard-?start|30/15\w*)\b|"
+    r"\b(?:ftp|cp)\b.*\b(?:watt|w/kg|test|zone|schwelle|entfernt|aktuell|steigern|laktat|peak|rolle|laufen)\b"
 )
 
 

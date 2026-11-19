@@ -140,6 +140,34 @@ def _expand_parsed_blocks_to_fit_steps(
                     "custom_low": r_lo,
                     "custom_high": r_hi,
                 })
+        elif kind == "compound_intervals":
+            reps = max(1, int(blk.get("repeat") or 1))
+            stages = blk.get("stages") or []
+            off_s = max(0, int(blk.get("off_sec") or 0))
+            off_p = float(blk.get("off_p") or 0.50)
+            for r_idx in range(1, reps + 1):
+                for s_idx, stg in enumerate(stages, start=1):
+                    s_sec = max(5, int(stg.get("sec") or 30))
+                    s_p = float(stg.get("p") or 1.10)
+                    t_type, t_lo, t_hi = _power_bounds(s_p, s_p) if is_cycling else _run_bounds(s_p)
+                    steps.append({
+                        "name": f"Int {r_idx}.{s_idx}/{reps}",
+                        "duration_ms": s_sec * 1000,
+                        "intensity": FIT_INTENSITY_ACTIVE,
+                        "target_type": t_type,
+                        "custom_low": t_lo,
+                        "custom_high": t_hi,
+                    })
+                if off_s > 0 and r_idx < reps:
+                    r_type, r_lo, r_hi = _power_bounds(off_p, off_p) if is_cycling else _run_bounds(off_p)
+                    steps.append({
+                        "name": "Recovery",
+                        "duration_ms": off_s * 1000,
+                        "intensity": FIT_INTENSITY_RECOVERY,
+                        "target_type": r_type,
+                        "custom_low": r_lo,
+                        "custom_high": r_hi,
+                    })
         elif kind in ("warmup", "cooldown", "ramp"):
             dur_s = max(30, int(blk.get("sec") or blk.get("duration_sec") or 600))
             p_lo = float(blk.get("p_low") or blk.get("power_low") or 0.55)

@@ -82,14 +82,20 @@ All credentials stay local in `brain/_secrets/*.env` (`chmod 600`):
 
 ## 5. The 7-Pillar Sports-Science Guardrails (2026 Gold Standard)
 
-1. **Ban `FTP_20` (`0.95 * P_20m`) & Static `TSS`-Only Dogma:** Anchor all prescriptions to true **`CP`**, **`W'`**, and **`MPR`** (`R^2 >= 0.98`, `SEE_CP < 5%` across `2–15 min` anchors; `MLSS ~ 0.95 * CP`). Track domain-separated work (`w_sub <= CP` vs. **`w_sup > CP`** in `kJ/kg`) and Sanders ratios (`Q_Strain = sRPE / TSS_CP`, `Q_RPE:PO`).
-2. **Mader Metabolism, Shuttle (`eta_shuttle`) & Podlogar Functional Fueling (S1 + S2):**
-   - Combine `W'`-cleaned `VO2max_rel_clean` with FFM-normalized `vLamax_sprint` and `eta_shuttle`:
-     - High `vLamax (>0.65)` + low `eta_shuttle (<=1.05)` -> prioritize strict `FatMax`/LT1 cap, `4x10m @ 92-96% CP`, or `1:4` Lactate-Shuttle Over/Unders (`1m@115-120% CP / 4m@FatMax`); avoid unstructured sprints.
+1. **Ban `FTP_20` (`0.95 * P_20m`), Static `% CP` Above CP & Mental-Math `W'bal`:**
+   - **Below `CP` (Sub-CP):** Use the dynamic phenotype-scaled `f(CP, vLamax_met)` anchors printed by Stage 1 (`FatMax`, `LT1`, `MLSS`) — NEVER fixed `% CP` across Diesel (`vLamax_met ~0.32`) vs. Sprinter (`~0.80`) phenotypes!
+   - **Above `CP` (Severe Domain):** NEVER prescribe or critique VO2max/Supra-CP intervals using static `% CP` or mental-math `W'bal`/`PCr` guesses! Always read the pre-solved 1-Hz targets from **`[3B_prescriptions W'-scaled]`** in `coach context` OR run:
+     ```bash
+     python -I <ROOT>/brain/_atlas/tools/atlas.py coach simulate --dsl "<spec>" [--prior-kj 1600 --cho-g-h 60]
+     ```
+     and respect `coach push`'s automatic 1-Hz `W'bal` / `Time >=90% VO2max` Compiler-Guard (`STIMULUS MISMATCH` / `BLOWOUT WARNING`).
+2. **Mader Metabolism (`vLamax_met` vs. Alactic Sprint), Shuttle (`eta_shuttle`) & Podlogar Functional Fueling (S1 + S2):**
+   - Strictly distinguish **metabolic `vLamax_met`** (inverse Mader-calibrated against `(VO2max_clean, CP)` — drives `FatMax`, `LT1`, `MLSS`, `CHO/Fat`) from **`alactic_15s_sprint_proxy`** (includes neuromuscular `W'_FC` PCr burst power — used for sprint/myotype typology, NOT submax `FatMax`!).
+   - High `vLamax_met` + low `eta_shuttle (<=1.05)` -> prioritize dynamic `FatMax`/LT1 volume, `Sub-Threshold (4x10m @ MLSS)`, and controlled **`1:4` Lactate-Shuttle Over/Unders** (`Under @ 80–86% CP`, `1m Over = 15–20% W' pulse`, NEVER `460–500W` IIx blasts).
    - **Functional CHO Periodization:** Prescribe `80–110 g/h` (`1:0.8` glucose:fructose) for races, `>2–2.5h` key sessions, and durability preloads; keep `<2h` easy Z1/Z2 rides moderate (`0–45 g/h`) to preserve fat oxidation & AMPK/PGC-1alpha signaling.
-3. **Chorley Bi-Exponential `W'bal` & Myotype `Z_Myo` Interval Matching (S3 + S4):**
-   - **`Fast Myotype` (`Z_Myo > +0.5`):** Requires **48–72 h** recovery after HIIT, strict Z1 discipline (`50–62% CP`), and **Rønnestad `30/15s` strictly anchored to `CP`** (never `P_5min`, never `5x5m @ 120% FTP_20`!).
-   - **`Slow Myotype` (`Z_Myo < -0.5`):** Fast neuromuscular rebound (`~24 h`), tolerates threshold density (`92–97% CP`), responds best to **Bossi Alternating `5x5m`** or `5x4m @ 108–115% CP` (avoid mild `30/30s`).
+3. **Chorley Bi-Exponential `W'bal`, 1st-Order `VO2(t)` & Myotype `Z_Myo` Interval Matching (S3 + S4):**
+   - **`Fast Myotype` (`Z_Myo > +0.5`):** Requires **48–72 h** recovery after HIIT, strict Z1 discipline, and **`W'`-scaled Float 30/15s** (with `IIx-Cap` auto-float) or **2-Stage Hard-Start `4x4m`** (`45s` `60–70%` PCr trigger -> `3:15m` `W'`-bisected hold) from `[3B_prescriptions]`! Label Re-Entry `~119% / 65% CP` honestly as **Threshold-Opener**, NEVER as VO2max.
+   - **`Slow Myotype` (`Z_Myo < -0.5`):** Fast neuromuscular rebound (`~24 h`), tolerates threshold density (`MLSS`), always enforces the **`max(0.18*W', 3.0 kJ)` Diesel safety floor** on severe intervals (avoid mild `30/30s`).
    - **True Strength vs. Low-Cadence Myth:** Submaximal `40–55 rpm` GA2 pedaling (`<50% F_max`) does NOT replace heavy strength training! For real `T_max`/RFD/economy gains, prescribe heavy gym lifts (`>=80% 1RM`, 2–4x3–6 reps, `>=6h` separated from endurance) or **`5x7` maximal seated torque accelerations** (`4m` rest); treat moderate low-cadence purely as specific climbing feel.
 4. **Intensity-Weighted Durability & Censoring-Bias Gate (S5):**
    - **Never confuse passive Zone-2 long rides (`UNTESTED / submax-only`) with a physiological durability drop!** Athletes rarely ride 5–20 min all-out at the end of disciplined 3–4h Z2 rides. Only diagnose a fatigue drop when a durability tier is marked **`VERIFIED`** (`> 1.03 * CP` with exhaustion) and exceeds `> 7%` drop (or `cadence_drop_fatigued_rpm > 6 rpm` / `Pw:Hr > 5%`). Treat `UNTESTED / submax` tiers honestly as unmeasured until a Preload test (`Field-Test Unit 3`) or late race effort is performed.

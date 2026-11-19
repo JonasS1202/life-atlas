@@ -23,6 +23,7 @@ import uuid
 from typing import Any
 
 from . import fit_writer
+from . import pillars_engine
 
 # ---------------------------------------------------------------------------
 # Hammerhead Karoo OAuth 2.0 & Workout API Endpoints
@@ -825,8 +826,11 @@ def sync_calendar_workouts_to_devices(
     execute: bool = True,
     mock_dir: str | None = None,
     today: dt.date | None = None,
+    w_prime_j: float | None = None,
+    p_5min_w: float | None = None,
+    mass_kg: float | None = None,
 ) -> dict[str, Any]:
-    """Compile `.zwo` + `.fit` files and sync `POST`/`PUT`/`DELETE` idempotently to Karoo & Garmin."""
+    """Compile `.zwo` + `.fit` files, run 1-Hz W'bal/VO2 Compiler-Guard, archive superseded files, and sync to devices."""
     ref_today = today or dt.date.today()
     workouts_dir = os.path.join(brain, "coach", "workouts")
     cache_dir = os.path.join(brain, "_atlas", "cache")
@@ -850,9 +854,12 @@ def sync_calendar_workouts_to_devices(
     gc_active = status["garmin_connected"] or bool(mock_dir)
 
     active_keys: set[str] = set()
+    active_filenames: set[str] = set()
     zwo_written: list[str] = []
     fit_written: list[str] = []
     device_actions: list[str] = []
+    sim_reports: list[dict[str, Any]] = []
+    superseded_archived: list[str] = []
 
     for it in cal_items or []:
         if it.get("kind") != "workout":
@@ -883,11 +890,29 @@ def sync_calendar_workouts_to_devices(
         zwo_xml = ""
         if sport == "cycling" and (spec.get("segments") or spec.get("blocks")):
             zwo_xml = compile_zwo_xml_fn(spec, date_str=d_iso, ftp_watts=ftp_watts)
-            zwo_p = os.path.join(workouts_dir, f"{d_iso}_{slug}.zwo")
+            zwo_name = f"{d_iso}_{slug}.zwo"
+            zwo_p = os.path.join(workouts_dir, zwo_name)
+            active_filenames.add(zwo_name)
             if execute:
                 with open(zwo_p, "w", encoding="utf-8") as fh:
                     fh.write(zwo_xml)
             zwo_written.append(zwo_p)
+
+            # Compiler-Guard: 1-Hz Chorley W'bal + VO2(t) kinetics audit on every compiled cycling workout!
+            w_arr, wb_arr = pillars_engine.expand_spec_to_1hz_watts(spec, cp_watts=float(ftp_watts or 275))
+            if w_arr:
+                sim = pillars_engine.simulate_workout_stream(
+                    watts=w_arr,
+                    cp_watts=float(ftp_watts or 275),
+                    w_prime_j=float(w_prime_j or 20000.0),
+                    p_5min_w=p_5min_w,
+                    mass_kg=float(mass_kg or 75.0),
+                    title=str(spec.get("title") or it.get("what") or ""),
+                    work_block_watts=wb_arr,
+                )
+                sim["date"] = d_iso
+                sim["title"] = str(spec.get("title") or "Workout")
+                sim_reports.append(sim)
 
         if spec.get("segments") or spec.get("blocks") or sport in ("cycling", "running"):
             fit_bytes = fit_writer.compile_fit_workout_bytes(
@@ -898,7 +923,9 @@ def sync_calendar_workouts_to_devices(
                 cs_mps=cs_mps,
                 default_duration_min=int(spec.get("total_min") or 45),
             )
-            fit_p = os.path.join(workouts_dir, f"{d_iso}_{slug}.fit")
+            fit_name = f"{d_iso}_{slug}.fit"
+            fit_p = os.path.join(workouts_dir, fit_name)
+            active_filenames.add(fit_name)
             if execute:
                 with open(fit_p, "wb") as fh:
                     fh.write(fit_bytes)
@@ -944,6 +971,28 @@ def sync_calendar_workouts_to_devices(
 
         sync_map[key] = rec
 
+    # Archive superseded local .zwo/.fit files inside the active [ref_today..ref_today+days] horizon (never delete!)
+    end_iso = (ref_today + dt.timedelta(days=days)).isoformat()
+    start_iso = ref_today.isoformat()
+    if execute and os.path.isdir(workouts_dir):
+        sup_dir = os.path.join(workouts_dir, "_superseded")
+        for fn in sorted(os.listdir(workouts_dir)):
+            if not fn.endswith((".zwo", ".fit")):
+                continue
+            m_d = re.match(r"^(\d{4}-\d{2}-\d{2})_", fn)
+            if not m_d:
+                continue
+            f_date = m_d.group(1)
+            if start_iso <= f_date <= end_iso and fn not in active_filenames:
+                os.makedirs(sup_dir, exist_ok=True)
+                src_f = os.path.join(workouts_dir, fn)
+                dst_f = os.path.join(sup_dir, fn)
+                try:
+                    os.replace(src_f, dst_f)
+                    superseded_archived.append(fn)
+                except OSError:
+                    pass
+
     # Clean up future workouts that were skipped (`[-]`), moved, or removed from calendar
     stale_keys = [
         k for k, v in list(sync_map.items())
@@ -967,4 +1016,6 @@ def sync_calendar_workouts_to_devices(
         "fit_files": fit_written,
         "device_actions": device_actions,
         "active_synced": len(active_keys),
+        "sim_reports": sim_reports,
+        "superseded_archived": superseded_archived,
     }

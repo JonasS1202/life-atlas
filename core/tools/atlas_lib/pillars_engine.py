@@ -318,6 +318,7 @@ def compute_pillar2_metabolic_mader(
 
     eff_t_alac = max(2.0, min(5.5, float(t_alac_s or 3.0)))
     delta_la = max(1.2, (15.0 * p15_eff + 551.0 - 123.0 * float(ffm)) / (11.0 * float(ffm)))
+    # Alactic/PCr-influenced 15s sprint proxy (reflects explosive W'_FC + glycolytic recruitment)
     vlamax_sprint = round(max(0.20, min(1.35, delta_la / (15.0 - eff_t_alac))), 2)
 
     conf = "high" if (body.get("kfa_calibrated") and anchor_status in ("fresh_42d", "anchored_90d")) else "low_provisional"
@@ -327,28 +328,51 @@ def compute_pillar2_metabolic_mader(
     if not vo2max_rel_clean or vo2max_rel_clean <= 20.0:
         return {
             "vlamax_sprint_proxy": vlamax_sprint,
+            "vlamax_met_mmol_l_s": None,
             "vlamax_confidence": conf,
             "sprint_anchor_status": anchor_status,
             "creatine_noted": creatine_flag is not None,
             "p_mlss_mader_w": None,
+            "p_mlss_w": None,
+            "p_lt1_w": None,
             "shuttle_index_eta": None,
             "shuttle_class": None,
             "rcp_langley_w_kg": None,
             "p_fatmax_w": None,
+            "fatmax_band_w": None,
             "mfo_g_min": None,
             "p_carbmax_90_w": None,
             "optimal_cadence_rpm": {"lt1": 66, "fatmax": 76, "mlss": 82, "vo2max": 85, "sprint": 135},
         }
 
     p_mlss_mader = _solve_mader_mlss_watts(float(mass), float(vo2max_rel_clean), vlamax_sprint, vol_rel)
-    rcp_w_kg = round(0.802 - 1.851 * vlamax_sprint + 0.070 * float(vo2max_rel_clean), 2)
 
     eta = None
     shuttle_cls = None
-    eff_submax_vla = vlamax_sprint
+    vlamax_met = round(min(0.85, max(0.25, vlamax_sprint * 0.72)), 2)
     if cp_watts and cp_watts > 50 and p_mlss_mader and p_mlss_mader > 30:
-        target_mlss = 0.95 * float(cp_watts)
-        eta = round(target_mlss / p_mlss_mader, 2)
+        # Inverse Mader equilibrium calibration: separate true metabolic vLamax_met from alactic/PCr sprint peak!
+        # Solve iteratively for (vLamax_met, MLSS) because MLSS/CP itself depends on vLamax_met (`f(CP, vLamax_met)`).
+        v_est = 0.55
+        for _ in range(6):
+            mlss_frac_iter = max(0.90, min(0.975, 0.985 - 0.065 * v_est))
+            target_mlss = mlss_frac_iter * float(cp_watts)
+            v_lo, v_hi = 0.20, 1.15
+            for _ in range(36):
+                v_mid = 0.5 * (v_lo + v_hi)
+                pm = _solve_mader_mlss_watts(float(mass), float(vo2max_rel_clean), v_mid, vol_rel) or target_mlss
+                if pm > target_mlss:
+                    v_lo = v_mid  # higher vLamax lowers MLSS
+                else:
+                    v_hi = v_mid
+            v_est = 0.5 * (v_lo + v_hi)
+        # Clamp metabolic vLamax within physiological bounds and <= sprint proxy when sprint is calibrated
+        if anchor_status != "passive_lower_bound":
+            v_est = min(v_est, vlamax_sprint)
+        vlamax_met = round(max(0.22, min(0.95, v_est)), 2)
+
+        target_mlss_final = max(0.90, min(0.975, 0.985 - 0.065 * vlamax_met)) * float(cp_watts)
+        eta = round(target_mlss_final / p_mlss_mader, 2)
         if eta > 1.15:
             shuttle_cls = "High MCT1/Type-IIa Clearance (Allrounder)"
         elif eta <= 1.00:
@@ -356,24 +380,33 @@ def compute_pillar2_metabolic_mader(
         else:
             shuttle_cls = "Balanced Lactate Shuttle"
 
-        # Calibrate effective submaximal vLamax so Mader MLSS matches empirical 0.95 * CP
-        v_lo, v_hi = 0.15, 1.40
-        for _ in range(36):
-            v_mid = 0.5 * (v_lo + v_hi)
-            pm = _solve_mader_mlss_watts(float(mass), float(vo2max_rel_clean), v_mid, vol_rel) or target_mlss
-            if pm > target_mlss:
-                v_lo = v_mid  # higher vLamax lowers MLSS
-            else:
-                v_hi = v_mid
-        eff_submax_vla = 0.5 * (v_lo + v_hi)
+    rcp_w_kg = round(0.802 - 1.851 * vlamax_met + 0.070 * float(vo2max_rel_clean), 2)
 
-    # Sweep power curve for exact stoichiometric FatMax, MFO (g/min), and CarbMax@90g/h
+    # Dynamic phenotype-scaled Sub-CP anchors `f(CP, vLamax_met)` (NEVER static % CP across Diesel vs Sprinter!)
+    p_mlss_dyn = None
+    p_lt1_dyn = None
+    fatmax_band = None
+    p_fatmax_dyn = None
+    if cp_watts and cp_watts > 50:
+        cp_f = float(cp_watts)
+        mlss_frac = max(0.90, min(0.975, 0.985 - 0.065 * vlamax_met))
+        lt1_frac = max(0.68, min(0.84, 0.865 - 0.14 * vlamax_met))
+        fm_lo_frac = max(0.60, min(0.75, 0.790 - 0.13 * vlamax_met))
+        fm_hi_frac = max(0.65, min(0.80, 0.845 - 0.14 * vlamax_met))
+        p_mlss_dyn = int(round(cp_f * mlss_frac))
+        p_lt1_dyn = int(round(cp_f * lt1_frac))
+        fm_lo_w = int(round(cp_f * fm_lo_frac))
+        fm_hi_w = int(round(cp_f * fm_hi_frac))
+        fatmax_band = (fm_lo_w, fm_hi_w)
+        p_fatmax_dyn = int(round(0.5 * (fm_lo_w + fm_hi_w)))
+
+    # Stoichiometric MFO (g/min) & CarbMax@90g/h using calibrated `vlamax_met` (never PCr-inflated sprint proxy)
     best_fat_g_min = 0.0
     best_fat_w = None
     p_carb_90 = None
     upper_sweep = int(round((cp_watts or p_mlss_mader or 280.0) * 1.08))
     for pw in range(50, max(80, upper_sweep) + 1, 2):
-        vo2_ss, vla_eff = _mader_vla_ss(float(pw), float(mass), float(vo2max_rel_clean), eff_submax_vla)
+        vo2_ss, vla_eff = _mader_vla_ss(float(pw), float(mass), float(vo2max_rel_clean), vlamax_met)
         c_cho_gh = vla_eff * v_la_l * 0.09008 * 60.0
         f_ox_gmin = 0.50 * (float(mass) / 1000.0) * max(0.0, (vo2_ss - 3.5) - (vla_eff * vol_rel) / 0.02049)
         if f_ox_gmin > best_fat_g_min:
@@ -384,15 +417,19 @@ def compute_pillar2_metabolic_mader(
 
     return {
         "vlamax_sprint_proxy": vlamax_sprint,
+        "vlamax_met_mmol_l_s": vlamax_met,
         "vlamax_confidence": conf,
         "sprint_anchor_status": anchor_status,
         "t_alac_s": eff_t_alac,
         "creatine_noted": creatine_flag is not None,
         "p_mlss_mader_w": int(round(p_mlss_mader)) if p_mlss_mader else None,
+        "p_mlss_w": p_mlss_dyn or (int(round(p_mlss_mader)) if p_mlss_mader else None),
+        "p_lt1_w": p_lt1_dyn,
         "shuttle_index_eta": eta,
         "shuttle_class": shuttle_cls,
         "rcp_langley_w_kg": rcp_w_kg,
-        "p_fatmax_w": best_fat_w,
+        "p_fatmax_w": p_fatmax_dyn or best_fat_w,
+        "fatmax_band_w": fatmax_band,
         "mfo_g_min": round(best_fat_g_min, 2) if best_fat_w else None,
         "p_carbmax_90_w": p_carb_90,
         "optimal_cadence_rpm": {"lt1": 66, "fatmax": 76, "mlss": 82, "vo2max": 85, "sprint": 135},
@@ -536,6 +573,447 @@ def compute_chorley_w_bal(
     }
 
 
+def expand_spec_to_1hz_watts(
+    parsed_spec: dict[str, Any] | None,
+    cp_watts: float,
+) -> tuple[list[float], list[float]]:
+    """Expand parsed workout segments (`parse_workout_spec`) into `(all_watts_1hz, work_block_watts_1hz)`."""
+    eff_cp = max(80.0, float(cp_watts or 275.0))
+    segs = (parsed_spec or {}).get("segments") or (parsed_spec or {}).get("blocks") or []
+    watts: list[float] = []
+    work_watts: list[float] = []
+
+    for blk in segs:
+        kind = str(blk.get("type") or blk.get("kind") or "steady").lower()
+        if kind == "intervals":
+            reps = max(1, int(blk.get("repeat") or blk.get("repeats") or 1))
+            on_s = max(1, int(blk.get("on_sec") or 60))
+            off_s = max(0, int(blk.get("off_sec") or 0))
+            on_w = float(blk.get("on_p") or blk.get("on_power") or 1.0) * eff_cp
+            off_w = float(blk.get("off_p") or blk.get("off_power") or 0.55) * eff_cp
+            for r_idx in range(reps):
+                seg_on = [on_w] * on_s
+                watts.extend(seg_on)
+                work_watts.extend(seg_on)
+                if off_s > 0:
+                    seg_off = [off_w] * off_s
+                    watts.extend(seg_off)
+                    if r_idx < reps - 1 or off_s <= 60:
+                        work_watts.extend(seg_off)
+        elif kind == "compound_intervals":
+            # Multi-stage intervals such as Hard-Start `4x (45s@420W + 195s@350W) / 5m@147W`
+            reps = max(1, int(blk.get("repeat") or 1))
+            stages = blk.get("stages") or []
+            off_s = max(0, int(blk.get("off_sec") or 0))
+            off_w = float(blk.get("off_p") or 0.50) * eff_cp
+            for r_idx in range(reps):
+                for stg in stages:
+                    s_sec = max(1, int(stg.get("sec") or 30))
+                    s_w = float(stg.get("p") or 1.0) * eff_cp
+                    seg_s = [s_w] * s_sec
+                    watts.extend(seg_s)
+                    work_watts.extend(seg_s)
+                if off_s > 0 and r_idx < reps - 1:
+                    watts.extend([off_w] * off_s)
+        elif kind in ("warmup", "cooldown", "ramp"):
+            dur_s = max(1, int(blk.get("sec") or blk.get("duration_sec") or 600))
+            w_lo = float(blk.get("p_low") or blk.get("power_low") or 0.55) * eff_cp
+            w_hi = float(blk.get("p_high") or blk.get("power_high") or 0.72) * eff_cp
+            if dur_s == 1:
+                arr = [0.5 * (w_lo + w_hi)]
+            else:
+                arr = [w_lo + (w_hi - w_lo) * (i / (dur_s - 1)) for i in range(dur_s)]
+            watts.extend(arr)
+            if kind == "ramp":
+                work_watts.extend(arr)
+        else:
+            dur_s = max(1, int(blk.get("sec") or blk.get("duration_sec") or 600))
+            pwr = float(blk.get("p") or blk.get("power") or 0.68) * eff_cp
+            arr = [pwr] * dur_s
+            watts.extend(arr)
+            if pwr >= 0.75 * eff_cp:
+                work_watts.extend(arr)
+
+    return watts, work_watts
+
+
+def simulate_workout_stream(
+    watts: list[float],
+    cp_watts: float,
+    w_prime_j: float,
+    p_5min_w: float | None = None,
+    mass_kg: float = 75.0,
+    prior_kj: float = 0.0,
+    cho_g_h: float = 60.0,
+    verified_drop_15kj_pct: float | None = None,
+    title: str = "",
+    work_block_watts: list[float] | None = None,
+) -> dict[str, Any]:
+    """1-Hz deterministic Chorley bi-exponential `W'bal` (`W'_FC` + `W'_SC`), 1st-order `VO2(t)` kinetics
+    with severe-domain slow component, pre-fatigue `(prior_kj, cho_g_h)` durability degradation, and
+    physiological stimulus / mismatch guard."""
+    cp_fresh = max(80.0, float(cp_watts or 275.0))
+    wp_fresh = max(4000.0, float(w_prime_j or 18000.0))
+    bw = max(40.0, float(mass_kg or 75.0))
+
+    # Guardrail #5: Pre-fatigue (prior_kj & cho_g_h) degradation of (CP_eff, W'_eff)
+    cp_eff, wp_eff = cp_fresh, wp_fresh
+    cp_drop_pct = 0.0
+    wp_drop_pct = 0.0
+    if prior_kj and float(prior_kj) > 0.0:
+        kj_kg = float(prior_kj) / bw
+        excess = max(0.0, kj_kg - 12.0)
+        # Fueling modulation: under-fueling (<60 g/h) accelerates glycogen/W' decay; 80-100 g/h dampens it
+        fuel_mult = max(0.65, min(1.55, 1.0 + (60.0 - float(cho_g_h)) * 0.012))
+        # Use athlete's verified >15 kJ/kg durability drop if available, else conservative baseline
+        base_cp_rate = 0.0020
+        if verified_drop_15kj_pct is not None and verified_drop_15kj_pct > 0:
+            base_cp_rate = max(0.0012, min(0.0040, (float(verified_drop_15kj_pct) / 100.0) * 0.25))
+        cp_drop = min(0.18, excess * base_cp_rate * fuel_mult)
+        wp_drop = min(0.35, excess * 0.0055 * fuel_mult)
+        cp_eff = cp_fresh * (1.0 - cp_drop)
+        wp_eff = wp_fresh * (1.0 - wp_drop)
+        cp_drop_pct = round(cp_drop * 100.0, 1)
+        wp_drop_pct = round(wp_drop * 100.0, 1)
+
+    p5_eff = float(p_5min_w) if (p_5min_w and float(p_5min_w) > cp_fresh) else (cp_fresh + wp_fresh / 300.0)
+    p5_deg = p5_eff * (cp_eff / cp_fresh)
+    p_vo2max = max(cp_eff * 1.15, p5_deg * 0.92)
+
+    # Chorley bi-exponential pools: fast PCr/myoglobin pool (`fc`) + slow glycolytic pool (`sc`)
+    fc_amp = 0.40 * wp_eff
+    sc_amp = 0.60 * wp_eff
+    fc_bal = fc_amp
+    sc_bal = sc_amp
+    vo2_frac = 0.15
+
+    min_tot = wp_eff
+    min_fc = fc_amp
+    t_ge_90_s = 0
+    peak_vo2 = 0.0
+    blowup_s: int | None = None
+    kj_above = 0.0
+    total_kj = 0.0
+
+    for idx, raw_p in enumerate(watts or []):
+        p = max(0.0, float(raw_p or 0.0))
+        total_kj += p / 1000.0
+        if p > cp_eff:
+            burn = p - cp_eff
+            kj_above += burn / 1000.0
+            take_fc = min(fc_bal, burn * 0.65)
+            rem = burn - take_fc
+            take_sc = min(sc_bal, rem)
+            leftover = rem - take_sc
+            if leftover > 0.0:
+                take_fc = min(fc_bal, take_fc + leftover)
+            fc_bal = max(0.0, fc_bal - take_fc)
+            sc_bal = max(0.0, sc_bal - take_sc)
+        else:
+            pct_d_cp = max(0.0, min(100.0, ((cp_eff - p) / cp_eff) * 100.0))
+            tau_fc = 45.0 * math.exp(-0.014 * pct_d_cp) + 9999.0 * math.exp(-0.811 * pct_d_cp)
+            tau_sc = 9999.0 * math.exp(-0.098 * pct_d_cp) + 429.0
+            fc_bal = fc_amp - (fc_amp - fc_bal) * math.exp(-1.0 / max(15.0, tau_fc))
+            sc_bal = sc_amp - (sc_amp - sc_bal) * math.exp(-1.0 / max(60.0, tau_sc))
+
+        wtot = fc_bal + sc_bal
+        if wtot < min_tot:
+            min_tot = wtot
+        if fc_bal < min_fc:
+            min_fc = fc_bal
+        if blowup_s is None and wtot <= 100.0:
+            blowup_s = idx
+
+        # Guardrail #4: 1st-order VO2(t) kinetics (tau_on ~ 22-30s, tau_off ~ 35s) + severe slow component
+        u_prim = 0.08 + 0.92 * (p / max(100.0, p_vo2max))
+        w_dep = max(0.0, 1.0 - (wtot / wp_eff))
+        fc_dep = max(0.0, 1.0 - (fc_bal / fc_amp))
+        slow_c = (0.14 * w_dep) if p > cp_eff else (0.04 * w_dep)
+        u_tgt = min(1.0, max(0.08, u_prim + slow_c))
+        tau_vo2 = (30.0 - 8.0 * fc_dep) if u_tgt >= vo2_frac else 35.0
+        vo2_frac += (u_tgt - vo2_frac) / max(15.0, tau_vo2)
+        if vo2_frac > peak_vo2:
+            peak_vo2 = vo2_frac
+        if vo2_frac >= 0.90:
+            t_ge_90_s += 1
+
+    n_s = len(watts or [])
+    avg_w = round(sum(watts) / n_s, 1) if n_s else 0.0
+    wb = work_block_watts if work_block_watts else watts
+    wb_avg_w = round(sum(wb) / len(wb), 1) if wb else avg_w
+    w_min_pct = round((min_tot / wp_eff) * 100.0, 1)
+    w_min_kj = round(min_tot / 1000.0, 1)
+    fc_min_pct = round((min_fc / fc_amp) * 100.0, 1)
+    t90_min = round(t_ge_90_s / 60.0, 1)
+    peak_vo2_pct = round(peak_vo2 * 100.0, 1)
+
+    safety_floor_kj = min(3.0, round(0.15 * (wp_eff / 1000.0), 2))
+    unsustainable = (blowup_s is not None) or (w_min_kj < safety_floor_kj and kj_above > 5.0)
+
+    if unsustainable:
+        stim_class = "UNSUSTAINABLE_BLOWOUT"
+    elif t90_min >= 7.0 and w_min_pct <= 45.0:
+        stim_class = "TRUE_VO2MAX_SEVERE"
+    elif kj_above >= 10.0 and w_min_pct <= 45.0 and t90_min < 7.0:
+        stim_class = "ANAEROBIC_CAPACITY_LOW_VO2"
+    elif kj_above >= 4.0 or wb_avg_w >= 0.88 * cp_eff:
+        stim_class = "THRESHOLD_OR_SHUTTLE_OPENER"
+    elif avg_w >= 0.60 * cp_eff:
+        stim_class = "AEROBIC_BASE_Z2"
+    else:
+        stim_class = "RECOVERY_Z1"
+
+    # Compiler-Guard mismatch detection against workout title intent
+    t_low = str(title or "").lower()
+    claims_vo2 = any(k in t_low for k in ("vo2", "vo₂", "rønnestad", "ronnestad", "hard-start", "hard start", "map"))
+    claims_opener = any(k in t_low for k in ("opener", "re-entry", "reentry", "threshold", "shuttle", "z1", "z2", "base", "recovery"))
+    mismatch = ""
+    if unsustainable:
+        where_s = f" at t={blowup_s // 60}m{blowup_s % 60:02d}s" if blowup_s is not None else ""
+        mismatch = (
+            f"BLOWOUT WARNING: W'bal drops to {w_min_pct}% ({w_min_kj} kJ < {safety_floor_kj} kJ safety floor){where_s} "
+            "— reduce On-power or add recovery!"
+        )
+    elif claims_vo2 and not claims_opener:
+        if t90_min < 7.0:
+            mismatch = (
+                f"STIMULUS MISMATCH: Title claims VO2max, but Time >=90% VO2max is only {t90_min} min (< 7.0 min) "
+                f"with W'bal_min={w_min_pct}% ({w_min_kj} kJ) -> actual stimulus is {stim_class}."
+            )
+        elif w_min_pct > 55.0:
+            mismatch = (
+                f"STIMULUS MISMATCH: Title claims VO2max, but W'bal_min stays at {w_min_pct}% (>55%) -> "
+                "this is intermittent threshold, not severe VO2max."
+            )
+
+    return {
+        "duration_min": round(n_s / 60.0, 1),
+        "cp_eff_w": round(cp_eff, 1),
+        "wp_eff_kj": round(wp_eff / 1000.0, 1),
+        "pre_fatigue_kj": round(float(prior_kj or 0.0), 0),
+        "cho_g_h": round(float(cho_g_h or 60.0), 0),
+        "cp_drop_pct": cp_drop_pct,
+        "wp_drop_pct": wp_drop_pct,
+        "avg_w": avg_w,
+        "work_block_avg_w": wb_avg_w,
+        "total_kj": round(total_kj, 0),
+        "kj_above_cp": round(kj_above, 1),
+        "w_bal_min_pct": w_min_pct,
+        "w_bal_min_kj": w_min_kj,
+        "fc_pcr_min_pct": fc_min_pct,
+        "time_ge_90_vo2max_min": t90_min,
+        "peak_vo2_pct": peak_vo2_pct,
+        "blowup_s": blowup_s,
+        "stimulus_class": stim_class,
+        "stimulus_mismatch": mismatch,
+    }
+
+
+def solve_individual_interval_prescriptions(
+    cp_watts: float | None,
+    w_prime_j: float | None,
+    p_5min_w: float | None = None,
+    p2_metabolic: dict[str, Any] | None = None,
+    p4_myotype: dict[str, Any] | None = None,
+    mass_kg: float | None = 75.0,
+) -> dict[str, Any]:
+    """Constrained 1-Hz inverse `W'bal` + `VO2(t)` prescription solver individualized to `(CP, W', vLamax_met, Z_Myo)`.
+
+    Enforces:
+      - Diesel safety floor: `target_reserve >= max(0.18 * W', 3.0 kJ)`
+      - Aerobic IIx-cap on `30/15s`: never pushes `P_on` above `min(0.98 * P_5m, CP + 0.35 * W'/100)` —
+        automatically raises `P_off` (Float) instead of driving `P_on` into an anaerobic sprint trap!
+      - 2-stage Hard-Start `4x4m`: Stage 1 targets `60-70%` fast PCr depletion in 45s without `W'_SC` flood;
+        Stage 2 bisects `P_hold` (3:15m) to hit target reserve in Set 4.
+      - Controlled `1:4` Lactate-Shuttle: anchors `4m Under` at `80-86% CP` (near LT1) and bounds `1m Over`
+        to `15-20% W'` per bout (preventing `460-500W` IIx blasts).
+    """
+    if not cp_watts or float(cp_watts) < 80.0 or not w_prime_j or float(w_prime_j) < 4000.0:
+        return {}
+
+    cp = float(cp_watts)
+    wp = float(w_prime_j)
+    bw = max(40.0, float(mass_kg or 75.0))
+    p5 = float(p_5min_w) if (p_5min_w and float(p_5min_w) > cp) else (cp + wp / 300.0)
+    p2 = p2_metabolic or {}
+
+    # Guardrail #3b: Diesel safety floor (`max(0.18 * W', 3.0 kJ)`, capped at 0.45*W' only for ultra-tiny W')
+    target_res_j = min(0.45 * wp, max(0.20 * wp, 3000.0))
+    target_res_kj = round(target_res_j / 1000.0, 1)
+
+    # Guardrail #3b: IIx-Cap for aerobic VO2max 30/15s
+    p_on_iix_cap = min(p5 * 0.98, cp + 0.35 * (wp / 100.0))
+    p_on_iix_cap = max(cp * 1.15, p_on_iix_cap)
+
+    def _build_3015(p_on: float, p_off: float, sets: int = 3, reps: int = 13) -> tuple[list[float], list[float]]:
+        w = [0.60 * cp] * 600
+        wb: list[float] = []
+        for s in range(sets):
+            for r in range(reps):
+                w.extend([p_on] * 30 + [p_off] * 15)
+                wb.extend([p_on] * 30 + [p_off] * 15)
+            if s < sets - 1:
+                w.extend([0.52 * cp] * 300)
+        return w, wb
+
+    # 1. Re-Entry / Threshold-Opener 30/15 Float (`119% / 65% CP`, honestly labeled Threshold-Opener)
+    op_on = int(round(cp * 1.19))
+    op_off = int(round(cp * 0.65))
+    op_w, op_wb = _build_3015(op_on, op_off, 3, 13)
+    op_sim = simulate_workout_stream(op_w, cp, wp, p5, bw, work_block_watts=op_wb)
+
+    # 2. VO2max Float 30/15 (`3x13`, `Off = 68-70% CP`, bisected to hit `target_res_j`, bounded by `p_on_iix_cap`)
+    fl_off = int(round(cp * 0.70))
+    lo, hi = cp * 1.03, p_on_iix_cap
+    for _ in range(28):
+        mid = 0.5 * (lo + hi)
+        sw, swb = _build_3015(mid, fl_off, 3, 13)
+        sm = simulate_workout_stream(sw, cp, wp, p5, bw, work_block_watts=swb)
+        if sm["w_bal_min_kj"] * 1000.0 > target_res_j:
+            lo = mid
+        else:
+            hi = mid
+    fl_on = int(round(0.5 * (lo + hi)))
+    fl_w, fl_wb = _build_3015(fl_on, fl_off, 3, 13)
+    fl_sim = simulate_workout_stream(fl_w, cp, wp, p5, bw, work_block_watts=fl_wb)
+
+    # 3. VO2max Classic 30/15 (`Off = 50% CP`) — if `P_on` hits `p_on_iix_cap`, auto-escalate `P_off` (Float)!
+    cl_off = int(round(cp * 0.50))
+    lo, hi = cp * 1.03, p_on_iix_cap * 1.15
+    for _ in range(28):
+        mid = 0.5 * (lo + hi)
+        sw, swb = _build_3015(mid, cl_off, 3, 13)
+        sm = simulate_workout_stream(sw, cp, wp, p5, bw, work_block_watts=swb)
+        if sm["w_bal_min_kj"] * 1000.0 > target_res_j:
+            lo = mid
+        else:
+            hi = mid
+    cl_on_raw = 0.5 * (lo + hi)
+    cl_capped = False
+    if cl_on_raw > p_on_iix_cap:
+        cl_capped = True
+        cl_on = int(round(p_on_iix_cap))
+        # Auto-raise P_off instead of breaching IIx-Cap!
+        o_lo, o_hi = cp * 0.50, cp * 0.82
+        for _ in range(24):
+            omid = 0.5 * (o_lo + o_hi)
+            sw, swb = _build_3015(cl_on, omid, 3, 13)
+            sm = simulate_workout_stream(sw, cp, wp, p5, bw, work_block_watts=swb)
+            if sm["w_bal_min_kj"] * 1000.0 > target_res_j:
+                o_lo = omid
+            else:
+                o_hi = omid
+        cl_off = int(round(0.5 * (o_lo + o_hi)))
+    else:
+        cl_on = int(round(cl_on_raw))
+    cl_w, cl_wb = _build_3015(cl_on, cl_off, 3, 13)
+    cl_sim = simulate_workout_stream(cl_w, cp, wp, p5, bw, work_block_watts=cl_wb)
+
+    # 4. Guardrail #3c: 2-Stage Hard-Start 4x4m (`45s Start -> 3:15m Hold`, `5m @ 50% CP rest`)
+    # Stage 1: Solve `P_start` (45s) for ~60-65% depletion of fast alactic PCr reserve (~min(0.22*W', 0.09*mass*1000))
+    # without flooding `W'_SC` (`burn = (P_start - CP)*45`, `0.65*burn = 0.62*pcr_pool`)
+    pcr_pool_j = min(0.22 * wp, 90.0 * bw)
+    p_start_raw = cp + (0.62 * pcr_pool_j) / (45.0 * 0.65)
+    hs_start = int(round(min(p5 * 1.03, max(cp * 1.15, p_start_raw))))
+
+    def _build_hs4x4(p_s: float, p_h: float) -> tuple[list[float], list[float]]:
+        w = [0.60 * cp] * 600
+        wb: list[float] = []
+        for s in range(4):
+            w.extend([p_s] * 45 + [p_h] * 195)
+            wb.extend([p_s] * 45 + [p_h] * 195)
+            if s < 3:
+                w.extend([0.50 * cp] * 300)
+        return w, wb
+
+    # Stage 2: Bisect `P_hold` (195s) so Set 4 lands cleanly on `target_res_j`
+    h_lo, h_hi = cp * 1.02, min(float(hs_start) - 10.0, p5 * 0.98)
+    for _ in range(28):
+        hmid = 0.5 * (h_lo + h_hi)
+        sw, swb = _build_hs4x4(hs_start, hmid)
+        sm = simulate_workout_stream(sw, cp, wp, p5, bw, work_block_watts=swb)
+        if sm["w_bal_min_kj"] * 1000.0 > target_res_j:
+            h_lo = hmid
+        else:
+            h_hi = hmid
+    hs_hold = int(round(0.5 * (h_lo + h_hi)))
+    hs_w, hs_wb = _build_hs4x4(hs_start, hs_hold)
+    hs_sim = simulate_workout_stream(hs_w, cp, wp, p5, bw, work_block_watts=hs_wb)
+
+    # 5. Guardrail #3a: Controlled 1:4 Lactate-Shuttle (`6x [1m Over / 4m Under]`)
+    # Anchor `4m Under` at `80-86% CP` (near LT1) for max aerobic ATP & MCT1 lactate clearance;
+    # bound `1m Over` to controlled `15-18% W'` pulse per 1m bout (never 460-500W IIx blast!)
+    lt1_w = p2.get("p_lt1_w") or int(round(cp * 0.78))
+    sh_under = int(round(max(cp * 0.80, min(cp * 0.86, lt1_w * 1.05))))
+    # 1m Over burns ~16-18% of W' per bout, clamped <= 0.92 * P_5m and <= 1.28 * CP
+    over_target_j = min(0.17 * wp, 0.28 * cp * 60.0)
+    sh_over = int(round(min(p5 * 0.92, max(cp * 1.12, cp + over_target_j / 60.0))))
+    sh_w = [0.60 * cp] * 600
+    sh_wb: list[float] = []
+    for _ in range(6):
+        sh_w.extend([sh_over] * 60 + [sh_under] * 240)
+        sh_wb.extend([sh_over] * 60 + [sh_under] * 240)
+    sh_sim = simulate_workout_stream(sh_w, cp, wp, p5, bw, work_block_watts=sh_wb)
+
+    # 6. Sub-Threshold / MLSS Builder (`4x10m @ MLSS`)
+    mlss_w = p2.get("p_mlss_w") or int(round(cp * 0.95))
+
+    return {
+        "target_reserve_kj": target_res_kj,
+        "iix_cap_w": int(round(p_on_iix_cap)),
+        "re_entry_opener": {
+            "label": "Re-Entry Threshold-Opener 30/15 Float (intermittent CP, NOT VO2max)",
+            "on_w": op_on, "on_pct": int(round(op_on / cp * 100)),
+            "off_w": op_off, "off_pct": int(round(op_off / cp * 100)),
+            "block_avg_w": op_sim["work_block_avg_w"],
+            "w_bal_min_pct": op_sim["w_bal_min_pct"],
+            "t90_min": op_sim["time_ge_90_vo2max_min"],
+            "dsl": f"3x (13x 30s@{int(round(op_on / cp * 100))}% / 15s@{int(round(op_off / cp * 100))}%)",
+        },
+        "vo2max_float_30_15": {
+            "label": "VO2max Float 30/15 (3x13, W'-scaled)",
+            "on_w": fl_on, "on_pct": int(round(fl_on / cp * 100)),
+            "off_w": fl_off, "off_pct": int(round(fl_off / cp * 100)),
+            "block_avg_w": fl_sim["work_block_avg_w"],
+            "w_bal_min_pct": fl_sim["w_bal_min_pct"],
+            "w_bal_min_kj": fl_sim["w_bal_min_kj"],
+            "t90_min": fl_sim["time_ge_90_vo2max_min"],
+            "dsl": f"13x 30s@{int(round(fl_on / cp * 100))}% / 15s@{int(round(fl_off / cp * 100))}%",
+        },
+        "vo2max_classic_30_15": {
+            "label": "VO2max Classic 30/15 (auto-float if IIx-capped)",
+            "on_w": cl_on, "on_pct": int(round(cl_on / cp * 100)),
+            "off_w": cl_off, "off_pct": int(round(cl_off / cp * 100)),
+            "iix_capped": cl_capped,
+            "block_avg_w": cl_sim["work_block_avg_w"],
+            "w_bal_min_pct": cl_sim["w_bal_min_pct"],
+            "t90_min": cl_sim["time_ge_90_vo2max_min"],
+        },
+        "vo2max_hard_start_4x4": {
+            "label": "VO2max Hard-Start 4x4m (2-Stage PCr+W' solved, 5m rest)",
+            "start_w": hs_start, "start_pct": int(round(hs_start / cp * 100)),
+            "hold_w": hs_hold, "hold_pct": int(round(hs_hold / cp * 100)),
+            "block_avg_w": hs_sim["work_block_avg_w"],
+            "w_bal_min_pct": hs_sim["w_bal_min_pct"],
+            "w_bal_min_kj": hs_sim["w_bal_min_kj"],
+            "fc_pcr_min_pct": hs_sim["fc_pcr_min_pct"],
+            "t90_min": hs_sim["time_ge_90_vo2max_min"],
+            "dsl": f"4x (45s@{hs_start}W + 3.25m@{hs_hold}W) / 5m@{int(round(cp * 0.50))}W",
+        },
+        "lactate_shuttle_1_4": {
+            "label": "1:4 Lactate-Shuttle Over/Under (6x, Under@80-86% CP, Over=15-20% W' pulse)",
+            "over_w": sh_over, "over_pct": int(round(sh_over / cp * 100)),
+            "under_w": sh_under, "under_pct": int(round(sh_under / cp * 100)),
+            "w_bal_min_pct": sh_sim["w_bal_min_pct"],
+            "dsl": f"6x 1m@{int(round(sh_over / cp * 100))}% / 4m@{int(round(sh_under / cp * 100))}%",
+        },
+        "sub_threshold": {
+            "label": "Sub-Threshold / MLSS Builder (4x10m)",
+            "target_w": mlss_w, "target_pct": int(round(mlss_w / cp * 100)),
+        },
+    }
+
+
 # ---------------------------------------------------------------------------
 # 4. Pillar 4: Sprint Torque-Velocity (with ERG Filter) & Myotype Z-Score
 # ---------------------------------------------------------------------------
@@ -644,17 +1122,17 @@ def compute_pillar4_myotype(
         if z_myo > 0.50:
             myo_cls = "Fast Myotype"
             rec_hiit_h = "48–72 h (>5h neuromuscular SR recovery)"
-            vo2_proto = "Rønnestad 30/15s (3x13, 'On' strictly anchored to CP, never P_5min) or 1:4 Lactate-Shuttle Over/Unders"
-            avoid_proto = "Continuous 5x5m @ 120% FTP_20 & back-to-back HIIT days (triggers rapid acidosis & Overreaching)"
+            vo2_proto = "W'-scaled Float 30/15s, 2-Stage Hard-Start 4x4m, or 1:4 Lactate-Shuttle (see [3B_prescriptions] — NEVER static % CP!)"
+            avoid_proto = "Uncapped 500W 30/15s, static % CP VO2 guesses, or back-to-back HIIT days"
         elif z_myo < -0.50:
             myo_cls = "Slow Myotype"
             rec_hiit_h = "24 h (fast ~20m neuromuscular rebound)"
-            vo2_proto = "Bossi Alternating 5x5m (30s@100% P_5m / 60s@77% P_5m) or 5x4m @ 108-115% CP (95-105 rpm)"
+            vo2_proto = "W'-scaled 2-Stage Hard-Start 4x4m / Bossi Alternating 5x5m (see [3B_prescriptions] — respect 3.0 kJ Diesel W' floor!)"
             avoid_proto = "Mild 30/30 intervals (fast tau_W' drops VO2 kinetics too far during 30s rests)"
         else:
             myo_cls = "Intermediate Myotype"
             rec_hiit_h = "36–48 h"
-            vo2_proto = "Pyramidal mix: 4x8m @ 102-105% CP + 4x4m @ 110% CP"
+            vo2_proto = "W'-scaled Pyramidal mix: Sub-Threshold MLSS + Float 30/15s or Hard-Start 4x4m (see [3B_prescriptions])"
             avoid_proto = "Chronic monotony without recovery days"
 
     return {
@@ -1501,43 +1979,45 @@ def detect_lsct_warmup(
     return None
 
 
-def format_seven_pillar_blocks(telemetry: dict[str, Any]) -> str:
-    """Render the compact, zero-hallucination 7-Pillar Vector + Missing Gate + Autonomy + Question Radar."""
+def format_seven_pillar_blocks(telemetry: dict[str, Any], include_actions: bool = True) -> str:
+    """Render the compact, zero-hallucination 7-Pillar Vector + W'-Scaled Prescriptions + Missing Gate + Question Radar."""
     sp = telemetry.get("seven_pillars") or {}
     audit = telemetry.get("coach_audit") or {}
     resp_m = telemetry.get("response_model") or {}
     prof = telemetry.get("profile") or {}
     lines: list[str] = []
 
-    # Block 0: Missing-Data & Calibration Gate
-    miss = audit.get("missing_critical") or []
-    cal_gaps = audit.get("calibration_gaps") or []
-    if miss or cal_gaps:
-        lines.append("=== 0. MISSING-DATA & CALIBRATION GATE (NO SILENT FALLBACKS!) ===")
-        for m in miss:
-            lines.append(f"  [MISSING: {m['field']}] Affects {m['blocks']} -> ASK ATHLETE: \"{m['ask']}\"")
-        for cg in cal_gaps:
-            lines.append(f"  [CALIBRATION] {cg}")
+    if include_actions:
+        # Block 0: Missing-Data & Calibration Gate
+        miss = audit.get("missing_critical") or []
+        cal_gaps = audit.get("calibration_gaps") or []
+        if miss or cal_gaps:
+            lines.append("=== 0. MISSING-DATA & CALIBRATION GATE (NO SILENT FALLBACKS!) ===")
+            for m in miss:
+                lines.append(f"  [MISSING: {m['field']}] Affects {m['blocks']} -> ASK ATHLETE: \"{m['ask']}\"")
+            for cg in cal_gaps:
+                lines.append(f"  [CALIBRATION] {cg}")
 
-    # Block 1: Autonomy & Accountability Directives
-    auto_acts = audit.get("autonomy_actions") or []
-    acc_flags = audit.get("accountability_flags") or []
-    persona = prof.get("coach_style") or "direct-demanding"
-    acc_lvl = prof.get("accountability") or "strict"
-    lines.append(f"=== 1A. AUTONOMOUS AGENT ACTIONS & COACH ACCOUNTABILITY (style: {persona}, accountability: {acc_lvl}) ===")
-    if auto_acts:
-        for act in auto_acts:
-            lines.append(f"  -> {act}")
-    else:
-        lines.append("  -> Files up-to-date (`macro-plan.md`, `dna.md`, 7d workout horizon).")
-    for af in acc_flags:
-        lines.append(f"  [!] {af}")
+        # Block 1: Autonomy & Accountability Directives
+        auto_acts = audit.get("autonomy_actions") or []
+        acc_flags = audit.get("accountability_flags") or []
+        persona = prof.get("coach_style") or "direct-demanding"
+        acc_lvl = prof.get("accountability") or "strict"
+        lines.append(f"=== 1A. AUTONOMOUS AGENT ACTIONS & COACH ACCOUNTABILITY (style: {persona}, accountability: {acc_lvl}) ===")
+        if auto_acts:
+            for act in auto_acts:
+                lines.append(f"  -> {act}")
+        else:
+            lines.append("  -> Files up-to-date (`macro-plan.md`, `dna.md`, 7d workout horizon).")
+        for af in acc_flags:
+            lines.append(f"  [!] {af}")
 
     # Block 2: The 7-Pillar Biophysical Vector
     b = sp.get("body") or {}
     p1 = sp.get("pillar1_oxidative") or {}
     p2 = sp.get("pillar2_metabolic") or {}
     p3 = sp.get("pillar3_kinetics") or {}
+    p3_rx = sp.get("pillar3_prescriptions") or {}
     p4 = sp.get("pillar4_myotype") or {}
     p5 = sp.get("pillar5_durability") or {}
     p6 = sp.get("pillar6_locomotion") or {}
@@ -1552,13 +2032,16 @@ def format_seven_pillar_blocks(telemetry: dict[str, Any]) -> str:
             f"FFM={b.get('ffm_kg') or '—'}kg | Vol_rel={b.get('vol_rel_ind')}L/kg | "
             f"sex={prof.get('sex')} | age={prof.get('age') or '—'} | creatine={prof.get('creatine_flag')}"
         )
-        if p1.get("vo2max_rel_clean") or p2.get("vlamax_sprint_proxy"):
+        if p1.get("vo2max_rel_clean") or p2.get("vlamax_sprint_proxy") or p2.get("vlamax_met_mmol_l_s"):
+            fm_band = p2.get("fatmax_band_w")
+            fm_str = f"{fm_band[0]}–{fm_band[1]}W" if fm_band else f"{p2.get('p_fatmax_w') or '—'}W"
             lines.append(
                 f"  [2_metabolic S1+S2] VO2max_clean={p1.get('vo2max_rel_clean') or '—'} mL/kg/min "
                 f"(VO2max_FFM={p1.get('vo2max_ffm') or '—'}, W'-deduct={p1.get('w_prime_deduction_w') or 0}W) | "
-                f"vLamax_sprint={p2.get('vlamax_sprint_proxy') or '—'} mmol/L/s ({p2.get('vlamax_confidence')}) | "
+                f"vLamax_met={p2.get('vlamax_met_mmol_l_s') or '—'} mmol/L/s (inverse Mader; alactic_15s_sprint_proxy={p2.get('vlamax_sprint_proxy') or '—'}) | "
                 f"eta_shuttle={p2.get('shuttle_index_eta') or '—'} ({p2.get('shuttle_class') or 'uncalibrated'}) | "
-                f"FatMax={p2.get('p_fatmax_w') or '—'}W ({p2.get('mfo_g_min') or '—'}g/min) | CarbMax@90g/h={p2.get('p_carbmax_90_w') or '—'}W"
+                f"Sub-CP f(CP,vLamax_met): FatMax={fm_str} ({p2.get('mfo_g_min') or '—'}g/min), LT1={p2.get('p_lt1_w') or '—'}W, MLSS={p2.get('p_mlss_w') or '—'}W | "
+                f"CarbMax@90g/h={p2.get('p_carbmax_90_w') or '—'}W"
             )
         if cp_m.get("cp_w") or telemetry.get("effective_cp_w"):
             lines.append(
@@ -1566,6 +2049,37 @@ def format_seven_pillar_blocks(telemetry: dict[str, Any]) -> str:
                 f"W'={cp_m.get('w_prime_kj') or telemetry.get('effective_w_prime_kj') or '—'}kJ | "
                 f"MPR={p3.get('mpr_w') or '—'}W | OmniPD_A={p3.get('omni_decay_a_w') or '—'}W | "
                 f"Chorley tau_FC(50%CP)={p3.get('tau_fc_50pct_s') or 22}s, tau_SC={p3.get('tau_sc_50pct_s') or 503}s"
+            )
+        if p3_rx:
+            op = p3_rx.get("re_entry_opener") or {}
+            fl = p3_rx.get("vo2max_float_30_15") or {}
+            cl = p3_rx.get("vo2max_classic_30_15") or {}
+            hs = p3_rx.get("vo2max_hard_start_4x4") or {}
+            sh = p3_rx.get("lactate_shuttle_1_4") or {}
+            st = p3_rx.get("sub_threshold") or {}
+            cl_note = " [IIx-capped -> auto-float]" if cl.get("iix_capped") else ""
+            lines.append(
+                f"  [3B_prescriptions W'-scaled (1-Hz Chorley+VO2 solved; floor={p3_rx.get('target_reserve_kj')}kJ, IIx_cap={p3_rx.get('iix_cap_w')}W — NEVER guess % CP!)]"
+            )
+            lines.append(
+                f"    • Threshold-Opener 30/15 (Re-Entry, NOT VO2max): {op.get('on_w')}W ({op.get('on_pct')}%) / {op.get('off_w')}W ({op.get('off_pct')}%) "
+                f"[avg {op.get('block_avg_w')}W, W'bal_min={op.get('w_bal_min_pct')}%, t>=90%VO2={op.get('t90_min')}m]"
+            )
+            lines.append(
+                f"    • VO2max Float 30/15 (3x13): {fl.get('on_w')}W ({fl.get('on_pct')}%) / {fl.get('off_w')}W ({fl.get('off_pct')}%) "
+                f"[avg {fl.get('block_avg_w')}W, W'bal_min={fl.get('w_bal_min_pct')}% ({fl.get('w_bal_min_kj')}kJ), t>=90%VO2={fl.get('t90_min')}m]"
+            )
+            lines.append(
+                f"    • VO2max Classic 30/15 (3x13{cl_note}): {cl.get('on_w')}W ({cl.get('on_pct')}%) / {cl.get('off_w')}W ({cl.get('off_pct')}%) "
+                f"[avg {cl.get('block_avg_w')}W, W'bal_min={cl.get('w_bal_min_pct')}%, t>=90%VO2={cl.get('t90_min')}m]"
+            )
+            lines.append(
+                f"    • VO2max Hard-Start 4x4m (2-Stage, 5m rest): 45s@{hs.get('start_w')}W ({hs.get('start_pct')}%) -> 3:15m@{hs.get('hold_w')}W ({hs.get('hold_pct')}%) "
+                f"[avg {hs.get('block_avg_w')}W, W'bal_min={hs.get('w_bal_min_pct')}% ({hs.get('w_bal_min_kj')}kJ), PCr_min={hs.get('fc_pcr_min_pct')}%, t>=90%VO2={hs.get('t90_min')}m]"
+            )
+            lines.append(
+                f"    • 1:4 Lactate-Shuttle (6x): 1m@{sh.get('over_w')}W ({sh.get('over_pct')}%) / 4m@{sh.get('under_w')}W ({sh.get('under_pct')}%) "
+                f"[W'bal_min={sh.get('w_bal_min_pct')}%] | Sub-Threshold 4x10m: {st.get('target_w')}W ({st.get('target_pct')}%)"
             )
         if p4.get("myotype_z_score") is not None or p4.get("t_max_nm_kg") is not None:
             lines.append(
@@ -1617,14 +2131,15 @@ def format_seven_pillar_blocks(telemetry: dict[str, Any]) -> str:
         )
 
     # Socratic Question Radar
-    pq = audit.get("priority_questions") or []
-    dq = audit.get("discovery_questions") or []
-    if pq or dq:
-        lines.append("=== 1C. SOCRATIC QUESTION RADAR (ASK 1-2 SHARP QUESTIONS AT END OF REPLY!) ===")
-        for q in pq:
-            lines.append(f"  [Acute/Data] {q}")
-        for q in dq:
-            lines.append(f"  [Athlete Discovery -> file answer in brain/coach/playbook.md] {q}")
+    if include_actions:
+        pq = audit.get("priority_questions") or []
+        dq = audit.get("discovery_questions") or []
+        if pq or dq:
+            lines.append("=== 1C. SOCRATIC QUESTION RADAR (ASK 1-2 SHARP QUESTIONS AT END OF REPLY!) ===")
+            for q in pq:
+                lines.append(f"  [Acute/Data] {q}")
+            for q in dq:
+                lines.append(f"  [Athlete Discovery -> file answer in brain/coach/playbook.md] {q}")
 
     return "\n".join(lines)
 

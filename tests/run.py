@@ -2056,6 +2056,125 @@ class UiReleaseV11(AtlasCase):
         for c in mutating_cmds:
             self.assertFalse(hk_mod._is_readonly_shell_cmd(c), f"Expected mutating False for: {c}")
 
+    def test_coach_v145_physics_and_guardrails(self):
+        """v1.4.5: Mader vLamax_met + dynamic Sub-CP, W'-scaled 1-Hz solver, VO2(t) guard, pre-fatigue & polish."""
+        import datetime as dt
+        import importlib.util
+        sys.path.insert(0, os.path.join(REPO, "core", "tools"))
+        from atlas_lib import pillars_engine as pe, coach_engine as ce
+
+        # 1. Separate alactic 15s sprint proxy from inverse-Mader vLamax_met + dynamic f(CP, vLamax_met)
+        body = {"mass_kg_7d": 75.0, "kfa_pct": 11.5, "kfa_calibrated": True, "ffm_kg": 66.38, "vol_rel_ind": 0.4458, "v_la_l": 33.43}
+        p1 = pe.compute_pillar1_oxidative(418.0, 31400.0, 75.0, 66.38, True)
+        curves_fast = {"fresh": {"15s": {"42d": 766, "90d": 1094, "365d": 1094}}}
+        p2_fast = pe.compute_pillar2_metabolic_mader(curves_fast, 294.0, p1["vo2max_rel_clean"], body, t_alac_s=2.0)
+        self.assertGreater(p2_fast["vlamax_sprint_proxy"], 0.85)
+        self.assertTrue(0.52 <= p2_fast["vlamax_met_mmol_l_s"] <= 0.66, p2_fast)
+        self.assertTrue(208 <= p2_fast["fatmax_band_w"][0] <= 216, p2_fast)
+        self.assertTrue(220 <= p2_fast["fatmax_band_w"][1] <= 230, p2_fast)
+        self.assertTrue(225 <= p2_fast["p_lt1_w"] <= 236, p2_fast)
+
+        # Diesel phenotype (low vLamax_met) gets higher FatMax & LT1 % CP than high-vLamax Sprinter at identical CP
+        p2_diesel = pe.compute_pillar2_metabolic_mader({"fresh": {"15s": {"90d": 620}}}, 294.0, 56.0, body, t_alac_s=3.0)
+        self.assertGreater(p2_diesel["p_fatmax_w"], p2_fast["p_fatmax_w"])
+        self.assertGreater(p2_diesel["p_lt1_w"], p2_fast["p_lt1_w"])
+        self.assertGreater(p2_diesel["p_mlss_w"], p2_fast["p_mlss_w"])
+
+        # 2. Constrained 1-Hz inverse W'bal + VO2(t) solver (Fast-Myotype 31.4 kJ vs Diesel 10.5 kJ)
+        rx_fast = pe.solve_individual_interval_prescriptions(294.0, 31400.0, 418.0, p2_fast, {}, 75.0)
+        self.assertLess(rx_fast["re_entry_opener"]["t90_min"], 2.0)
+        self.assertGreaterEqual(rx_fast["vo2max_float_30_15"]["t90_min"], 7.0)
+        self.assertLessEqual(rx_fast["vo2max_float_30_15"]["on_w"], rx_fast["iix_cap_w"])
+        self.assertGreaterEqual(rx_fast["vo2max_float_30_15"]["w_bal_min_kj"], 5.0)
+        self.assertGreaterEqual(rx_fast["vo2max_hard_start_4x4"]["t90_min"], 9.0)
+        self.assertGreater(rx_fast["vo2max_hard_start_4x4"]["start_w"], rx_fast["vo2max_hard_start_4x4"]["hold_w"] + 40)
+        # 1:4 Shuttle anchored near LT1 (80-86% CP) and Over capped well below 460W
+        self.assertTrue(235 <= rx_fast["lactate_shuttle_1_4"]["under_w"] <= 253, rx_fast["lactate_shuttle_1_4"])
+        self.assertTrue(340 <= rx_fast["lactate_shuttle_1_4"]["over_w"] <= 385, rx_fast["lactate_shuttle_1_4"])
+
+        # Diesel safety floor >= 3.0 kJ
+        rx_diesel = pe.solve_individual_interval_prescriptions(294.0, 10500.0, 330.0, p2_diesel, {}, 65.0)
+        self.assertGreaterEqual(rx_diesel["target_reserve_kj"], 3.0)
+        self.assertGreaterEqual(rx_diesel["vo2max_float_30_15"]["w_bal_min_kj"], 2.8)
+        self.assertLess(rx_diesel["vo2max_float_30_15"]["on_w"], rx_fast["vo2max_float_30_15"]["on_w"])
+
+        # 3. 1-Hz VO2(t) Compiler-Guard catches fake VO2 (`4x 40s@705W / 4m@155W`), blowout (`450/225W`), and pre-fatigue
+        fake_vo2 = [180.0] * 600 + ([705.0] * 40 + [155.0] * 240) * 4
+        sim_fake = pe.simulate_workout_stream(fake_vo2, 294.0, 31400.0, 418.0, 75.0, title="VO2max Killer")
+        self.assertIn("STIMULUS MISMATCH", sim_fake["stimulus_mismatch"])
+        self.assertLess(sim_fake["time_ge_90_vo2max_min"], 2.0)
+
+        blow_set = ([450.0] * 30 + [225.0] * 15) * 12
+        blow_stream = [180.0] * 600 + blow_set + [153.0] * 300 + blow_set + [153.0] * 300 + blow_set
+        sim_blow = pe.simulate_workout_stream(blow_stream, 294.0, 31400.0, 418.0, 75.0, title="Float 30/15")
+        self.assertEqual(sim_blow["stimulus_class"], "UNSUSTAINABLE_BLOWOUT")
+        self.assertIn("BLOWOUT WARNING", sim_blow["stimulus_mismatch"])
+
+        good_fl = [180.0] * 600 + ([388.0] * 30 + [205.0] * 15) * 13 + [153.0] * 300 + ([388.0] * 30 + [205.0] * 15) * 13 + [153.0] * 300 + ([388.0] * 30 + [205.0] * 15) * 13
+        sim_fresh = pe.simulate_workout_stream(good_fl, 294.0, 31400.0, 418.0, 75.0, title="VO2max Float 30/15")
+        sim_fatig = pe.simulate_workout_stream(good_fl, 294.0, 31400.0, 418.0, 75.0, prior_kj=1600.0, cho_g_h=30.0, title="VO2max Float 30/15")
+        self.assertEqual(sim_fresh["stimulus_class"], "TRUE_VO2MAX_SEVERE")
+        self.assertEqual(sim_fresh["stimulus_mismatch"], "")
+        self.assertLess(sim_fatig["cp_eff_w"], sim_fresh["cp_eff_w"])
+        self.assertLess(sim_fatig["w_bal_min_kj"], sim_fresh["w_bal_min_kj"])
+
+        # 4. Polish: solve_cp_w_prime rejects unpaced single-month submax 20m collapse
+        bad_cp = ce.solve_cp_w_prime({"3m": 455, "5m": 418, "12m": 265, "20m": 235})
+        self.assertFalse(bad_cp["valid"])
+
+        # 5. CLI integration: coach simulate + coach push superseded archival + coach note no premature [x] + COACH_RX
+        today = dt.date.today()
+        t_iso = today.isoformat()
+        tom_iso = (today + dt.timedelta(days=1)).isoformat()
+        self.atlas("coach", "context", "--init", "--execute")
+        self.page("coach/profile.md", (
+            "---\nsummary: Profile\ntags: [sport]\ndepth: pro\nsex: male\nage: 25\ncreatine: false\n---\n"
+            "# Athlete Profile\n\n| Metric | Value | Notes |\n|---|---|---|\n"
+            "| Biometrie | 186 cm · 75,0 kg · 11,5 % KFA | Test |\n"
+            "| CP / W' | 294 W / 31.4 kJ | Anchor |\n"
+            "| Max HR / Rest HR | 200 bpm / 48 bpm | Test |\n"
+        ))
+        self.page("calendar/README.md", (
+            "---\nsummary: Cal\ntags: [atlas, calendar]\n---\n# Calendar\n\n## Timeline\n\n"
+            f"- [ ] {t_iso} 17:30 [workout:strength] Upper Body Strength (35m)\n"
+            f"- [ ] {tom_iso} 17:30 [workout:cycling] Base Z2 Old (60m | 10m WU 55-68%, 40m Z2@68%, 10m CD 62-48%)\n"
+        ))
+        # Morning readiness note must NOT mark today's open evening strength workout `[x]`
+        self.atlas("coach", "note", "--date", t_iso, "--sleep", "4.5", "--sleep-quality", "poor", "--text", "Tired morning", "--execute")
+        cal_after = self.read(os.path.join(self.brain, "calendar", "README.md"))
+        self.assertIn(f"- [ ] {t_iso} 17:30 [workout:strength]", cal_after)
+
+        # Historical RPE note must NOT append a spurious AMBER row to readiness.md
+        old_d = (today - dt.timedelta(days=12)).isoformat()
+        self.atlas("coach", "note", "--date", old_d, "--rpe", "7", "--text", "RPE 7: tough hills", "--execute")
+        rdy_after = self.read(os.path.join(self.brain, "coach", "readiness.md"))
+        self.assertNotIn(f"| {old_d} |", rdy_after)
+
+        # `coach push` archives superseded workouts into `_superseded/` and prints 1Hz-Guard audit
+        self.atlas("coach", "push", "--execute")
+        self.page("calendar/README.md", (
+            "---\nsummary: Cal\ntags: [atlas, calendar]\n---\n# Calendar\n\n## Timeline\n\n"
+            f"- [ ] {tom_iso} 17:30 [workout:cycling] VO2max Hard-Start (60m | 10m WU 55-68%, 4x (45s@420W + 3.25m@350W) / 5m@147W, 8m CD 60-48%)\n"
+        ))
+        push_out = self.atlas("coach", "push", "--execute").stdout
+        self.assertIn("1Hz-Guard", push_out)
+        self.assertIn("superseded archived", push_out)
+        sup_dir = os.path.join(self.brain, "coach", "workouts", "_superseded")
+        self.assertTrue(os.path.isdir(sup_dir) and any("base-z2-old" in f for f in os.listdir(sup_dir)))
+
+        # `coach simulate` CLI works with watts, Hard-Start syntax, and `--prior-kj`
+        sim_out = self.atlas("coach", "simulate", "--dsl", "10m WU 55-68%, 4x (45s@420W + 3.25m@350W) / 5m@147W", "--prior-kj", "1600", "--cho-g-h", "35").stdout
+        self.assertIn("1-HZ BIOPHYSICAL WORKOUT SIMULATION", sim_out)
+        self.assertIn("Pre-Fatigue Applied", sim_out)
+        self.assertIn("TRUE_VO2MAX_SEVERE", sim_out)
+
+        # COACH_RX matches Test 7 sensor/lactate/CP query on Step 1
+        spec_hk = importlib.util.spec_from_file_location("atlas_hook_v145", os.path.join(REPO, "core", "hooks", "atlas_hook.py"))
+        hk_m = importlib.util.module_from_spec(spec_hk)
+        spec_hk.loader.exec_module(hk_m)
+        mode7, _, _ = hk_m.detect_coach_mode("Wenn ich heute beim Laufen 310 W hatte und gestern auf der Rolle ein 1580 W 5s-Peak, was heißt das für CP und Laktatbildung?")
+        self.assertEqual(mode7, "daily")
+
 
 if __name__ == "__main__":
     os.makedirs(BASE_DIR, exist_ok=True)

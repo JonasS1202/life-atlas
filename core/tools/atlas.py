@@ -2787,6 +2787,8 @@ def _coach_note(
     prof_info = coach_engine.parse_athlete_profile(prof_text, fallback_ftp=ftp_w, fallback_weight=weight_kg)
 
     clean_text = (text or "").strip()
+    if rpe is not None and clean_text:
+        clean_text = re.sub(r"(?i)^rpe\s*\d+(?:/10)?\s*[:—–-]\s*", "", clean_text).strip()
     clean_sq = (sleep_quality or "").strip() or None
     if rpe is not None and clean_text:
         note_str = f"RPE {rpe}/10 — {clean_text}"
@@ -2802,8 +2804,8 @@ def _coach_note(
 
     has_readiness_args = any(v is not None for v in (rhr, sleep_h, clean_sq, soreness, hrv_rmssd, weight_kg_in, leg_pain, fatigue_7d))
     # Update activity log when workout feedback (`text` or `rpe` without pure morning check-in) is provided
+    updated_act = False
     if note_str or (rpe is not None and not has_readiness_args):
-        updated_act = False
         for a in acts:
             if isinstance(a, dict) and str(a.get("date", ""))[:10] == eff_date:
                 if note_str:
@@ -2825,8 +2827,10 @@ def _coach_note(
             acts.insert(0, new_act)
         dump_json(act_json_path, acts)
 
+        # Only mark calendar workouts `[x]` when annotating an actual workout (NOT on pure morning readiness check-ins!)
         cal_path = os.path.join(brain, "calendar", "README.md")
-        if os.path.isfile(cal_path) and note_str:
+        is_pure_readiness = has_readiness_args and rpe is None and not updated_act
+        if os.path.isfile(cal_path) and note_str and not is_pure_readiness:
             cal_txt = read(cal_path)
             lines = cal_txt.splitlines()
             for i, line in enumerate(lines):
@@ -2840,9 +2844,11 @@ def _coach_note(
                     lines[i] = f"{m.group(1)}[x]{m.group(3)}{eff_date}{rest}"
             write(cal_path, "\n".join(lines) + ("\n" if cal_txt.endswith("\n") else ""))
 
-    # Update brain/coach/readiness.md when readiness metrics (RHR, sleep, soreness, or RPE) are logged
+    # Update brain/coach/readiness.md for morning readiness metrics (or today's RPE, NOT historical Strava ride annotations!)
     rdy_status_msg = ""
-    if has_readiness_args or rpe is not None:
+    today_iso = dt.date.today().isoformat()
+    log_to_readiness = has_readiness_args or (rpe is not None and eff_date >= today_iso)
+    if log_to_readiness:
         rdy_path = os.path.join(brain, "coach", "readiness.md")
         rdy_existing = read(rdy_path) if os.path.isfile(rdy_path) else ""
         rows = coach_engine.parse_readiness_log(rdy_existing)
@@ -3114,7 +3120,8 @@ def _coach_context(
         f"Garmin Connect={'connected' if conn['garmin_connected'] else 'not connected (`atlas.py coach auth-garmin` + `.fit` ready)'} | "
         f"Intervals.icu={'connected' if conn['intervals_connected'] else 'optional'}"
     )
-    say("  On-Demand Pull CLI (call when user asks about >21d history, past blocks, or a specific session):")
+    say("  On-Demand Pull & 1-Hz Simulation CLI (NEVER compute W'bal/VO2 in your head!):")
+    say("    - `atlas.py coach simulate --dsl \"15m WU 55-68%, 13x 30s@388W / 15s@205W\" [--prior-kj 1600 --cho-g-h 60]`")
     say("    - `atlas.py coach history --months 6 [--sport cycling|running]`")
     say("    - `atlas.py coach compare --epoch-a YYYY-MM-DD..YYYY-MM-DD --epoch-b YYYY-MM-DD..YYYY-MM-DD`")
     say("    - `atlas.py coach inspect --date YYYY-MM-DD` | `atlas.py coach push --execute` | `atlas.py coach field-test --unit 1|2|preload|lsct --date YYYY-MM-DD --execute`")
@@ -3323,6 +3330,10 @@ def _coach_push(root, brain, hk, days=14, execute=True, mock_dir=None):
                for d in ("1km", "3km", "5km", "10km") if curves["run_splits"][d].get("90d")}
     cs_sol = coach_engine.solve_cs_d_prime(run_90d)
     eff_ftp = int(cp_sol["cp_w"]) if (cp_sol["valid"] and cp_sol["cp_w"]) else ftp_w
+    eff_wp_j = float(cp_sol["w_prime_j"]) if (cp_sol["valid"] and cp_sol["w_prime_j"]) else (
+        float(prof_info["w_prime_kj"]) * 1000.0 if prof_info.get("w_prime_kj") else 20000.0
+    )
+    eff_p5m = float(curves["fresh"]["5m"].get("90d") or 0) or None
     eff_cs = float(cs_sol["cs_mps"]) if (cs_sol["valid"] and cs_sol["cs_mps"]) else prof_info.get("cs_mps")
 
     idx = hk.load_index()
@@ -3337,26 +3348,110 @@ def _coach_push(root, brain, hk, days=14, execute=True, mock_dir=None):
         days=days,
         execute=execute,
         mock_dir=mock_dir,
+        w_prime_j=eff_wp_j,
+        p_5min_w=eff_p5m,
+        mass_kg=float(prof_info.get("weight_kg") or weight_kg or 75.0),
     )
     if execute:
         hk.render_calendar_html(idx, start_server=False)
+    sup_n = len(res.get("superseded_archived") or [])
+    sup_s = f", {sup_n} superseded archived" if sup_n else ""
     say(f"coach push ({'applied' if execute else 'dry-run'}): {len(res['zwo_files'])} .zwo file(s), "
-        f"{len(res['fit_files'])} .fit file(s), {len(res['device_actions'])} remote sync op(s) (anchor={eff_ftp}W).")
+        f"{len(res['fit_files'])} .fit file(s), {len(res['device_actions'])} remote sync op(s){sup_s} "
+        f"(anchor={eff_ftp}W, W'={eff_wp_j/1000.0:.1f}kJ).")
+    for sr in res.get("sim_reports") or []:
+        say(f"  [1Hz-Guard {sr['date']} '{sr['title'][:42]}'] avg={sr['work_block_avg_w']}W | "
+            f"W'bal_min={sr['w_bal_min_pct']}% ({sr['w_bal_min_kj']}kJ) | PCr_min={sr['fc_pcr_min_pct']}% | "
+            f"t>=90%VO2={sr['time_ge_90_vo2max_min']}m | {sr['stimulus_class']}")
+        if sr.get("stimulus_mismatch"):
+            say(f"    [!] {sr['stimulus_mismatch']}")
     for act_msg in res["device_actions"]:
         say(f"  - {act_msg}")
     return res
 
 
+def _coach_simulate(brain, hk, dsl_spec=None, date_str=None, prior_kj=0.0, cho_g_h=60.0):
+    """Run deterministic 1-Hz Chorley W'bal + 1st-order VO2(t) + pre-fatigue simulation on any DSL or calendar workout."""
+    ftp_w, weight_kg = _extract_profile_numbers(brain, hk)
+    prof_p = os.path.join(brain, "coach", "profile.md")
+    prof_txt = read(prof_p) if os.path.isfile(prof_p) else ""
+    c_state = hk.load_coach_state()
+    tel = coach_engine.build_coach_telemetry(prof_txt, c_state.get("activities", []), fallback_ftp=ftp_w, fallback_weight=weight_kg)
+
+    cp_w = float(tel.get("effective_cp_w") or ftp_w or 275.0)
+    wp_j = float(tel["effective_w_prime_kj"] * 1000.0) if tel.get("effective_w_prime_kj") else 20000.0
+    p5_w = float((tel.get("curves", {}).get("fresh", {}).get("5m") or {}).get("90d") or 0) or None
+    mass_kg = float((tel.get("seven_pillars", {}).get("body") or {}).get("mass_kg_7d") or weight_kg or 75.0)
+    v15_drop = (tel.get("seven_pillars", {}).get("pillar5_durability") or {}).get("verified_drop_15kj_pct")
+
+    raw_dsl = (dsl_spec or "").strip()
+    title = "Custom Workout"
+    if not raw_dsl and date_str:
+        idx = hk.load_index()
+        items = hk.calendar_items(idx, days=30, past_days=14, include_done=True)
+        for it in items:
+            if it.get("kind") == "workout" and isinstance(it.get("start"), dt.date) and it["start"].isoformat() == date_str[:10]:
+                raw_dsl = str(it.get("what") or "")
+                title = raw_dsl
+                break
+    if not raw_dsl:
+        sys.exit("coach simulate requires `--dsl \"...\"` (or `--date YYYY-MM-DD` matching a calendar workout)")
+
+    spec = hk.parse_workout_spec(raw_dsl, subkind="cycling", ftp_watts=int(round(cp_w)))
+    title = str(spec.get("title") or title)
+    w_arr, wb_arr = coach_engine.expand_spec_to_1hz_watts(spec, cp_watts=cp_w)
+    if not w_arr:
+        sys.exit(f"coach simulate: could not parse cycling segments from {raw_dsl!r}")
+
+    sim = coach_engine.simulate_workout_stream(
+        watts=w_arr,
+        cp_watts=cp_w,
+        w_prime_j=wp_j,
+        p_5min_w=p5_w,
+        mass_kg=mass_kg,
+        prior_kj=float(prior_kj or 0.0),
+        cho_g_h=float(cho_g_h if cho_g_h is not None else 60.0),
+        verified_drop_15kj_pct=v15_drop,
+        title=title,
+        work_block_watts=wb_arr,
+    )
+    say(f"=== 1-HZ BIOPHYSICAL WORKOUT SIMULATION ({title}) ===")
+    say(f"  Input Anchor: CP={cp_w:.0f}W | W'={wp_j/1000.0:.1f}kJ | 5m={int(p5_w) if p5_w else '—'}W | Mass={mass_kg:.1f}kg")
+    if sim["pre_fatigue_kj"] > 0:
+        say(f"  Pre-Fatigue Applied: prior_kj={sim['pre_fatigue_kj']:.0f}kJ @ {sim['cho_g_h']:.0f}g/h CHO -> "
+            f"CP_eff={sim['cp_eff_w']}W (-{sim['cp_drop_pct']}%), W'_eff={sim['wp_eff_kj']}kJ (-{sim['wp_drop_pct']}%)")
+    say(f"  Duration: {sim['duration_min']} min | Session Avg: {sim['avg_w']}W | Work-Block Avg: {sim['work_block_avg_w']}W | "
+        f"Total Work: {sim['total_kj']:.0f} kJ ({sim['kj_above_cp']} kJ > CP)")
+    say(f"  Chorley Bi-Exp W'bal: min={sim['w_bal_min_pct']}% ({sim['w_bal_min_kj']} kJ left) | Fast PCr/Myo Pool min={sim['fc_pcr_min_pct']}%")
+    say(f"  1st-Order VO2(t) Kinetics: Time >=90% VO2max = {sim['time_ge_90_vo2max_min']} min | Peak VO2 = {sim['peak_vo2_pct']}%")
+    say(f"  Stimulus Class: {sim['stimulus_class']}")
+    if sim.get("stimulus_mismatch"):
+        say(f"  [!] {sim['stimulus_mismatch']}")
+    return sim
+
+
 def _coach_compare_epochs(brain, hk, epoch_a, epoch_b):
     """Compare the 7-Pillar Biophysical State Vector across two historical date ranges (`YYYY-MM-DD..YYYY-MM-DD`)."""
+    import calendar as _cal_mod
+
+    def _safe_end_date(d_str, fallback_str):
+        m = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", str(d_str or ""))
+        if m:
+            y, mo, day = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            if 1 <= mo <= 12:
+                last_d = _cal_mod.monthrange(y, mo)[1]
+                return dt.date(y, mo, min(day, last_d))
+        return dt.date.fromisoformat(fallback_str[:10])
+
     def _parse_range(spec_s):
         s = str(spec_s or "").strip()
         if ".." in s:
             a, b = s.split("..", 1)
             return a.strip()[:10], b.strip()[:10]
-        # Allow `YYYY-MM` shorthand
         if re.match(r"^\d{4}-\d{2}$", s):
-            return f"{s}-01", f"{s}-31"
+            y, mo = int(s[:4]), int(s[5:7])
+            last_d = _cal_mod.monthrange(y, mo)[1]
+            return f"{s}-01", f"{s}-{last_d:02d}"
         return s[:10], s[:10]
 
     a_lo, a_hi = _parse_range(epoch_a)
@@ -3368,14 +3463,14 @@ def _coach_compare_epochs(brain, hk, epoch_a, epoch_b):
 
     acts_a = [a for a in acts if isinstance(a, dict) and a_lo <= str(a.get("date", ""))[:10] <= a_hi]
     acts_b = [a for a in acts if isinstance(a, dict) and b_lo <= str(a.get("date", ""))[:10] <= b_hi]
-    ref_a = dt.date.fromisoformat(a_hi if re.match(r"^\d{4}-\d{2}-\d{2}$", a_hi) and a_hi[-2:] <= "28" else a_lo)
-    ref_b = dt.date.fromisoformat(b_hi if re.match(r"^\d{4}-\d{2}-\d{2}$", b_hi) and b_hi[-2:] <= "28" else b_lo)
+    ref_a = _safe_end_date(a_hi, a_lo)
+    ref_b = _safe_end_date(b_hi, b_lo)
 
     tel_a = coach_engine.build_coach_telemetry(prof_txt, acts_a, today=ref_a)
     tel_b = coach_engine.build_coach_telemetry(prof_txt, acts_b, today=ref_b)
-    say(f"=== COACH 7-PILLAR EPOCH COMPARISON ({epoch_a} [{len(acts_a)} acts] vs {epoch_b} [{len(acts_b)} acts]) ===")
-    say(f"\n--- Epoch A ({epoch_a}) ---\n" + coach_engine.format_seven_pillar_blocks(tel_a))
-    say(f"\n--- Epoch B ({epoch_b}) ---\n" + coach_engine.format_seven_pillar_blocks(tel_b))
+    say(f"=== COACH 7-PILLAR EPOCH COMPARISON ({epoch_a} [{len(acts_a)} acts, ref {ref_a}] vs {epoch_b} [{len(acts_b)} acts, ref {ref_b}]) ===")
+    say(f"\n--- Epoch A ({epoch_a}) ---\n" + coach_engine.format_seven_pillar_blocks(tel_a, include_actions=False))
+    say(f"\n--- Epoch B ({epoch_b}) ---\n" + coach_engine.format_seven_pillar_blocks(tel_b, include_actions=False))
 
 
 def _coach_field_test(root, brain, hk, unit, date_str=None, execute=True):
@@ -3500,6 +3595,15 @@ def cmd_coach(args):
         if not (getattr(args, "epoch_a", None) and getattr(args, "epoch_b", None)):
             sys.exit("coach compare requires `--epoch-a YYYY-MM-DD..YYYY-MM-DD --epoch-b YYYY-MM-DD..YYYY-MM-DD`")
         _coach_compare_epochs(brain, hk, args.epoch_a, args.epoch_b)
+    elif action == "simulate":
+        _coach_simulate(
+            brain,
+            hk,
+            dsl_spec=getattr(args, "dsl", None) or getattr(args, "text", None),
+            date_str=getattr(args, "date", None),
+            prior_kj=getattr(args, "prior_kj", 0.0) or 0.0,
+            cho_g_h=getattr(args, "cho_g_h", 60.0),
+        )
     elif action == "field-test":
         _coach_field_test(root, brain, hk, unit=getattr(args, "unit", "1"), date_str=args.date, execute=args.execute)
     else:
@@ -5015,10 +5119,13 @@ def main():
         default="context",
         choices=(
             "context", "status", "auth-strava", "auth-hammerhead", "auth-garmin", "auth-intervals",
-            "sync", "note", "zwo", "fit", "push", "history", "inspect", "compare", "field-test",
+            "sync", "note", "zwo", "fit", "push", "history", "inspect", "compare", "simulate", "field-test",
         ),
         help="coach action (default: context)",
     )
+    p.add_argument("--dsl", help="cycling workout DSL string for `simulate` (supports pct CP, W, and Hard-Start syntax)")
+    p.add_argument("--prior-kj", type=float, default=0.0, help="pre-fatigue work in kJ before intervals for `simulate`")
+    p.add_argument("--cho-g-h", type=float, default=60.0, help="carbohydrate intake (g/h) during prior work for `simulate`")
     p.add_argument("--init", action="store_true", help="scaffold brain/coach/ and harvest existing athlete thresholds")
     p.add_argument("--mode", choices=("auto", "daily", "checkin", "plan-14d", "macro", "dna"), default="auto",
                    help="context slicing mode (default: auto)")

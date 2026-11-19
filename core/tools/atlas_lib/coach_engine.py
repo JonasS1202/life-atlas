@@ -21,10 +21,13 @@ from .pillars_engine import (  # noqa: F401
     compute_individual_response_model,
     compute_morin_leg_stiffness,
     evaluate_workout_execution,
+    expand_spec_to_1hz_watts,
     filter_power_spikes,
     format_seven_pillar_blocks,
     minetti_running_cost_j_kg_m,
     query_coach_history,
+    simulate_workout_stream,
+    solve_individual_interval_prescriptions,
 )
 
 COACH_DURATIONS: tuple[tuple[str, int], ...] = (
@@ -583,6 +586,8 @@ def solve_cp_w_prime(mmp_dict: dict[str, int | float]) -> dict[str, Any]:
         reasons.append(f"R^2={r2:.3f} < 0.98 (uneven effort across durations)")
     if cp <= 50 or w_prime < 2000.0 or p_short <= p_long * 1.05:
         reasons.append("non-maximal flat curve (need true all-out short & long efforts)")
+    if w_prime > 55000.0 or (p_long > 0 and cp < 0.62 * p_long):
+        reasons.append("unpaced submaximal long anchor skewed 2-parameter slope (W' > 55 kJ or CP << P_long)")
 
     valid = len(reasons) == 0
     return {
@@ -2489,6 +2494,14 @@ def build_coach_telemetry(
         vlamax_sprint=p2.get("vlamax_sprint_proxy"),
         mass_kg=body.get("mass_kg_7d"),
     )
+    p3_rx = pillars_engine.solve_individual_interval_prescriptions(
+        cp_watts=float(eff_cp) if eff_cp else None,
+        w_prime_j=eff_wp_j,
+        p_5min_w=float(base_5m) if base_5m else None,
+        p2_metabolic=p2,
+        p4_myotype=p4,
+        mass_kg=body.get("mass_kg_7d"),
+    )
     p5 = pillars_engine.compute_pillar5_durability_and_tid(
         activities=sorted_acts,
         curves=curves,
@@ -2570,6 +2583,7 @@ def build_coach_telemetry(
             "pillar1_oxidative": p1,
             "pillar2_metabolic": p2,
             "pillar3_kinetics": p3,
+            "pillar3_prescriptions": p3_rx,
             "pillar4_myotype": p4,
             "pillar5_durability": p5,
             "pillar6_locomotion": p6,
@@ -2648,7 +2662,12 @@ def format_pro_telemetry_block(telemetry: dict[str, Any]) -> str:
         if met.get("p15s_p5m"):
             g_sub.append(f"P15s/P5m {met['p15s_p5m']}")
         met_parts.append(f"Glycolytic Index: {met['glycolytic_band']}" + (f" ({', '.join(g_sub)})" if g_sub else ""))
-    if met.get("fatmax_watts"):
+    p2_sp = (telemetry.get("seven_pillars") or {}).get("pillar2_metabolic") or {}
+    if p2_sp.get("fatmax_band_w"):
+        fw = p2_sp["fatmax_band_w"]
+        lt1_s = f" | LT1 {p2_sp['p_lt1_w']} W" if p2_sp.get("p_lt1_w") else ""
+        met_parts.append(f"FatMax {fw[0]}–{fw[1]} W{lt1_s}")
+    elif met.get("fatmax_watts"):
         fw = met["fatmax_watts"]
         met_parts.append(f"FatMax {fw[0]}–{fw[1]} W")
     if telemetry.get("durability_5m_90d"):
