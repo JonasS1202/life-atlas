@@ -2,6 +2,14 @@
 
 Written for users: `/atlas-update` shows the sections between the installed and the new version.
 
+## [1.4.9] - 2026-11-20
+
+- **Native Cadence Targets (`@90rpm` / `@65-70rpm`) for `.zwo` (Hammerhead Karoo) & `.fit` Workouts (`atlas_hook.py`, `fit_writer.py`, `coach_connectors.py`, `atlas.py`, `coach.md`):**
+  - **Extended Workout DSL:** Every cycling step (`WU`, `CD`, `ramp`, `free`, `SteadyState`, `Intervals`, `Nested Sets`, and `Compound Intervals`) now accepts optional exact (`@88rpm`) or range (`@65-70rpm`, `@105-115rpm`) cadence targets and surfaces them in Coach Dashboard workout blocks.
+  - **Hammerhead Karoo-Safe `.zwo` Compiler:** Emits `Cadence="..."` (exact) and `CadenceLow="..." CadenceHigh="..."` (range) directly on ZWO blocks so Hammerhead Karoo displays live secondary RPM targets alongside primary Watt targets. Automatically unrolls repeating intervals with distinct On/Off cadence targets or ranges into explicit `<SteadyState>` pairs — working around Hammerhead's `.zwo` importer ignoring `CadenceResting` on `<IntervalsT>`.
+  - **ANT+ `.FIT` Secondary Cadence Targets:** Encodes official FIT SDK `workout_step` secondary cadence fields (`secondary_target_type=3`, `custom_target_cadence_low/high`) whenever a workout specifies cadence targets (keeping non-cadence `.fit` files byte-identical).
+  - **Clean Remote Re-Push (`atlas.py coach push --recreate --execute`):** Includes the compiled `.zwo` hash in sync signatures and adds `--recreate` to cleanly delete and re-upload existing Hammerhead workouts when structural upgrades land.
+
 ## [1.4.8] - 2026-11-19
 
 - **Individual `tau_w_mult` W'-Reconstitution Calibration & Seasonal Updates (`pillars_engine.py`, `coach_engine.py`, `coach_connectors.py`, `atlas.py`, `coach.md`):**

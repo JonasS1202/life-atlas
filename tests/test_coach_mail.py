@@ -749,6 +749,117 @@ class CoachMailUnit(unittest.TestCase):
         self.assertIn("submax-only, untested", tel["durability_5m_90d"][">25 kJ/kg"])
         self.assertIn("verified", tel["durability_5m_90d"][">15 kJ/kg"])
 
+    def test_cadence_dsl_zwo_unrolling_and_fit_secondary_target(self):
+        import xml.etree.ElementTree as ET
+        hooks_dir = os.path.join(REPO, "core", "hooks")
+        if hooks_dir not in sys.path:
+            sys.path.insert(0, hooks_dir)
+        import atlas_hook as hk
+        from atlas_lib import fit_writer
+
+        line = (
+            "Cadence Mix (82m | 12m WU 52-66% @88rpm, "
+            "4x 30s@225W @105-115rpm / 90s@175W @85-90rpm, "
+            "2x (4m@235W @65-70rpm + 4m@235W @92-98rpm) / 4m@185W @85-90rpm, "
+            "2x 3m@250W @90rpm / 2m@170W @90rpm, "
+            "10m Z2@210W @85-90rpm, 5m free @92rpm, 8m CD 62-48% @85rpm)"
+        )
+        spec = hk.parse_workout_spec(line, subkind="cycling", ftp_watts=305)
+        self.assertEqual(spec["unparsed_tokens"], [])
+
+        zwo = hk.compile_zwo_xml(spec, date_str="2026-11-20", ftp_watts=305)
+        self.assertNotIn("CadenceResting", zwo)
+        root = ET.fromstring(zwo)
+        w_el = root.find("workout")
+        children = list(w_el)
+
+        # Warmup exact cadence
+        self.assertEqual(children[0].tag, "Warmup")
+        self.assertEqual(children[0].attrib.get("Cadence"), "88")
+
+        # 4x spin-ups with distinct On/Off cadence ranges MUST unroll to 8 SteadyState steps (Hammerhead bugfix)
+        spin_steps = children[1:9]
+        self.assertTrue(all(el.tag == "SteadyState" for el in spin_steps))
+        self.assertEqual(spin_steps[0].attrib.get("CadenceLow"), "105")
+        self.assertEqual(spin_steps[0].attrib.get("CadenceHigh"), "115")
+        self.assertEqual(spin_steps[1].attrib.get("CadenceLow"), "85")
+        self.assertEqual(spin_steps[1].attrib.get("CadenceHigh"), "90")
+
+        # Compound intervals (2x (4m@65-70 + 4m@92-98) / 4m@85-90) -> 2+1+2 = 5 SteadyState steps
+        cmp_steps = children[9:14]
+        self.assertEqual(cmp_steps[0].attrib.get("CadenceLow"), "65")
+        self.assertEqual(cmp_steps[0].attrib.get("CadenceHigh"), "70")
+        self.assertEqual(cmp_steps[1].attrib.get("CadenceLow"), "92")
+        self.assertEqual(cmp_steps[1].attrib.get("CadenceHigh"), "98")
+        self.assertEqual(cmp_steps[2].attrib.get("CadenceLow"), "85")
+        self.assertEqual(cmp_steps[2].attrib.get("CadenceHigh"), "90")
+
+        # Equal exact On/Off cadence stays compact <IntervalsT ... Cadence="90"/>
+        self.assertEqual(children[14].tag, "IntervalsT")
+        self.assertEqual(children[14].attrib.get("Cadence"), "90")
+
+        # SteadyState, FreeRide, Cooldown
+        self.assertEqual(children[15].attrib.get("CadenceLow"), "85")
+        self.assertEqual(children[15].attrib.get("CadenceHigh"), "90")
+        self.assertEqual(children[16].tag, "FreeRide")
+        self.assertEqual(children[16].attrib.get("Cadence"), "92")
+        self.assertEqual(children[17].tag, "Cooldown")
+        self.assertEqual(children[17].attrib.get("Cadence"), "85")
+
+        # FIT binary workout file includes valid CRCs and secondary cadence target fields
+        fit_with = fit_writer.compile_fit_workout_bytes(
+            "2026-11-20 Cadence Mix", sport="cycling", parsed_spec=spec, ftp_watts=305, now_unix=1795170000
+        )
+        self.assertEqual(fit_with[8:12], b".FIT")
+        hdr_crc = int.from_bytes(fit_with[12:14], "little")
+        self.assertEqual(hdr_crc, fit_writer.fit_crc16(fit_with[:12]))
+        file_crc = int.from_bytes(fit_with[-2:], "little")
+        self.assertEqual(file_crc, fit_writer.fit_crc16(fit_with[:-2]))
+
+        # Workout without cadence stays compact (no extra secondary target columns)
+        spec_no_cad = hk.parse_workout_spec("Base (40m | 10m WU 55-70%, 20m Z2@68%, 10m CD 65-50%)", ftp_watts=305)
+        fit_without = fit_writer.compile_fit_workout_bytes(
+            "2026-11-20 Base", sport="cycling", parsed_spec=spec_no_cad, ftp_watts=305, now_unix=1795170000
+        )
+        self.assertEqual(fit_without[8:12], b".FIT")
+        self.assertGreater(len(fit_with), len(fit_without))
+
+    def test_hammerhead_force_recreate_delete_and_reupload(self):
+        import tempfile
+        hooks_dir = os.path.join(REPO, "core", "hooks")
+        if hooks_dir not in sys.path:
+            sys.path.insert(0, hooks_dir)
+        import atlas_hook as hk
+        from atlas_lib import coach_connectors as cc
+
+        with tempfile.TemporaryDirectory() as td:
+            brain = os.path.join(td, "brain")
+            mock_dir = os.path.join(td, "mock")
+            os.makedirs(os.path.join(brain, "coach"), exist_ok=True)
+            today = dt.date(2026, 11, 20)
+            cal_items = [{
+                "kind": "workout", "subkind": "cycling", "status": "open", "start": today,
+                "what": "Spin-Ups (30m | 10m WU 55-68% @88rpm, 4x 30s@225W @105-115rpm / 90s@175W @85-90rpm, 12m CD 62-48% @85rpm)",
+            }]
+            r1 = cc.sync_calendar_workouts_to_devices(
+                brain=brain, cal_items=cal_items, parse_workout_spec_fn=hk.parse_workout_spec,
+                compile_zwo_xml_fn=hk.compile_zwo_xml, ftp_watts=305, days=14, execute=True,
+                mock_dir=mock_dir, today=today,
+            )
+            hh1 = [a for a in r1["device_actions"] if "Hammerhead" in a]
+            self.assertEqual(len(hh1), 1)
+            self.assertIn("POST", hh1[0])
+
+            r2 = cc.sync_calendar_workouts_to_devices(
+                brain=brain, cal_items=cal_items, parse_workout_spec_fn=hk.parse_workout_spec,
+                compile_zwo_xml_fn=hk.compile_zwo_xml, ftp_watts=305, days=14, execute=True,
+                mock_dir=mock_dir, today=today, force_recreate=True,
+            )
+            hh2 = [a for a in r2["device_actions"] if "Hammerhead" in a]
+            self.assertEqual(len(hh2), 2)
+            self.assertIn("DELETE", hh2[0])
+            self.assertIn("POST", hh2[1])
+
 
 if __name__ == "__main__":
     unittest.main()

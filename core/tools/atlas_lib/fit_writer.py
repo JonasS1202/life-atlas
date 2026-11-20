@@ -27,6 +27,7 @@ BT_UINT32 = 0x86
 BT_UINT32Z = 0x8C
 
 UINT32_INVALID = 0xFFFFFFFF
+ENUM_INVALID = 0xFF
 
 # FIT Sport Enums
 FIT_SPORT_RUNNING = 1
@@ -49,6 +50,7 @@ FIT_DUR_OPEN = 5
 FIT_TGT_SPEED = 0
 FIT_TGT_HR = 1
 FIT_TGT_OPEN = 2
+FIT_TGT_CADENCE = 3
 FIT_TGT_POWER = 4
 
 
@@ -121,81 +123,105 @@ def _expand_parsed_blocks_to_fit_steps(
             off_s = max(5, int(blk.get("off_sec") or 60))
             on_p = float(blk.get("on_p") or blk.get("on_power") or 1.0)
             off_p = float(blk.get("off_p") or blk.get("off_power") or 0.55)
+            on_cl, on_ch = blk.get("on_cad_low"), blk.get("on_cad_high")
+            off_cl, off_ch = blk.get("off_cad_low"), blk.get("off_cad_high")
             for r_idx in range(1, reps + 1):
                 t_type, t_lo, t_hi = _power_bounds(on_p, on_p) if is_cycling else _run_bounds(on_p)
-                steps.append({
+                st_on = {
                     "name": f"Int {r_idx}/{reps}",
                     "duration_ms": on_s * 1000,
                     "intensity": FIT_INTENSITY_ACTIVE,
                     "target_type": t_type,
                     "custom_low": t_lo,
                     "custom_high": t_hi,
-                })
+                }
+                if on_cl is not None:
+                    st_on["cad_low"], st_on["cad_high"] = int(on_cl), int(on_ch if on_ch is not None else on_cl)
+                steps.append(st_on)
                 r_type, r_lo, r_hi = _power_bounds(off_p, off_p) if is_cycling else _run_bounds(off_p)
-                steps.append({
+                st_off = {
                     "name": "Recovery",
                     "duration_ms": off_s * 1000,
                     "intensity": FIT_INTENSITY_RECOVERY,
                     "target_type": r_type,
                     "custom_low": r_lo,
                     "custom_high": r_hi,
-                })
+                }
+                if off_cl is not None:
+                    st_off["cad_low"], st_off["cad_high"] = int(off_cl), int(off_ch if off_ch is not None else off_cl)
+                steps.append(st_off)
         elif kind == "compound_intervals":
             reps = max(1, int(blk.get("repeat") or 1))
             stages = blk.get("stages") or []
             off_s = max(0, int(blk.get("off_sec") or 0))
             off_p = float(blk.get("off_p") or 0.50)
+            off_cl, off_ch = blk.get("off_cad_low"), blk.get("off_cad_high")
             for r_idx in range(1, reps + 1):
                 for s_idx, stg in enumerate(stages, start=1):
                     s_sec = max(5, int(stg.get("sec") or 30))
                     s_p = float(stg.get("p") or 1.10)
                     t_type, t_lo, t_hi = _power_bounds(s_p, s_p) if is_cycling else _run_bounds(s_p)
-                    steps.append({
+                    st_c = {
                         "name": f"Int {r_idx}.{s_idx}/{reps}",
                         "duration_ms": s_sec * 1000,
                         "intensity": FIT_INTENSITY_ACTIVE,
                         "target_type": t_type,
                         "custom_low": t_lo,
                         "custom_high": t_hi,
-                    })
+                    }
+                    if stg.get("cad_low") is not None:
+                        st_c["cad_low"] = int(stg["cad_low"])
+                        st_c["cad_high"] = int(stg.get("cad_high") if stg.get("cad_high") is not None else stg["cad_low"])
+                    steps.append(st_c)
                 if off_s > 0 and r_idx < reps:
                     r_type, r_lo, r_hi = _power_bounds(off_p, off_p) if is_cycling else _run_bounds(off_p)
-                    steps.append({
+                    st_o = {
                         "name": "Recovery",
                         "duration_ms": off_s * 1000,
                         "intensity": FIT_INTENSITY_RECOVERY,
                         "target_type": r_type,
                         "custom_low": r_lo,
                         "custom_high": r_hi,
-                    })
+                    }
+                    if off_cl is not None:
+                        st_o["cad_low"], st_o["cad_high"] = int(off_cl), int(off_ch if off_ch is not None else off_cl)
+                    steps.append(st_o)
         elif kind in ("warmup", "cooldown", "ramp"):
             dur_s = max(30, int(blk.get("sec") or blk.get("duration_sec") or 600))
             p_lo = float(blk.get("p_low") or blk.get("power_low") or 0.55)
             p_hi = float(blk.get("p_high") or blk.get("power_high") or 0.72)
             p_mid = 0.5 * (p_lo + p_hi)
             t_type, t_lo, t_hi = _power_bounds(p_lo, p_hi) if is_cycling else _run_bounds(p_mid)
-            steps.append({
+            st_r = {
                 "name": "Warmup" if kind == "warmup" else ("Cooldown" if kind == "cooldown" else "Ramp"),
                 "duration_ms": dur_s * 1000,
                 "intensity": FIT_INTENSITY_WARMUP if kind == "warmup" else (FIT_INTENSITY_COOLDOWN if kind == "cooldown" else FIT_INTENSITY_ACTIVE),
                 "target_type": t_type,
                 "custom_low": t_lo,
                 "custom_high": t_hi,
-            })
+            }
+            if blk.get("cad_low") is not None:
+                st_r["cad_low"] = int(blk["cad_low"])
+                st_r["cad_high"] = int(blk.get("cad_high") if blk.get("cad_high") is not None else blk["cad_low"])
+            steps.append(st_r)
         else:
             dur_s = max(30, int(blk.get("sec") or blk.get("duration_sec") or 600))
             pwr = float(blk.get("p") or blk.get("power") or 0.70)
             inten = FIT_INTENSITY_RECOVERY if pwr < 0.60 else FIT_INTENSITY_ACTIVE
             lbl = str(blk.get("label") or ("Recovery" if inten == FIT_INTENSITY_RECOVERY else "Steady"))[:22]
             t_type, t_lo, t_hi = _power_bounds(pwr, pwr) if is_cycling else _run_bounds(pwr)
-            steps.append({
+            st_s = {
                 "name": lbl,
                 "duration_ms": dur_s * 1000,
                 "intensity": inten,
                 "target_type": t_type,
                 "custom_low": t_lo,
                 "custom_high": t_hi,
-            })
+            }
+            if blk.get("cad_low") is not None:
+                st_s["cad_low"] = int(blk["cad_low"])
+                st_s["cad_high"] = int(blk.get("cad_high") if blk.get("cad_high") is not None else blk["cad_low"])
+            steps.append(st_s)
 
     if not steps:
         tot_s = max(600, int((parsed_spec or {}).get("total_min") or default_duration_min) * 60)
@@ -270,7 +296,8 @@ def compile_fit_workout_bytes(
     records.extend(struct.pack("<BBH", 0x01, fit_sport, len(steps)) + _fixed_utf8(title or "Atlas Workout", 32))
 
     # 3. workout_step (Global Mesg 27, Local 2)
-    records.extend(_def_mesg(2, 27, [
+    has_cadence = any(st.get("cad_low") is not None for st in steps)
+    step_fields = [
         (254, 2, BT_UINT16),  # message_index
         (0, 24, BT_STRING),   # wkt_step_name
         (1, 1, BT_ENUM),      # duration_type
@@ -280,9 +307,17 @@ def compile_fit_workout_bytes(
         (5, 4, BT_UINT32),    # custom_target_value_low
         (6, 4, BT_UINT32),    # custom_target_value_high
         (7, 1, BT_ENUM),      # intensity
-    ]))
+    ]
+    if has_cadence:
+        step_fields.extend([
+            (19, 1, BT_ENUM),    # secondary_target_type (3 = cadence)
+            (20, 4, BT_UINT32),  # secondary_target_value (0 = custom range)
+            (21, 4, BT_UINT32),  # secondary_custom_target_value_low (rpm)
+            (22, 4, BT_UINT32),  # secondary_custom_target_value_high (rpm)
+        ])
+    records.extend(_def_mesg(2, 27, step_fields))
     for idx, st in enumerate(steps):
-        records.extend(
+        row = (
             struct.pack("<BH", 0x02, idx)
             + _fixed_utf8(st["name"], 24)
             + struct.pack(
@@ -296,6 +331,14 @@ def compile_fit_workout_bytes(
                 int(st["intensity"]),
             )
         )
+        if has_cadence:
+            if st.get("cad_low") is not None:
+                c_lo = int(st["cad_low"])
+                c_hi = int(st.get("cad_high") if st.get("cad_high") is not None else c_lo)
+                row += struct.pack("<BIII", FIT_TGT_CADENCE, 0, c_lo, c_hi)
+            else:
+                row += struct.pack("<BIII", ENUM_INVALID, UINT32_INVALID, UINT32_INVALID, UINT32_INVALID)
+        records.extend(row)
 
     rec_bytes = bytes(records)
     header_no_crc = struct.pack("<BBHI4s", 14, 0x10, 2132, len(rec_bytes), b".FIT")

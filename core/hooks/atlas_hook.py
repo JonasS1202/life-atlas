@@ -709,6 +709,53 @@ def _dur_sec(val_str, unit_str="m"):
     return int(round(v * 60))
 
 
+_CAD_SUFFIX_RE = re.compile(r"(?:\s*@?\s*(\d{2,3}(?:\s*[-–]\s*\d{2,3})?)\s*rpm)\s*$", re.I)
+
+
+def _norm_cad(raw_val):
+    """Parse cadence token ('90', '90rpm', '65-70', '105-115rpm') into (low_int, high_int) or (None, None)."""
+    if raw_val is None or raw_val == "":
+        return None, None
+    s = re.sub(r"rpm$", "", str(raw_val).strip(), flags=re.I).strip()
+    m = re.match(r"^(\d{2,3})(?:\s*[-–]\s*(\d{2,3}))?$", s)
+    if not m:
+        return None, None
+    lo = max(30, min(200, int(m.group(1))))
+    hi = max(30, min(200, int(m.group(2)))) if m.group(2) else lo
+    if lo > hi:
+        lo, hi = hi, lo
+    return lo, hi
+
+
+def _strip_cad_suffix(text):
+    """Strip an optional trailing cadence target (`@90rpm`, `65-70rpm`) from a DSL token."""
+    s = str(text or "").strip()
+    m = _CAD_SUFFIX_RE.search(s)
+    if not m:
+        return s, None, None
+    lo, hi = _norm_cad(m.group(1))
+    return s[:m.start()].strip(), lo, hi
+
+
+def _fmt_cad(lo, hi):
+    if lo is None:
+        return ""
+    if hi is None or int(lo) == int(hi):
+        return f"{int(lo)} rpm"
+    return f"{int(lo)}–{int(hi)} rpm"
+
+
+def _cad_xml_attrs(lo, hi):
+    """Format ZWO cadence XML attributes (`Cadence` for exact target, `CadenceLow`/`CadenceHigh` for range)."""
+    if lo is None:
+        return ""
+    lo_i = int(lo)
+    hi_i = int(hi) if hi is not None else lo_i
+    if lo_i == hi_i:
+        return f' Cadence="{lo_i}"'
+    return f' CadenceLow="{lo_i}" CadenceHigh="{hi_i}"'
+
+
 def parse_workout_spec(what_text, subkind="cycling", ftp_watts=275, sport=None):
     """Deterministically parse a workout description into structured segments and visual blocks (0 LLM tokens).
 
@@ -761,19 +808,20 @@ def parse_workout_spec(what_text, subkind="cycling", ftp_watts=275, sport=None):
         tokens = [t.strip() for t in re.split(r"[,;]+", spec_body) if t.strip()]
         for tok in tokens:
             # 0a. Nested interval sets:
-            #   `3x (13x 30s@394W / 15s@206W) / 4m@150W`
+            #   `3x (13x 30s@394W@95-105rpm / 15s@206W@85rpm) / 4m@150W@85rpm`
             #   `3x13x 30s@394W / 15s@206W` (optional `/ 4m@150W` inter-set rest; default 4m @ 50%)
+            _cad_opt = r"(?:\s*@?\s*(\d{2,3}(?:\s*[-–]\s*\d{2,3})?)\s*rpm)?"
             m_nset = re.match(
-                r"^(\d+)\s*[x×]\s*\(\s*(\d+)\s*[x×]\s*(\d+(?:[.,]\d+)?)\s*(m|min|s)?\s*(?:@\s*(\d+(?:[.,]\d+)?\s*[wW%]?))?"
-                r"(?:\s*(?:/|with|rest|pause)\s*(\d+(?:[.,]\d+)?)\s*(m|min|s)?\s*(?:@\s*(\d+(?:[.,]\d+)?\s*[wW%]?))?)?\s*\)"
-                r"(?:\s*(?:/|rest|pause)\s*(\d+(?:[.,]\d+)?)\s*(m|min|s)?\s*(?:@\s*(\d+(?:[.,]\d+)?\s*[wW%]?))?)?$",
+                r"^(\d+)\s*[x×]\s*\(\s*(\d+)\s*[x×]\s*(\d+(?:[.,]\d+)?)\s*(m|min|s)?\s*(?:@\s*(\d+(?:[.,]\d+)?\s*[wW%]?))?" + _cad_opt
+                + r"(?:\s*(?:/|with|rest|pause)\s*(\d+(?:[.,]\d+)?)\s*(m|min|s)?\s*(?:@\s*(\d+(?:[.,]\d+)?\s*[wW%]?))?" + _cad_opt + r")?\s*\)"
+                + r"(?:\s*(?:/|rest|pause)\s*(\d+(?:[.,]\d+)?)\s*(m|min|s)?\s*(?:@\s*(\d+(?:[.,]\d+)?\s*[wW%]?))?" + _cad_opt + r")?$",
                 tok, re.I
             )
             if not m_nset:
                 m_nset = re.match(
-                    r"^(\d+)\s*[x×]\s*(\d+)\s*[x×]\s*(\d+(?:[.,]\d+)?)\s*(m|min|s)?\s*(?:@\s*(\d+(?:[.,]\d+)?\s*[wW%]?))?"
-                    r"(?:\s*(?:/|with|rest|pause)\s*(\d+(?:[.,]\d+)?)\s*(m|min|s)?\s*(?:@\s*(\d+(?:[.,]\d+)?\s*[wW%]?))?)?"
-                    r"(?:\s*(?:/|rest|pause)\s*(\d+(?:[.,]\d+)?)\s*(m|min|s)?\s*(?:@\s*(\d+(?:[.,]\d+)?\s*[wW%]?))?)?$",
+                    r"^(\d+)\s*[x×]\s*(\d+)\s*[x×]\s*(\d+(?:[.,]\d+)?)\s*(m|min|s)?\s*(?:@\s*(\d+(?:[.,]\d+)?\s*[wW%]?))?" + _cad_opt
+                    + r"(?:\s*(?:/|with|rest|pause)\s*(\d+(?:[.,]\d+)?)\s*(m|min|s)?\s*(?:@\s*(\d+(?:[.,]\d+)?\s*[wW%]?))?" + _cad_opt + r")?"
+                    + r"(?:\s*(?:/|rest|pause)\s*(\d+(?:[.,]\d+)?)\s*(m|min|s)?\s*(?:@\s*(\d+(?:[.,]\d+)?\s*[wW%]?))?" + _cad_opt + r")?$",
                     tok, re.I
                 )
             if m_nset:
@@ -781,10 +829,13 @@ def parse_workout_spec(what_text, subkind="cycling", ftp_watts=275, sport=None):
                 rep = max(1, int(m_nset.group(2)))
                 on_sec = _dur_sec(m_nset.group(3), m_nset.group(4) or "s")
                 on_p = _norm_pwr(m_nset.group(5), 1.15, ftp_watts=ftp_watts)
-                off_sec = _dur_sec(m_nset.group(6), m_nset.group(7) or "s") if m_nset.group(6) else max(15, int(round(on_sec * 0.5)))
-                off_p = _norm_pwr(m_nset.group(8), 0.60, ftp_watts=ftp_watts)
-                set_rest_sec = _dur_sec(m_nset.group(9), m_nset.group(10) or "m") if m_nset.group(9) else 240
-                set_rest_p = _norm_pwr(m_nset.group(11), 0.50, ftp_watts=ftp_watts)
+                on_cl, on_ch = _norm_cad(m_nset.group(6))
+                off_sec = _dur_sec(m_nset.group(7), m_nset.group(8) or "s") if m_nset.group(7) else max(15, int(round(on_sec * 0.5)))
+                off_p = _norm_pwr(m_nset.group(9), 0.60, ftp_watts=ftp_watts)
+                off_cl, off_ch = _norm_cad(m_nset.group(10))
+                set_rest_sec = _dur_sec(m_nset.group(11), m_nset.group(12) or "m") if m_nset.group(11) else 240
+                set_rest_p = _norm_pwr(m_nset.group(13), 0.50, ftp_watts=ftp_watts)
+                sr_cl, sr_ch = _norm_cad(m_nset.group(14))
                 iv_lbl = (
                     f"{rep}× {on_sec // 60 if on_sec >= 60 else str(on_sec) + 's'}"
                     f"{'m' if on_sec >= 60 else ''} @ {int(round(on_p * 100))}% / "
@@ -792,20 +843,29 @@ def parse_workout_spec(what_text, subkind="cycling", ftp_watts=275, sport=None):
                     f"{'m' if off_sec >= 60 else ''} @ {int(round(off_p * 100))}%"
                 )
                 for s_idx in range(n_sets):
-                    segments.append({
+                    seg_iv = {
                         "type": "intervals", "repeat": rep, "on_sec": on_sec, "off_sec": off_sec,
                         "on_p": on_p, "off_p": off_p, "label": iv_lbl,
-                    })
+                    }
+                    if on_cl is not None:
+                        seg_iv["on_cad_low"], seg_iv["on_cad_high"] = on_cl, on_ch
+                    if off_cl is not None:
+                        seg_iv["off_cad_low"], seg_iv["off_cad_high"] = off_cl, off_ch
+                    segments.append(seg_iv)
                     if s_idx < n_sets - 1 and set_rest_sec > 0:
-                        segments.append({
+                        seg_sr = {
                             "type": "steady", "sec": set_rest_sec, "p": set_rest_p,
                             "label": f"{set_rest_sec // 60}m Rest @ {int(round(set_rest_p * 100))}%",
-                        })
+                        }
+                        if sr_cl is not None:
+                            seg_sr["cad_low"], seg_sr["cad_high"] = sr_cl, sr_ch
+                        segments.append(seg_sr)
                 continue
 
-            # 0b. Compound multi-stage intervals (e.g. Hard-Start: `4x (45s@420W + 3.25m@350W) / 5m@147W`)
+            # 0b. Compound multi-stage intervals (e.g. Hard-Start: `4x (45s@420W + 3.25m@350W) / 5m@147W`
+            #     or Cadence-Switch: `3x (4m@235W@65-70rpm + 4m@235W@92-98rpm) / 4m@185W@85-90rpm`)
             m_cmp = re.match(
-                r"^(\d+)\s*[x×]\s*\(([^()]+)\)(?:\s*(?:/|rest|pause)\s*(\d+(?:[.,]\d+)?)\s*(m|min|s)?\s*(?:@\s*(\d+(?:[.,]\d+)?\s*[wW%]?))?)?$",
+                r"^(\d+)\s*[x×]\s*\(([^()]+)\)(?:\s*(?:/|rest|pause)\s*(\d+(?:[.,]\d+)?)\s*(m|min|s)?\s*(?:@\s*(\d+(?:[.,]\d+)?\s*[wW%]?))?" + _cad_opt + r")?$",
                 tok, re.I
             )
             if m_cmp:
@@ -814,107 +874,143 @@ def parse_workout_spec(what_text, subkind="cycling", ftp_watts=275, sport=None):
                 raw_stages = [st.strip() for st in re.split(r"(?:\+|->|→)", inner) if st.strip()]
                 stages = []
                 for st_s in raw_stages:
+                    st_clean, st_cl, st_ch = _strip_cad_suffix(st_s)
                     m_st_part = re.match(
                         r"^(\d+(?:[.,]\d+)?)\s*(m|min|s)?\s*(?:@\s*(\d+(?:[.,]\d+)?\s*[wW%]?))?$",
-                        st_s, re.I
+                        st_clean, re.I
                     )
                     if m_st_part:
                         s_sec = _dur_sec(m_st_part.group(1), m_st_part.group(2) or "m")
                         s_p = _norm_pwr(m_st_part.group(3), 1.15, ftp_watts=ftp_watts)
                         if s_sec > 0:
-                            stages.append({"sec": s_sec, "p": s_p})
+                            stg_d = {"sec": s_sec, "p": s_p}
+                            if st_cl is not None:
+                                stg_d["cad_low"], stg_d["cad_high"] = st_cl, st_ch
+                            stages.append(stg_d)
                 if stages:
                     off_sec = _dur_sec(m_cmp.group(3), m_cmp.group(4) or "m") if m_cmp.group(3) else 240
                     off_p = _norm_pwr(m_cmp.group(5), 0.50, ftp_watts=ftp_watts)
+                    off_cl, off_ch = _norm_cad(m_cmp.group(6))
                     stg_lbl = "+".join(f"{st['sec']}s@{int(round(st['p']*100))}%" for st in stages)
-                    segments.append({
+                    seg_cmp = {
                         "type": "compound_intervals", "repeat": rep, "stages": stages,
                         "off_sec": off_sec, "off_p": off_p,
                         "label": f"{rep}× ({stg_lbl}) / {off_sec // 60}m@{int(round(off_p * 100))}%",
-                    })
+                    }
+                    if off_cl is not None:
+                        seg_cmp["off_cad_low"], seg_cmp["off_cad_high"] = off_cl, off_ch
+                    segments.append(seg_cmp)
                     continue
 
-            # 1. Warmup: `15m WU 55-75%` or `10m warmup 150W-200W`
+            # 1. Warmup: `15m WU 55-75%` or `12m WU 52-66% @88rpm`
+            tok_nocad, tok_cl, tok_ch = _strip_cad_suffix(tok)
             m_wu = re.match(
                 r"^(\d+(?:[.,]\d+)?)\s*(m|min|s|h)?\s*(?:wu|warm-?up)\s*(?:@\s*)?(\d+(?:[.,]\d+)?\s*[wW%]?)?\s*(?:[-–>to/]+\s*(\d+(?:[.,]\d+)?\s*[wW%]?))?$",
-                tok, re.I
+                tok_nocad, re.I
             )
             if m_wu:
                 sec = _dur_sec(m_wu.group(1), m_wu.group(2) or "m")
                 p_low = _norm_pwr(m_wu.group(3), 0.50, ftp_watts=ftp_watts)
                 p_high = _norm_pwr(m_wu.group(4), 0.75, ftp_watts=ftp_watts)
-                segments.append({"type": "warmup", "sec": sec, "p_low": p_low, "p_high": p_high,
-                                 "label": f"{sec // 60}m WU {int(round(p_low * 100))}–{int(round(p_high * 100))}%"})
+                cad_s = f" · {_fmt_cad(tok_cl, tok_ch)}" if tok_cl is not None else ""
+                seg = {"type": "warmup", "sec": sec, "p_low": p_low, "p_high": p_high,
+                       "label": f"{sec // 60}m WU {int(round(p_low * 100))}–{int(round(p_high * 100))}%{cad_s}"}
+                if tok_cl is not None:
+                    seg["cad_low"], seg["cad_high"] = tok_cl, tok_ch
+                segments.append(seg)
                 continue
 
-            # 2. Cooldown: `10m CD 65-50%`
+            # 2. Cooldown: `10m CD 65-50%` or `8m CD 62-48% @85rpm`
             m_cd = re.match(
                 r"^(\d+(?:[.,]\d+)?)\s*(m|min|s|h)?\s*(?:cd|cool-?down)\s*(?:@\s*)?(\d+(?:[.,]\d+)?\s*[wW%]?)?\s*(?:[-–>to/]+\s*(\d+(?:[.,]\d+)?\s*[wW%]?))?$",
-                tok, re.I
+                tok_nocad, re.I
             )
             if m_cd:
                 sec = _dur_sec(m_cd.group(1), m_cd.group(2) or "m")
                 p_low = _norm_pwr(m_cd.group(3), 0.65, ftp_watts=ftp_watts)
                 p_high = _norm_pwr(m_cd.group(4), 0.50, ftp_watts=ftp_watts)
-                segments.append({"type": "cooldown", "sec": sec, "p_low": p_low, "p_high": p_high,
-                                 "label": f"{sec // 60}m CD {int(round(p_low * 100))}–{int(round(p_high * 100))}%"})
+                cad_s = f" · {_fmt_cad(tok_cl, tok_ch)}" if tok_cl is not None else ""
+                seg = {"type": "cooldown", "sec": sec, "p_low": p_low, "p_high": p_high,
+                       "label": f"{sec // 60}m CD {int(round(p_low * 100))}–{int(round(p_high * 100))}%{cad_s}"}
+                if tok_cl is not None:
+                    seg["cad_low"], seg["cad_high"] = tok_cl, tok_ch
+                segments.append(seg)
                 continue
 
-            # 3. Intervals: `4x 8m@102% / 4m@55%`, `13x 30s@388W / 15s@205W`, `5x4m@112%`
+            # 3. Intervals: `4x 8m@102% / 4m@55%`, `4x 30s@225W@105-115rpm / 90s@175W@85-90rpm`
             m_iv = re.match(
-                r"^(\d+)\s*[x×]\s*(\d+(?:[.,]\d+)?)\s*(m|min|s)?\s*(?:@\s*(\d+(?:[.,]\d+)?\s*[wW%]?))?"
-                r"(?:\s*(?:/|\(|with|rest|pause)\s*(\d+(?:[.,]\d+)?)\s*(m|min|s)?\s*(?:@\s*(\d+(?:[.,]\d+)?\s*[wW%]?))?\s*\)?)?$",
+                r"^(\d+)\s*[x×]\s*(\d+(?:[.,]\d+)?)\s*(m|min|s)?\s*(?:@\s*(\d+(?:[.,]\d+)?\s*[wW%]?))?" + _cad_opt
+                + r"(?:\s*(?:/|\(|with|rest|pause)\s*(\d+(?:[.,]\d+)?)\s*(m|min|s)?\s*(?:@\s*(\d+(?:[.,]\d+)?\s*[wW%]?))?" + _cad_opt + r"\s*\)?)?$",
                 tok, re.I
             )
             if m_iv:
                 rep = int(m_iv.group(1))
                 on_sec = _dur_sec(m_iv.group(2), m_iv.group(3) or "m")
                 on_p = _norm_pwr(m_iv.group(4), 0.95 if on_sec >= 480 else 1.10, ftp_watts=ftp_watts)
-                off_sec = _dur_sec(m_iv.group(5), m_iv.group(6) or "m") if m_iv.group(5) else max(60, int(round(on_sec * 0.5)))
-                off_p = _norm_pwr(m_iv.group(7), 0.55, ftp_watts=ftp_watts)
-                segments.append({
+                on_cl, on_ch = _norm_cad(m_iv.group(5))
+                off_sec = _dur_sec(m_iv.group(6), m_iv.group(7) or "m") if m_iv.group(6) else max(60, int(round(on_sec * 0.5)))
+                off_p = _norm_pwr(m_iv.group(8), 0.55, ftp_watts=ftp_watts)
+                off_cl, off_ch = _norm_cad(m_iv.group(9))
+                seg_iv = {
                     "type": "intervals", "repeat": rep, "on_sec": on_sec, "off_sec": off_sec,
                     "on_p": on_p, "off_p": off_p,
                     "label": f"{rep}× {on_sec // 60 if on_sec >= 60 else str(on_sec) + 's'}"
                              f"{'m' if on_sec >= 60 else ''} @ {int(round(on_p * 100))}% / "
                              f"{off_sec // 60 if off_sec >= 60 else str(off_sec) + 's'}"
                              f"{'m' if off_sec >= 60 else ''} @ {int(round(off_p * 100))}%"
-                })
+                }
+                if on_cl is not None:
+                    seg_iv["on_cad_low"], seg_iv["on_cad_high"] = on_cl, on_ch
+                if off_cl is not None:
+                    seg_iv["off_cad_low"], seg_iv["off_cad_high"] = off_cl, off_ch
+                segments.append(seg_iv)
                 continue
 
-            # 4. Ramp: `12m ramp 70-95%`
+            # 4. Ramp: `12m ramp 70-95%` or `12m ramp 70-95% @90-95rpm`
             m_rmp = re.match(
                 r"^(\d+(?:[.,]\d+)?)\s*(m|min|s)?\s*ramp\s*(?:@\s*)?(\d+(?:[.,]\d+)?\s*[wW%]?)\s*[-–>to/]+\s*(\d+(?:[.,]\d+)?\s*[wW%]?)$",
-                tok, re.I
+                tok_nocad, re.I
             )
             if m_rmp:
                 sec = _dur_sec(m_rmp.group(1), m_rmp.group(2) or "m")
                 p_low = _norm_pwr(m_rmp.group(3), 0.65, ftp_watts=ftp_watts)
                 p_high = _norm_pwr(m_rmp.group(4), 0.95, ftp_watts=ftp_watts)
-                segments.append({"type": "ramp", "sec": sec, "p_low": p_low, "p_high": p_high,
-                                 "label": f"{sec // 60}m Ramp {int(round(p_low * 100))}–{int(round(p_high * 100))}%"})
+                cad_s = f" · {_fmt_cad(tok_cl, tok_ch)}" if tok_cl is not None else ""
+                seg = {"type": "ramp", "sec": sec, "p_low": p_low, "p_high": p_high,
+                       "label": f"{sec // 60}m Ramp {int(round(p_low * 100))}–{int(round(p_high * 100))}%{cad_s}"}
+                if tok_cl is not None:
+                    seg["cad_low"], seg["cad_high"] = tok_cl, tok_ch
+                segments.append(seg)
                 continue
 
-            # 5. FreeRide: `15m free`
-            m_fr = re.match(r"^(\d+(?:[.,]\d+)?)\s*(m|min|s|h)?\s*(?:free|freeride)$", tok, re.I)
+            # 5. FreeRide: `15m free` or `15m free @90rpm`
+            m_fr = re.match(r"^(\d+(?:[.,]\d+)?)\s*(m|min|s|h)?\s*(?:free|freeride)$", tok_nocad, re.I)
             if m_fr:
                 sec = _dur_sec(m_fr.group(1), m_fr.group(2) or "m")
-                segments.append({"type": "freeride", "sec": sec, "label": f"{sec // 60}m FreeRide"})
+                cad_s = f" · {_fmt_cad(tok_cl, tok_ch)}" if tok_cl is not None else ""
+                seg = {"type": "freeride", "sec": sec, "label": f"{sec // 60}m FreeRide{cad_s}"}
+                if tok_cl is not None:
+                    seg["cad_low"], seg["cad_high"] = tok_cl, tok_ch
+                segments.append(seg)
                 continue
 
-            # 6. SteadyState: `19m Z2@68%` or `45m @ 215W` or `30m Z2`
+            # 6. SteadyState: `19m Z2@68%` or `45m @ 215W @85-90rpm` or `8m@235W 65-70rpm`
             m_st = re.match(
                 r"^(\d+(?:[.,]\d+)?)\s*(m|min|s|h)?\s*(?:[A-Za-z0-9_-]+\s*)?(?:@\s*(\d+(?:[.,]\d+)?\s*[wW%]?))?$",
-                tok, re.I
+                tok_nocad, re.I
             )
             if m_st:
                 sec = _dur_sec(m_st.group(1), m_st.group(2) or "m")
-                low_tok = tok.lower()
+                low_tok = tok_nocad.lower()
                 def_p = 0.52 if "z1" in low_tok else (0.88 if ("z3" in low_tok or "ss" in low_tok or "tempo" in low_tok)
                         else (1.00 if "z4" in low_tok else (1.12 if "z5" in low_tok else 0.68)))
                 p = _norm_pwr(m_st.group(3), def_p, ftp_watts=ftp_watts)
-                segments.append({"type": "steady", "sec": sec, "p": p,
-                                 "label": f"{sec // 60}m @ {int(round(p * 100))}%"})
+                cad_s = f" · {_fmt_cad(tok_cl, tok_ch)}" if tok_cl is not None else ""
+                seg = {"type": "steady", "sec": sec, "p": p,
+                       "label": f"{sec // 60}m @ {int(round(p * 100))}%{cad_s}"}
+                if tok_cl is not None:
+                    seg["cad_low"], seg["cad_high"] = tok_cl, tok_ch
+                segments.append(seg)
                 continue
 
             # Track unrecognized DSL tokens so `coach simulate` & `coach push` never silently drop interval blocks!
@@ -954,32 +1050,61 @@ def parse_workout_spec(what_text, subkind="cycling", ftp_watts=275, sport=None):
         if st in ("warmup", "cooldown", "ramp"):
             calc_sec += seg["sec"]
             mid_p = round((seg["p_low"] + seg["p_high"]) / 2.0, 2)
-            visual_blocks.append({"min": round(seg["sec"] / 60.0, 1), "pct": int(round(mid_p * 100)),
-                                  "zone": _zone_class(mid_p), "label": seg["label"]})
+            vb = {"min": round(seg["sec"] / 60.0, 1), "pct": int(round(mid_p * 100)),
+                  "zone": _zone_class(mid_p), "label": seg["label"]}
+            if seg.get("cad_low") is not None:
+                vb["cadence"] = _fmt_cad(seg["cad_low"], seg.get("cad_high"))
+            visual_blocks.append(vb)
         elif st == "intervals":
+            on_cs = _fmt_cad(seg.get("on_cad_low"), seg.get("on_cad_high"))
+            off_cs = _fmt_cad(seg.get("off_cad_low"), seg.get("off_cad_high"))
             for _ in range(seg["repeat"]):
                 calc_sec += seg["on_sec"] + seg["off_sec"]
-                visual_blocks.append({"min": round(seg["on_sec"] / 60.0, 1), "pct": int(round(seg["on_p"] * 100)),
-                                      "zone": _zone_class(seg["on_p"]), "label": f"ON {int(round(seg['on_p'] * 100))}%"})
-                visual_blocks.append({"min": round(seg["off_sec"] / 60.0, 1), "pct": int(round(seg["off_p"] * 100)),
-                                      "zone": _zone_class(seg["off_p"]), "label": f"OFF {int(round(seg['off_p'] * 100))}%"})
+                vb_on = {"min": round(seg["on_sec"] / 60.0, 1), "pct": int(round(seg["on_p"] * 100)),
+                         "zone": _zone_class(seg["on_p"]),
+                         "label": f"ON {int(round(seg['on_p'] * 100))}%{(' · ' + on_cs) if on_cs else ''}"}
+                if on_cs:
+                    vb_on["cadence"] = on_cs
+                visual_blocks.append(vb_on)
+                vb_off = {"min": round(seg["off_sec"] / 60.0, 1), "pct": int(round(seg["off_p"] * 100)),
+                          "zone": _zone_class(seg["off_p"]),
+                          "label": f"OFF {int(round(seg['off_p'] * 100))}%{(' · ' + off_cs) if off_cs else ''}"}
+                if off_cs:
+                    vb_off["cadence"] = off_cs
+                visual_blocks.append(vb_off)
         elif st == "compound_intervals":
+            off_cs = _fmt_cad(seg.get("off_cad_low"), seg.get("off_cad_high"))
             for r_i in range(seg["repeat"]):
                 for stg in seg.get("stages") or []:
                     calc_sec += stg["sec"]
-                    visual_blocks.append({"min": round(stg["sec"] / 60.0, 1), "pct": int(round(stg["p"] * 100)),
-                                          "zone": _zone_class(stg["p"]), "label": f"ON {int(round(stg['p'] * 100))}%"})
+                    stg_cs = _fmt_cad(stg.get("cad_low"), stg.get("cad_high"))
+                    vb_s = {"min": round(stg["sec"] / 60.0, 1), "pct": int(round(stg["p"] * 100)),
+                            "zone": _zone_class(stg["p"]),
+                            "label": f"ON {int(round(stg['p'] * 100))}%{(' · ' + stg_cs) if stg_cs else ''}"}
+                    if stg_cs:
+                        vb_s["cadence"] = stg_cs
+                    visual_blocks.append(vb_s)
                 if seg.get("off_sec") and r_i < seg["repeat"] - 1:
                     calc_sec += seg["off_sec"]
-                    visual_blocks.append({"min": round(seg["off_sec"] / 60.0, 1), "pct": int(round(seg["off_p"] * 100)),
-                                          "zone": _zone_class(seg["off_p"]), "label": f"OFF {int(round(seg['off_p'] * 100))}%"})
+                    vb_o = {"min": round(seg["off_sec"] / 60.0, 1), "pct": int(round(seg["off_p"] * 100)),
+                            "zone": _zone_class(seg["off_p"]),
+                            "label": f"OFF {int(round(seg['off_p'] * 100))}%{(' · ' + off_cs) if off_cs else ''}"}
+                    if off_cs:
+                        vb_o["cadence"] = off_cs
+                    visual_blocks.append(vb_o)
         elif st == "freeride":
             calc_sec += seg["sec"]
-            visual_blocks.append({"min": round(seg["sec"] / 60.0, 1), "pct": 68, "zone": "z2", "label": seg["label"]})
+            vb = {"min": round(seg["sec"] / 60.0, 1), "pct": 68, "zone": "z2", "label": seg["label"]}
+            if seg.get("cad_low") is not None:
+                vb["cadence"] = _fmt_cad(seg["cad_low"], seg.get("cad_high"))
+            visual_blocks.append(vb)
         else:
             calc_sec += seg["sec"]
-            visual_blocks.append({"min": round(seg["sec"] / 60.0, 1), "pct": int(round(seg["p"] * 100)),
-                                  "zone": _zone_class(seg["p"]), "label": seg["label"]})
+            vb = {"min": round(seg["sec"] / 60.0, 1), "pct": int(round(seg["p"] * 100)),
+                  "zone": _zone_class(seg["p"]), "label": seg["label"]}
+            if seg.get("cad_low") is not None:
+                vb["cadence"] = _fmt_cad(seg["cad_low"], seg.get("cad_high"))
+            visual_blocks.append(vb)
 
     if calc_sec > 0 and not total_min:
         total_min = int(round(calc_sec / 60.0))
@@ -1030,27 +1155,47 @@ def compile_zwo_xml(spec_or_title, description="", parsed_spec=None, date_str=""
     ]
     for s in segs:
         t = s["type"]
+        cad_attr = _cad_xml_attrs(s.get("cad_low"), s.get("cad_high"))
         if t == "warmup":
-            lines.append(f'    <Warmup Duration="{int(s["sec"])}" PowerLow="{s["p_low"]:.2f}" PowerHigh="{s["p_high"]:.2f}"/>')
+            lines.append(f'    <Warmup Duration="{int(s["sec"])}" PowerLow="{s["p_low"]:.2f}" PowerHigh="{s["p_high"]:.2f}"{cad_attr}/>')
         elif t == "cooldown":
-            lines.append(f'    <Cooldown Duration="{int(s["sec"])}" PowerLow="{s["p_low"]:.2f}" PowerHigh="{s["p_high"]:.2f}"/>')
+            lines.append(f'    <Cooldown Duration="{int(s["sec"])}" PowerLow="{s["p_low"]:.2f}" PowerHigh="{s["p_high"]:.2f}"{cad_attr}/>')
         elif t == "ramp":
-            lines.append(f'    <Ramp Duration="{int(s["sec"])}" PowerLow="{s["p_low"]:.2f}" PowerHigh="{s["p_high"]:.2f}"/>')
+            lines.append(f'    <Ramp Duration="{int(s["sec"])}" PowerLow="{s["p_low"]:.2f}" PowerHigh="{s["p_high"]:.2f}"{cad_attr}/>')
         elif t == "intervals":
-            lines.append(
-                f'    <IntervalsT Repeat="{int(s["repeat"])}" OnDuration="{int(s["on_sec"])}" '
-                f'OffDuration="{int(s["off_sec"])}" OnPower="{s["on_p"]:.2f}" OffPower="{s["off_p"]:.2f}"/>'
-            )
+            on_cl, on_ch = s.get("on_cad_low"), s.get("on_cad_high")
+            off_cl, off_ch = s.get("off_cad_low"), s.get("off_cad_high")
+            if on_cl is None and off_cl is None:
+                lines.append(
+                    f'    <IntervalsT Repeat="{int(s["repeat"])}" OnDuration="{int(s["on_sec"])}" '
+                    f'OffDuration="{int(s["off_sec"])}" OnPower="{s["on_p"]:.2f}" OffPower="{s["off_p"]:.2f}"/>'
+                )
+            elif on_cl is not None and on_cl == on_ch and off_cl == on_cl and off_ch == on_ch:
+                lines.append(
+                    f'    <IntervalsT Repeat="{int(s["repeat"])}" OnDuration="{int(s["on_sec"])}" '
+                    f'OffDuration="{int(s["off_sec"])}" OnPower="{s["on_p"]:.2f}" OffPower="{s["off_p"]:.2f}" Cadence="{int(on_cl)}"/>'
+                )
+            else:
+                # Unroll into explicit <SteadyState> pairs when On/Off cadence targets differ or use ranges:
+                # Hammerhead Karoo's ZWO importer ignores `CadenceResting` on `<IntervalsT>` and copies `Cadence`
+                # onto the recovery step, whereas `<SteadyState>` renders exact per-step `Cadence` / `CadenceLow`/`CadenceHigh`.
+                on_ca = _cad_xml_attrs(on_cl, on_ch)
+                off_ca = _cad_xml_attrs(off_cl, off_ch)
+                for _ in range(int(s["repeat"])):
+                    lines.append(f'    <SteadyState Duration="{int(s["on_sec"])}" Power="{s["on_p"]:.2f}"{on_ca}/>')
+                    lines.append(f'    <SteadyState Duration="{int(s["off_sec"])}" Power="{s["off_p"]:.2f}"{off_ca}/>')
         elif t == "compound_intervals":
+            off_ca = _cad_xml_attrs(s.get("off_cad_low"), s.get("off_cad_high"))
             for r_i in range(int(s["repeat"])):
                 for stg in s.get("stages") or []:
-                    lines.append(f'    <SteadyState Duration="{int(stg["sec"])}" Power="{stg["p"]:.2f}"/>')
+                    stg_ca = _cad_xml_attrs(stg.get("cad_low"), stg.get("cad_high"))
+                    lines.append(f'    <SteadyState Duration="{int(stg["sec"])}" Power="{stg["p"]:.2f}"{stg_ca}/>')
                 if s.get("off_sec") and r_i < int(s["repeat"]) - 1:
-                    lines.append(f'    <SteadyState Duration="{int(s["off_sec"])}" Power="{s["off_p"]:.2f}"/>')
+                    lines.append(f'    <SteadyState Duration="{int(s["off_sec"])}" Power="{s["off_p"]:.2f}"{off_ca}/>')
         elif t == "freeride":
-            lines.append(f'    <FreeRide Duration="{int(s["sec"])}" FlatRoad="1"/>')
+            lines.append(f'    <FreeRide Duration="{int(s["sec"])}" FlatRoad="1"{cad_attr}/>')
         else:
-            lines.append(f'    <SteadyState Duration="{int(s["sec"])}" Power="{s["p"]:.2f}"/>')
+            lines.append(f'    <SteadyState Duration="{int(s["sec"])}" Power="{s["p"]:.2f}"{cad_attr}/>')
     lines += ["  </workout>", "</workout_file>\n"]
     return "\n".join(lines)
 

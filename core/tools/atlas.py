@@ -3344,7 +3344,7 @@ def _coach_auth_intervals(brain, args):
     say(f"intervals auth: saved Intervals.icu credentials -> {fwd(p)}")
 
 
-def _coach_push(root, brain, hk, days=14, execute=True, mock_dir=None):
+def _coach_push(root, brain, hk, days=14, execute=True, mock_dir=None, force_recreate=False):
     """Compile `.zwo` + `.fit` files and push/update/delete idempotently on Hammerhead Karoo & Garmin Connect."""
     _coach_init(root, brain, hk, execute=execute, quiet=True)
     ftp_w, weight_kg = _extract_profile_numbers(brain, hk)
@@ -3392,6 +3392,7 @@ def _coach_push(root, brain, hk, days=14, execute=True, mock_dir=None):
         mass_kg=float(prof_info.get("weight_kg") or weight_kg or 75.0),
         creatine_flag=prof_info.get("creatine_flag"),
         base_tau_w_mult=eff_tau_push,
+        force_recreate=force_recreate,
     )
     if execute:
         hk.render_calendar_html(idx, start_server=False)
@@ -4114,7 +4115,11 @@ def cmd_coach(args):
     elif action == "zwo":
         _coach_zwo(root, brain, hk, date_str=args.date, days=args.days)
     elif action in ("push", "fit"):
-        _coach_push(root, brain, hk, days=args.days, execute=args.execute, mock_dir=getattr(args, "mock_dir", None))
+        _coach_push(
+            root, brain, hk, days=args.days, execute=args.execute,
+            mock_dir=getattr(args, "mock_dir", None),
+            force_recreate=bool(getattr(args, "recreate", False)),
+        )
     elif action == "history":
         c_state = hk.load_coach_state()
         say(coach_engine.query_coach_history(
@@ -5796,6 +5801,7 @@ def main():
     p.add_argument("--port", type=int, default=8766, help="loopback OAuth callback port (default: 8766)")
     p.add_argument("--open", action="store_true", help="open visual calendar in Coach View")
     p.add_argument("--no-sync", action="store_true", help="skip automatic Strava background sync during `context`")
+    p.add_argument("--recreate", action="store_true", help="delete and re-upload existing remote workouts during `push`")
     p.add_argument("--execute", action="store_true")
 
     p = sub.add_parser("inventory")

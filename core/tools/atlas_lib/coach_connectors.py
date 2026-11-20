@@ -831,6 +831,7 @@ def sync_calendar_workouts_to_devices(
     mass_kg: float | None = None,
     creatine_flag: bool | None = None,
     base_tau_w_mult: float = 1.0,
+    force_recreate: bool = False,
 ) -> dict[str, Any]:
     """Compile `.zwo` + `.fit` files, run 1-Hz W'bal/VO2 Compiler-Guard, archive superseded files, and sync to devices."""
     ref_today = today or dt.date.today()
@@ -885,9 +886,6 @@ def sync_calendar_workouts_to_devices(
             continue
 
         active_keys.add(key)
-        spec_sig = hashlib.sha1(
-            json.dumps({"date": d_iso, "sport": sport, "what": it.get("what"), "ftp": ftp_watts}, sort_keys=True).encode("utf-8")
-        ).hexdigest()[:12]
 
         zwo_xml = ""
         if sport == "cycling" and (spec.get("segments") or spec.get("blocks")):
@@ -920,6 +918,11 @@ def sync_calendar_workouts_to_devices(
                     sim["unparsed_tokens"] = list(spec["unparsed_tokens"])
                 sim_reports.append(sim)
 
+        zwo_sha = hashlib.sha1(zwo_xml.encode("utf-8")).hexdigest()[:8] if zwo_xml else ""
+        spec_sig = hashlib.sha1(
+            json.dumps({"date": d_iso, "sport": sport, "what": it.get("what"), "ftp": ftp_watts, "zwo": zwo_sha}, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:12]
+
         if spec.get("segments") or spec.get("blocks") or sport in ("cycling", "running"):
             fit_bytes = fit_writer.compile_fit_workout_bytes(
                 title=f"{d_iso} {spec.get('title', 'Workout')}",
@@ -938,17 +941,24 @@ def sync_calendar_workouts_to_devices(
             fit_written.append(fit_p)
 
         prev = sync_map.get(key) or {}
-        unchanged = prev.get("spec_sig") == spec_sig
+        unchanged = (prev.get("spec_sig") == spec_sig) and not force_recreate
         rec = dict(prev)
         rec.update({"date": d_iso, "sport": sport, "title": spec.get("title"), "spec_sig": spec_sig})
 
         if execute and hh_active and sport == "cycling" and zwo_xml and (not unchanged or not rec.get("hammerhead_id")):
+            existing_hh_id = rec.get("hammerhead_id")
+            if force_recreate and existing_hh_id:
+                ok_del, msg_del = hammerhead_delete_workout(brain, existing_hh_id, mock_dir=mock_dir)
+                device_actions.append(msg_del)
+                if ok_del:
+                    existing_hh_id = None
+                    rec.pop("hammerhead_id", None)
             ok_hh, msg_hh, wid_hh = hammerhead_push_or_update(
                 brain,
                 zwo_xml=zwo_xml,
                 filename=f"{d_iso}_{slug}.zwo",
                 planned_date=d_iso,
-                existing_workout_id=rec.get("hammerhead_id"),
+                existing_workout_id=existing_hh_id,
                 mock_dir=mock_dir,
             )
             device_actions.append(msg_hh)
