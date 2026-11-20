@@ -2,6 +2,15 @@
 
 Written for users: `/atlas-update` shows the sections between the installed and the new version.
 
+## [1.4.10] - 2026-11-20
+
+- **Zero-Loss To-Do & Calendar Persistence Hardening (`atlas_hook.py`, `cal_engine.py`, `atlas.py`, `calendar.md`):**
+  - **Eliminates Silent False-Positive Deduplication:** Within `calendar/README.md`, distinct same-day tasks or undated to-dos sharing topic keywords are never fuzzy-dropped (only exact duplicates are merged), while cross-file mirror deduplication now requires `>= 2` overlapping tokens and reads decentralized checklists up to `256 KB` instead of truncating at `16 KB`.
+  - **Unbounded Open-Task Visibility & Overflow Indicator:** `render_calendar_html()` now keeps **all** open items in `calendar.html` regardless of age or future horizon (including `> 90d` overdue tasks and multi-year deadlines up to 10 years out) while keeping completed history compact (`[-90d, +365d]`); the `PreInvocation` urgent-task line appends `(+N more — run atlas.py todo)` whenever more than 5 overdue/due-today items exist (0 extra tokens otherwise).
+  - **Thread- & Process-Safe Atomic Writes (`brain_write_lock` + `atlas-cal-v5`):** Serializes all `calendar/README.md` and task mutations across threads and processes via cross-platform locking (`fcntl.flock` / `msvcrt`) + unique temp filenames (`pid + thread + nonce` + `os.fsync` + `os.replace`) across `cal_engine.py`, `atlas.py` (`write()`, Coach sync/field-test), and `atlas_hook.py` (`daily_log()`, `_save_json()`), preventing lost updates on parallel browser clicks or concurrent CLI runs.
+  - **Stop-Hook Calendar Deletion Guard:** Before auto-committing, `stop()` compares `HEAD:calendar/README.md` against disk and fires a loud safety alert (with the exact recovery command `git -C brain show HEAD~1:calendar/README.md`) if any open non-workout task was deleted instead of marked `[x]`/`[-]`, rescheduled, or promoted (0 extra tokens on normal turns).
+  - **Instant Browser-Toggle Git Persistence & Frontmatter `due:` Checkboxes:** Successful `POST /toggle-todo` clicks in the loopback dashboard (`atlas-cal-v5`, auto-reloading older `v4` servers) asynchronously commit and push only the toggled file without touching unrelated dirty files; non-yearly frontmatter `due:` deadlines now expose 1-click checkboxes in the dashboard (`can_toggle = True`).
+
 ## [1.4.9] - 2026-11-20
 
 - **Native Cadence Targets (`@90rpm` / `@65-70rpm`) for `.zwo` (Hammerhead Karoo) & `.fit` Workouts (`atlas_hook.py`, `fit_writer.py`, `coach_connectors.py`, `atlas.py`, `coach.md`):**

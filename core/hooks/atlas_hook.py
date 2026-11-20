@@ -26,9 +26,11 @@ import json
 import math
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import traceback
 
@@ -127,7 +129,7 @@ def _state():
 
 def _save_json(path, data):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = f"{path}.{os.getpid()}.tmp"
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.{secrets.token_hex(4)}.tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(data, fh, indent=1, sort_keys=True, ensure_ascii=False)
     os.replace(tmp, path)
@@ -462,27 +464,43 @@ def _parse_cal_line(raw, rel, today, default_kind="deadline"):
         end = start
     delta = 0 if start <= today <= end else ((start - today).days if start > today else (end - today).days)
     return {"start": start, "end": end, "delta": delta, "status": status, "time": t_str,
-            "kind": kind, "subkind": subkind, "what": rest, "rel": rel}
+            "kind": kind, "subkind": subkind, "what": rest, "rel": rel, "yearly": yearly}
 
 
 def _is_dup_cal_item(candidate, existing_items):
-    """Return True if candidate on the same date range is already represented (e.g. folder README + detail page)."""
+    """Return True if candidate on the same date range is already represented (e.g. folder README + detail page).
+
+    Within `calendar/` files themselves, only exact (what + time + kind) duplicates are suppressed so distinct
+    same-day tasks sharing topic keywords are never silently dropped.
+    """
     c_start, c_end = candidate["start"], candidate["end"]
     c_what = candidate["what"].lower().strip()
     c_tokens = _cal_tokens(c_what)
-    c_area = candidate["rel"].split("/")[:2]
+    c_rel = candidate["rel"]
+    c_in_cal = c_rel.startswith("calendar/")
+    c_area = c_rel.split("/")[:2]
     for ex in existing_items:
         if ex["start"] != c_start or ex["end"] != c_end:
             continue
+        if c_in_cal and ex["rel"].startswith("calendar/"):
+            if (
+                ex["what"].lower().strip() == c_what
+                and ex.get("time", "") == candidate.get("time", "")
+                and ex.get("kind", "") == candidate.get("kind", "")
+            ):
+                return True
+            continue
         if ex["what"].lower().strip() == c_what:
             return True
+        if ex["rel"] == c_rel:
+            continue
         ex_tokens = _cal_tokens(ex["what"])
         if not c_tokens or not ex_tokens:
             continue
         overlap = len(c_tokens & ex_tokens)
         min_len = max(min(len(c_tokens), len(ex_tokens)), 1)
         same_area = (ex["rel"].split("/")[:2] == c_area) or ex["rel"].startswith("calendar/")
-        if (same_area and overlap >= 2 and overlap / min_len >= 0.35) or (overlap >= 3 and overlap / min_len >= 0.5):
+        if (same_area and overlap >= 2 and overlap / min_len >= 0.5) or (overlap >= 3 and overlap / min_len >= 0.5):
             return True
     return False
 
@@ -537,7 +555,7 @@ def calendar_items(idx, days=30, past_days=3650, include_done=False):
             if not item:
                 continue
             item["line"] = 0
-            item["can_toggle"] = False
+            item["can_toggle"] = (item["kind"] in ("todo", "deadline") and not item.get("yearly"))
             if not include_done and item["status"] != "open":
                 continue
             if -past_days <= item["delta"] <= days and not _is_dup_cal_item(item, items):
@@ -563,9 +581,14 @@ def open_todos(include_done=False):
         for ex in out:
             if ex["what"].lower() == what_clean.lower():
                 return
+            # Never fuzzy-drop two distinct user tasks inside `calendar/README.md`
+            if rel == "calendar/README.md" and ex["rel"] == "calendar/README.md":
+                continue
             t_ex = _cal_tokens(ex["what"])
-            if t_new and t_ex and len(t_new & t_ex) / max(min(len(t_new), len(t_ex)), 1) >= 0.6:
-                return
+            if t_new and t_ex:
+                overlap = len(t_new & t_ex)
+                if overlap >= 2 and overlap / max(min(len(t_new), len(t_ex)), 1) >= 0.6:
+                    return
         out.append({
             "status": status,
             "prio": prio,
@@ -623,7 +646,7 @@ def open_todos(include_done=False):
                 is_checklist_file = any(w in fn.lower() for w in ("todo", "checkliste", "aufgaben"))
                 try:
                     with open(full, encoding="utf-8", errors="replace") as fh:
-                        lines = fh.read(HEAD_BYTES).splitlines()
+                        lines = fh.read(262_144).splitlines()
                 except OSError:
                     continue
                 in_open_sec = False
@@ -1596,7 +1619,7 @@ def actionable_tasks(idx=None, include_upcoming_days=0):
             prio, badge = "scheduled", f"in {delta} d · {it['start'].isoformat()}"
         what_clean = _clean_md_inline(it["what"])
         out.append({
-            "source": "dated" if it.get("can_toggle") else "due_fm",
+            "source": "due_fm" if int(it.get("line") or 0) == 0 else "dated",
             "kind": it["kind"],
             "prio": prio,
             "badge": badge,
@@ -1617,9 +1640,15 @@ def actionable_tasks(idx=None, include_upcoming_days=0):
                 dup = True
                 break
             t_ex = _cal_tokens(ex["what"])
-            if t_new and t_ex and len(t_new & t_ex) / max(min(len(t_new), len(t_ex)), 1) >= 0.6:
-                dup = True
-                break
+            if t_new and t_ex:
+                overlap = len(t_new & t_ex)
+                if td["rel"] == "calendar/README.md" and ex["rel"] == "calendar/README.md":
+                    if overlap >= 3 and overlap / max(len(t_new), len(t_ex), 1) >= 0.85:
+                        dup = True
+                        break
+                elif overlap >= 2 and overlap / max(min(len(t_new), len(t_ex)), 1) >= 0.6:
+                    dup = True
+                    break
         if dup:
             continue
         out.append({
@@ -1645,7 +1674,7 @@ CAL_SERVER_SCRIPT = cal_engine.CAL_SERVER_SCRIPT
 
 
 def _cal_http_ok(port):
-    """Verify the calendar server returns HTTP 200 on `/healthz` (`atlas-cal-v3`)."""
+    """Verify the calendar server returns HTTP 200 on `/healthz` (`atlas-cal-v5`)."""
     return cal_engine.cal_http_ok(port)
 
 
@@ -1664,7 +1693,9 @@ def render_calendar_html(idx=None, start_server=False):
     """Generate `brain/_atlas/cache/calendar.html` (0 LLM tokens) and return its rendered `http://127.0.0.1` URL."""
     if idx is None:
         idx = load_index(budget=INDEX_BUDGET_S)
-    raw_items = calendar_items(idx, days=365, past_days=90, include_done=True)
+    all_items = calendar_items(idx, days=3650, past_days=3650, include_done=True)
+    # Always keep ALL open items (even >90d overdue or >365d future deadlines); cap completed history to [-90d, +365d]
+    raw_items = [it for it in all_items if it["status"] == "open" or (-90 <= it["delta"] <= 365)]
     serial = [{k: (v.isoformat() if isinstance(v, dt.date) else v) for k, v in it.items()} for it in raw_items]
     todos = [
         {
@@ -2036,8 +2067,9 @@ def session_text(cwd, session, skip_pull=False):
                 _log_hook_error("session.render_calendar", exc)
         urgent = [d for d in due if d[1] <= 0]
         if urgent:
+            more_u = f" (+{len(urgent) - 5} more — run `atlas.py todo`)" if len(urgent) > 5 else ""
             lines.append("Due today/overdue (mention if due today, relevant, or when the user only sends a bare greeting like 'moin'): " + "; ".join(
-                f"{w.isoformat()} {what} [{_show(rel, cwd)}]" for w, _d, what, rel in urgent[:5]))
+                f"{w.isoformat()} {what} [{_show(rel, cwd)}]" for w, _d, what, rel in urgent[:5]) + more_u)
     hour = dt.datetime.now().hour
     if s.get("questions") == "evening-3" and hour >= _int(s.get("evening_hour"), 18) and st.get("last_evening") != today:
         st["last_evening"] = today
@@ -2560,8 +2592,11 @@ def daily_log(text, context):
             new.append(f"- {stamp} · {context} · {linked}")
     if new:
         body = current.rstrip("\n")
-        with open(path, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write(body + ("\n\n" if body.endswith("· Log") else "\n") + "\n".join(new) + "\n")
+        payload = body + ("\n\n" if body.endswith("· Log") else "\n") + "\n".join(new) + "\n"
+        tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.{secrets.token_hex(4)}.tmp"
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(payload)
+        os.replace(tmp, path)
 
 
 IGNORED_TOOLS = re.compile(r"(?i)todo|plan|wrap_up|toolsearch|askuserquestion|read_widget|mark_chapter")
@@ -2824,6 +2859,63 @@ def _parse_antigravity_turn(transcript_path):
     return "\n\n".join(contents), did_work
 
 
+def _detect_deleted_open_calendar_tasks():
+    """Return open non-workout tasks present in `HEAD:calendar/README.md` that vanished completely from disk.
+
+    Marking a task `[x]` or `[-]`, rescheduling its date/time, promoting an undated task into `## Timeline`,
+    or slightly rewording it are all recognized as preserved (zero false positives). Only genuinely deleted
+    open non-workout lines are returned so the Stop hook can alert before an accidental edit goes unnoticed.
+    """
+    if not os.path.isdir(os.path.join(BRAIN, ".git")):
+        return []
+    st_res = _git("status", "--porcelain", "--", "calendar/README.md")
+    if st_res.returncode != 0 or not (st_res.stdout or "").strip():
+        return []
+    head_res = _git("show", "HEAD:calendar/README.md")
+    if head_res.returncode != 0 or not head_res.stdout:
+        return []
+    head_lines = head_res.stdout.splitlines()
+    cal_path = os.path.join(BRAIN, "calendar", "README.md")
+    if os.path.isfile(cal_path):
+        try:
+            with open(cal_path, encoding="utf-8", errors="replace") as fh:
+                cur_lines = fh.read().splitlines()
+        except OSError:
+            return []
+    else:
+        cur_lines = []
+
+    cur_all = []
+    for _idx, _box, rest in cal_engine.find_checkbox_lines(cur_lines):
+        n = cal_engine._norm_todo_compare(rest)
+        if n:
+            cur_all.append((n, _cal_tokens(n)))
+
+    deleted = []
+    for _idx, box, rest in cal_engine.find_checkbox_lines(head_lines):
+        if box != " ":
+            continue
+        if "[workout" in rest.lower():
+            continue
+        old_norm = cal_engine._norm_todo_compare(rest)
+        if len(old_norm) < 3:
+            continue
+        old_toks = _cal_tokens(old_norm)
+        found = False
+        for c_norm, c_toks in cur_all:
+            if old_norm == c_norm or old_norm in c_norm or c_norm in old_norm:
+                found = True
+                break
+            if old_toks and c_toks:
+                ov = len(old_toks & c_toks)
+                if ov >= 2 and ov / max(min(len(old_toks), len(c_toks)), 1) >= 0.6:
+                    found = True
+                    break
+        if not found:
+            deleted.append(rest.strip()[:120])
+    return deleted
+
+
 def stop(agent, data):
     if PROBE:
         return
@@ -2846,6 +2938,11 @@ def stop(agent, data):
         _auto_heal_dirty_brain_pages()
     except Exception as exc:
         _log_hook_error("stop.auto_heal", exc)
+    deleted_cal_tasks = []
+    try:
+        deleted_cal_tasks = _detect_deleted_open_calendar_tasks()
+    except Exception as exc:
+        _log_hook_error("stop.calendar_guard", exc)
     try:
         if _calendar_needs_render():
             render_calendar_html()
@@ -2855,9 +2952,22 @@ def stop(agent, data):
         autocommit_and_push()
     except Exception as exc:
         _log_hook_error("stop.autocommit", exc)
+    guard_reason = None
+    if deleted_cal_tasks:
+        preview = "; ".join(deleted_cal_tasks[:4])
+        if len(deleted_cal_tasks) > 4:
+            preview += f" (+{len(deleted_cal_tasks) - 4} more)"
+        guard_reason = (
+            f"Atlas safety guard - {len(deleted_cal_tasks)} open task(s) were deleted from calendar/README.md "
+            f"instead of marked [x] or [-]: {preview}. Restore any accidentally removed task(s) from git "
+            f"(`git -C brain show HEAD~1:calendar/README.md`) or confirm intentional deletion with the user."
+        )
     marker = bool(MARKER.search(last))
     if agent == "claude":
         if data.get("stop_hook_active"):
+            return
+        if guard_reason:
+            emit_continue(agent, guard_reason)
             return
         tp = data.get("transcript_path")
         did_work = bool(tp and os.path.isfile(tp) and _claude_turn_did_work(tp))
@@ -2873,7 +2983,7 @@ def stop(agent, data):
     key = hashlib.sha256((session + (data.get("lastUserInput") or "")).encode("utf-8")).hexdigest()[:16]
     if _state().get("antigravity_last_nudge") == key:
         return
-    reason = _decide(session, marker, ag_did_work)
+    reason = guard_reason or _decide(session, marker, ag_did_work)
     if reason:
         st = _state()
         st["antigravity_last_nudge"] = key

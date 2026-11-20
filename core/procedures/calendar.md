@@ -29,7 +29,7 @@ What this does automatically (0 LLM tokens):
    the brain, plus the SQLite knowledge graph (`index.sqlite`) and adaptive Coach state.
 2. Regenerates the visual dashboard (`brain/_atlas/cache/calendar.html`) with 4 views (`Alle`, `🚴 Coach View`,
    `☑️ To-Dos & Fristen`, and `🕸️ Brain Graph`).
-3. Starts the loopback server (`atlas-cal-v3`) on `http://127.0.0.1:<port>/calendar.html` (with CSRF-protected
+3. Starts the loopback server (`atlas-cal-v5`) on `http://127.0.0.1:<port>/calendar.html` (with CSRF-protected
    1-click To-Do/Workout checkbox toggling via `POST /toggle-todo`) and opens the rendered dashboard in the browser.
 
 In your reply:

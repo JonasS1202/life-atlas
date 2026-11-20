@@ -48,10 +48,12 @@ import math
 import os
 import platform
 import re
+import secrets
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 sys.dont_write_bytecode = True
@@ -100,9 +102,25 @@ def read(path, limit=None):
 
 
 def write(path, text):
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8", newline="\n") as fh:
-        fh.write(text)
+    parent = os.path.dirname(path) or "."
+    os.makedirs(parent, exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.{secrets.token_hex(4)}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def load_json(path, default):
@@ -2411,42 +2429,43 @@ def _match_activities_to_calendar(brain, activities):
     cal_path = os.path.join(brain, "calendar", "README.md")
     if not os.path.isfile(cal_path):
         return 0
-    text = read(cal_path)
-    lines = text.splitlines()
-    by_date = {}
-    for a in activities:
-        if isinstance(a, dict) and a.get("date"):
-            by_date.setdefault(a["date"][:10], []).append(a)
-    matched = 0
-    for idx_l, line in enumerate(lines):
-        m = re.match(r"^(\s*-\s*)\[([ xX\-])\](\s+)(\d{4}-\d{2}-\d{2})\b(.*)$", line)
-        if not m or "[workout" not in m.group(5).lower():
-            continue
-        d_str = m.group(4)
-        if d_str not in by_date:
-            continue
-        rest = m.group(5)
-        m_sub = re.search(r"\[workout:([a-z0-9_-]+)\]", rest, re.I)
-        w_sport = m_sub.group(1).lower() if m_sub else ""
-        day_cands = by_date[d_str]
-        sport_matches = [a for a in day_cands if not w_sport or a.get("sport", "").lower() == w_sport]
-        act = sport_matches[0] if sport_matches else day_cands[0]
-        changed = False
-        if m.group(2) == " ":
-            changed = True
-        fb = act.get("feedback") or ""
-        if fb and "[feedback:" not in rest.lower():
-            rest = rest.rstrip() + f" [feedback: {fb}]"
-            changed = True
-        elif fb and fb != "pending" and "[feedback: pending]" in rest.lower():
-            rest = re.sub(r"\[feedback:\s*pending\]", f"[feedback: {fb}]", rest, flags=re.I)
-            changed = True
-        if changed:
-            lines[idx_l] = f"{m.group(1)}[x]{m.group(3)}{d_str}{rest}"
-            matched += 1
-    if matched:
-        write(cal_path, "\n".join(lines) + ("\n" if text.endswith("\n") else ""))
-    return matched
+    with cal_engine.brain_write_lock(brain):
+        text = read(cal_path)
+        lines = text.splitlines()
+        by_date = {}
+        for a in activities:
+            if isinstance(a, dict) and a.get("date"):
+                by_date.setdefault(a["date"][:10], []).append(a)
+        matched = 0
+        for idx_l, line in enumerate(lines):
+            m = re.match(r"^(\s*-\s*)\[([ xX\-])\](\s+)(\d{4}-\d{2}-\d{2})\b(.*)$", line)
+            if not m or "[workout" not in m.group(5).lower():
+                continue
+            d_str = m.group(4)
+            if d_str not in by_date:
+                continue
+            rest = m.group(5)
+            m_sub = re.search(r"\[workout:([a-z0-9_-]+)\]", rest, re.I)
+            w_sport = m_sub.group(1).lower() if m_sub else ""
+            day_cands = by_date[d_str]
+            sport_matches = [a for a in day_cands if not w_sport or a.get("sport", "").lower() == w_sport]
+            act = sport_matches[0] if sport_matches else day_cands[0]
+            changed = False
+            if m.group(2) == " ":
+                changed = True
+            fb = act.get("feedback") or ""
+            if fb and "[feedback:" not in rest.lower():
+                rest = rest.rstrip() + f" [feedback: {fb}]"
+                changed = True
+            elif fb and fb != "pending" and "[feedback: pending]" in rest.lower():
+                rest = re.sub(r"\[feedback:\s*pending\]", f"[feedback: {fb}]", rest, flags=re.I)
+                changed = True
+            if changed:
+                lines[idx_l] = f"{m.group(1)}[x]{m.group(3)}{d_str}{rest}"
+                matched += 1
+        if matched:
+            write(cal_path, "\n".join(lines) + ("\n" if text.endswith("\n") else ""))
+        return matched
 
 
 DEFAULT_STRAVA_CLIENT_ID = "91804"
@@ -4027,15 +4046,16 @@ def _coach_field_test(root, brain, hk, unit, date_str=None, execute=True, depth_
     line = templates[u_key]
     cal_path = os.path.join(brain, "calendar", "README.md")
     if execute and os.path.isfile(cal_path):
-        txt = read(cal_path)
-        if "## Timeline" in txt:
-            idx_t = txt.index("## Timeline") + len("## Timeline")
-            nl = txt.find("\n", idx_t)
-            ins_at = nl + 1 if nl >= 0 else len(txt)
-            txt = txt[:ins_at] + "\n" + line + "\n" + txt[ins_at:].lstrip("\n")
-        else:
-            txt = txt.rstrip() + f"\n\n## Timeline\n\n{line}\n"
-        write(cal_path, txt)
+        with cal_engine.brain_write_lock(brain):
+            txt = read(cal_path)
+            if "## Timeline" in txt:
+                idx_t = txt.index("## Timeline") + len("## Timeline")
+                nl = txt.find("\n", idx_t)
+                ins_at = nl + 1 if nl >= 0 else len(txt)
+                txt = txt[:ins_at] + "\n" + line + "\n" + txt[ins_at:].lstrip("\n")
+            else:
+                txt = txt.rstrip() + f"\n\n## Timeline\n\n{line}\n"
+            write(cal_path, txt)
         _coach_push(root, brain, hk, days=21, execute=True)
     say(f"coach field-test ({'scheduled' if execute else 'dry-run'}, depth={eff_depth}): {line}")
     if u_key == "2" and is_fast_myo:

@@ -2,8 +2,9 @@
 
 Loads `templates/calendar.html`, compiles the zero-token JSON payload (Calendar + Adaptive Coach +
 SQLite Knowledge Graph + CSRF token), safely toggles Markdown checkboxes inside `<BRAIN>/`, and
-manages the loopback `127.0.0.1` HTTP server (`atlas-cal-v4`).
+manages the loopback `127.0.0.1` HTTP server (`atlas-cal-v5`).
 """
+import contextlib
 import datetime as dt
 import hmac
 import json
@@ -14,6 +15,7 @@ import secrets
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 
@@ -21,8 +23,9 @@ sys.dont_write_bytecode = True
 
 from atlas_lib import graph_engine
 
-CAL_SERVER_HEALTH_TOKEN = b"atlas-cal-v4"
+CAL_SERVER_HEALTH_TOKEN = b"atlas-cal-v5"
 
+_THREAD_WRITE_LOCK = threading.RLock()
 _CHECKBOX_LINE_RX = re.compile(r"^(\s*(?:[-*+]|\d+\.)?\s*)\[([ xX-])\](\s+.*)$")
 _FENCE_RX = re.compile(r"^\s*(`{3,}|~{3,})")
 
@@ -88,7 +91,7 @@ def get_or_create_csrf_token(cache_dir):
     except OSError:
         pass
     tok = secrets.token_hex(24)
-    tmp = f"{p}.{os.getpid()}.tmp"
+    tmp = f"{p}.{os.getpid()}.{threading.get_ident()}.{secrets.token_hex(4)}.tmp"
     try:
         with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(tok + "\n")
@@ -138,7 +141,7 @@ def _norm_todo_compare(text):
     s = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", s)
     s = s.replace("**", "").replace("`", "").strip()
     s = re.sub(r"^\d{4}-\d{2}-\d{2}(?:\.\.\d{4}-\d{2}-\d{2})?\s+", "", s)
-    s = re.sub(r"^\d{1,2}:\d{2}\s+", "", s)
+    s = re.sub(r"^\d{1,2}:\d{2}(?:-\d{1,2}:\d{2})?\s+", "", s)
     s = re.sub(r"^\[[a-zA-Z0-9_:-]+\]\s*", "", s)
     s = re.sub(r"\s*:\s*$", "", s)
     s = re.sub(r"\s+", " ", s).strip().lower()
@@ -204,11 +207,72 @@ def find_checkbox_lines(lines):
             yield idx, m_cb.group(2), m_cb.group(3)
 
 
+@contextlib.contextmanager
+def brain_write_lock(brain):
+    """Serialize read-modify-write calendar/to-do mutations across threads and processes (stdlib only, fail-safe)."""
+    lock_fh = None
+    locked_mode = None
+    with _THREAD_WRITE_LOCK:
+        try:
+            cache_dir = os.path.join(brain, "_atlas", "cache")
+            os.makedirs(cache_dir, exist_ok=True)
+            lock_path = os.path.join(cache_dir, ".todo.lock")
+            lock_fh = open(lock_path, "a+b")
+            if os.name == "nt":
+                import msvcrt
+                lock_fh.seek(0)
+                if os.path.getsize(lock_path) == 0:
+                    lock_fh.write(b"0")
+                    lock_fh.flush()
+                    lock_fh.seek(0)
+                for _ in range(40):
+                    try:
+                        msvcrt.locking(lock_fh.fileno(), msvcrt.LK_NBLCK, 1)
+                        locked_mode = "nt"
+                        break
+                    except OSError:
+                        time.sleep(0.05)
+            else:
+                import fcntl
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+                locked_mode = "posix"
+        except Exception:
+            if lock_fh is not None:
+                try:
+                    lock_fh.close()
+                except OSError:
+                    pass
+                lock_fh = None
+        try:
+            yield
+        finally:
+            if lock_fh is not None:
+                try:
+                    if locked_mode == "nt":
+                        import msvcrt
+                        lock_fh.seek(0)
+                        msvcrt.locking(lock_fh.fileno(), msvcrt.LK_UNLCK, 1)
+                    elif locked_mode == "posix":
+                        import fcntl
+                        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+                except Exception:
+                    pass
+                try:
+                    lock_fh.close()
+                except OSError:
+                    pass
+
+
 def _atomic_write_text(target_real, content):
-    tmp_path = f"{target_real}.{os.getpid()}.tmp"
+    tmp_path = f"{target_real}.{os.getpid()}.{threading.get_ident()}.{secrets.token_hex(4)}.tmp"
     try:
         with open(tmp_path, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(content)
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
         os.replace(tmp_path, target_real)
         return None
     except OSError as exc:
@@ -360,8 +424,15 @@ def toggle_todo_in_brain(brain, rel, line_no=None, what="", target_done=None, ta
     """Safely toggle or set `- [ ]` / `- [x]` / `- [-]` on a task/workout or `due:` frontmatter line in `<BRAIN>/<rel>`.
 
     Enforces strict path confinement, ignores fenced code blocks, verifies `line_no` / `what`,
-    and writes atomically with LF line endings.
+    serializes concurrent writes via `brain_write_lock`, and writes atomically with LF line endings.
     """
+    with brain_write_lock(brain):
+        return _toggle_todo_in_brain_unlocked(
+            brain, rel, line_no=line_no, what=what, target_done=target_done, target_status=target_status
+        )
+
+
+def _toggle_todo_in_brain_unlocked(brain, rel, line_no=None, what="", target_done=None, target_status=None):
     validated, err = _validate_brain_rel_path(brain, rel)
     if err:
         return {"ok": False, "error": err, "code": 400}
@@ -453,6 +524,13 @@ def toggle_todo_in_brain(brain, rel, line_no=None, what="", target_done=None, ta
 
 def reschedule_task_in_brain(brain, rel, target_date_spec, line_no=None, what="", today=None):
     """Move/reschedule a dated `[todo]`/`due:` item or promote an undated `Open To-Do` onto `target_date_spec`."""
+    with brain_write_lock(brain):
+        return _reschedule_task_in_brain_unlocked(
+            brain, rel, target_date_spec, line_no=line_no, what=what, today=today
+        )
+
+
+def _reschedule_task_in_brain_unlocked(brain, rel, target_date_spec, line_no=None, what="", today=None):
     try:
         target_iso = parse_target_date(target_date_spec, today=today)
     except ValueError as exc:
@@ -567,6 +645,13 @@ def reschedule_task_in_brain(brain, rel, target_date_spec, line_no=None, what=""
 
 def add_todo_in_brain(brain, text, target_date_spec=None, prio="med", kind="todo", time_spec=None, today=None):
     """Add a dated `[kind]` item under `## Timeline` or an undated `[prio]` task under `## Open To-Dos` in `calendar/README.md`."""
+    with brain_write_lock(brain):
+        return _add_todo_in_brain_unlocked(
+            brain, text, target_date_spec=target_date_spec, prio=prio, kind=kind, time_spec=time_spec, today=today
+        )
+
+
+def _add_todo_in_brain_unlocked(brain, text, target_date_spec=None, prio="med", kind="todo", time_spec=None, today=None):
     clean = str(text or "").strip()
     if len(clean) < 2:
         return {"ok": False, "error": "task text is empty", "code": 400}
@@ -844,7 +929,7 @@ def build_brain_graph_payload(brain, idx=None, db_path=None, today=None):
     }
 
 
-CAL_SERVER_SCRIPT = """import functools, hmac, http.server, importlib.util, json, os, subprocess, sys, urllib.parse
+CAL_SERVER_SCRIPT = """import functools, hmac, http.server, importlib.util, json, os, subprocess, sys, threading, urllib.parse
 sys.dont_write_bytecode = True
 try:
     sys.stdout = sys.stderr = open(os.devnull, "w")
@@ -861,6 +946,32 @@ ATLAS_PY = os.path.join(TOOLS_DIR, "atlas.py")
 
 if TOOLS_DIR not in sys.path:
     sys.path.insert(0, TOOLS_DIR)
+
+_TOGGLE_LOCK = threading.Lock()
+_GIT_SYNC_LOCK = threading.Lock()
+
+def _commit_toggle_async(rel_path):
+    if not rel_path or not os.path.isdir(os.path.join(BRAIN_DIR, ".git")):
+        return
+    def _worker():
+        with _GIT_SYNC_LOCK:
+            try:
+                kw = dict(cwd=BRAIN_DIR, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10)
+                subprocess.run(["git", "add", "--", rel_path], **kw)
+                diff = subprocess.run(["git", "diff", "--cached", "--quiet", "--", rel_path], **kw)
+                if diff.returncode == 0:
+                    return
+                subprocess.run(["git", "commit", "-q", "-m", "atlas: calendar toggle", "--", rel_path], **kw)
+                if os.environ.get("ATLAS_NO_GIT_PUSH"):
+                    return
+                rem = subprocess.run(["git", "remote"], **kw)
+                if rem.returncode == 0 and (rem.stdout or "").strip():
+                    br = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], **kw)
+                    branch = (br.stdout or "").strip() or "main"
+                    subprocess.run(["git", "push", "-q", "-u", "origin", branch], **kw)
+            except Exception:
+                pass
+    threading.Thread(target=_worker, daemon=True).start()
 
 def _get_cid():
     p = os.path.join(BRAIN_DIR, "_secrets", "strava.env")
@@ -930,7 +1041,7 @@ class _QuietHandler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/healthz":
-            body = b"atlas-cal-v4"
+            body = b"atlas-cal-v5"
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -1081,22 +1192,24 @@ class _QuietHandler(http.server.SimpleHTTPRequestHandler):
         if not _verify_csrf(csrf_hdr):
             self._send_json(403, {"ok": False, "error": "CSRF token invalid or missing"})
             return
-        try:
-            from atlas_lib import cal_engine as _ce
-            res = _ce.toggle_todo_in_brain(
-                BRAIN_DIR,
-                rel=payload.get("rel", ""),
-                line_no=payload.get("line"),
-                what=payload.get("what", ""),
-                target_done=payload.get("done"),
-            )
-        except Exception as exc:
-            self._send_json(500, {"ok": False, "error": str(exc)})
-            return
-        if not res.get("ok"):
-            self._send_json(int(res.get("code") or 400), {"ok": False, "error": res.get("error", "toggle failed")})
-            return
-        _rerender_calendar()
+        with _TOGGLE_LOCK:
+            try:
+                from atlas_lib import cal_engine as _ce
+                res = _ce.toggle_todo_in_brain(
+                    BRAIN_DIR,
+                    rel=payload.get("rel", ""),
+                    line_no=payload.get("line"),
+                    what=payload.get("what", ""),
+                    target_done=payload.get("done"),
+                )
+            except Exception as exc:
+                self._send_json(500, {"ok": False, "error": str(exc)})
+                return
+            if not res.get("ok"):
+                self._send_json(int(res.get("code") or 400), {"ok": False, "error": res.get("error", "toggle failed")})
+                return
+            _rerender_calendar()
+        _commit_toggle_async(res.get("rel"))
         self._send_json(200, {k: v for k, v in res.items() if k != "code"})
 
 handler = functools.partial(_QuietHandler, directory=CACHE_DIR)
@@ -1112,7 +1225,7 @@ srv.serve_forever()
 
 
 def cal_http_ok(port):
-    """Verify the calendar server returns HTTP 200 on `/healthz` with `atlas-cal-v3`."""
+    """Verify the calendar server returns HTTP 200 on `/healthz` with `atlas-cal-v5`."""
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=0.25) as resp:
             return resp.status == 200 and CAL_SERVER_HEALTH_TOKEN in resp.read()
