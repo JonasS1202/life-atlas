@@ -1058,6 +1058,7 @@ if TESTS_DIR not in sys.path:
     sys.path.insert(0, TESTS_DIR)
 from test_graph_engine import GraphEngineUnit  # noqa: E402,F401
 from test_coach_mail import CoachMailUnit  # noqa: E402,F401
+from test_coach_health import CoachHealthUnit  # noqa: E402,F401
 from test_coach_physics import (  # noqa: E402,F401
     TestBlock1GoldenMasterKumpelMatrix,
     TestBlock2SolverAndPhenotypeInvariants,
@@ -2298,6 +2299,112 @@ class UiReleaseV11(AtlasCase):
         self.assertIn("tau_w_date:", prof_tau)
         ctx_tau = self.atlas("coach", "context", "--mode", "daily", "--depth", "pro", "--no-sync").stdout
         self.assertIn("tau_mult=1.18x, profile", ctx_tau)
+
+    def test_coach_v150_google_health_temporal_alignment_and_multiyear(self):
+        """v1.5.0: Google Health API v4 sync, 2-layer biometrics/intraday store, Strava timestamps, temporal inspect & multi-year search."""
+        import datetime as dt
+        from test_coach_health import _synthetic_gh_bundle
+
+        self.atlas("coach", "--init", "--execute")
+        today = dt.date.today()
+        d1 = (today - dt.timedelta(days=1)).isoformat()
+        d0 = today.isoformat()
+
+        # 1. Import Desktop OAuth JSON & check auth-google-health CLI
+        c_json = os.path.join(self.tmp, "client_secret_demo.json")
+        with open(c_json, "w", encoding="utf-8") as fh:
+            json.dump({"installed": {"client_id": "demo-cid.apps.googleusercontent.com", "client_secret": "demo-client-secret"}}, fh)
+        auth_out = self.atlas("coach", "auth-google-health", "--client-json", c_json, "--login-hint", "athlete@example.com").stdout
+        self.assertIn("imported OAuth client credentials", auth_out)
+        self.assertIn("Google Health verbinden / erneuern (1-Klick)", auth_out)
+
+        # 2. Sync Strava multi-year fixture (with full ISO timestamps!) + Google Health v4 bundle fixture
+        strava_mock = os.path.join(self.tmp, "strava_v150.json")
+        with open(strava_mock, "w", encoding="utf-8") as fh:
+            json.dump([
+                {
+                    "id": 99001,
+                    "name": "Evening Tempo Ride",
+                    "sport_type": "Ride",
+                    "start_date": f"{d1}T16:30:00Z",
+                    "start_date_local": f"{d1}T17:30:00Z",
+                    "utc_offset": 3600.0,
+                    "timezone": "(GMT+01:00) Europe/Berlin",
+                    "moving_time": 5400,
+                    "elapsed_time": 5400,
+                    "distance": 45000.0,
+                    "total_elevation_gain": 420.0,
+                    "device_watts": True,
+                    "average_watts": 255,
+                    "weighted_average_watts": 272,
+                    "kilojoules": 1377,
+                    "average_heartrate": 156,
+                    "max_heartrate": 184,
+                },
+                {
+                    "id": 88001,
+                    "name": "Alpine Classic 2024",
+                    "sport_type": "Ride",
+                    "start_date": "2024-07-14T06:00:00Z",
+                    "start_date_local": "2024-07-14T08:00:00Z",
+                    "utc_offset": 7200.0,
+                    "moving_time": 10800,
+                    "elapsed_time": 11100,
+                    "distance": 112000.0,
+                    "total_elevation_gain": 1650.0,
+                    "device_watts": True,
+                    "average_watts": 268,
+                    "weighted_average_watts": 292,
+                    "kilojoules": 2894,
+                    "average_heartrate": 162,
+                    "max_heartrate": 191,
+                },
+            ], fh)
+
+        gh_mock = os.path.join(self.tmp, "gh_v150.json")
+        with open(gh_mock, "w", encoding="utf-8") as fh:
+            json.dump(_synthetic_gh_bundle(today), fh)
+
+        sync_out = self.atlas(
+            "coach", "sync", "--mock-file", strava_mock, "--google-health-mock", gh_mock, "--days", "1095", "--execute"
+        ).stdout
+        self.assertIn("wellness day(s) imported (google_health)", sync_out)
+        self.assertIn("intraday cached", sync_out)
+
+        # Verify persisted timestamps in activities.json and canonical biometrics.json + intraday cache
+        acts_saved = json.loads(self.read(os.path.join(self.brain, "coach", "activities.json")))
+        a_recent = next(a for a in acts_saved if str(a["id"]) == "99001")
+        self.assertEqual(a_recent["start_time_utc"], f"{d1}T16:30:00Z")
+        self.assertEqual(a_recent["start_time_local"], f"{d1}T17:30:00")
+        self.assertEqual(a_recent["end_time_utc"], f"{d1}T18:00:00Z")
+
+        bio_saved = json.loads(self.read(os.path.join(self.brain, "coach", "biometrics.json")))
+        self.assertIn(d0, bio_saved["days"])
+        self.assertIn(d1, bio_saved["days"])
+        self.assertEqual(bio_saved["days"][d0]["autonomic"]["rhr_bpm"], 49)
+        self.assertTrue(os.path.isfile(os.path.join(self.brain, "_atlas", "cache", "health", "intraday", f"{d0}.json")))
+
+        # 3. Chat-First coach context surfaces 24/7 wearable summary & coach inspect renders full Temporal Timeline
+        ctx_out = self.atlas("coach", "context", "--mode", "daily", "--depth", "pro", "--no-sync").stdout
+        self.assertIn("[7B_wearable", ctx_out)
+        self.assertIn("HRV 78.4ms", ctx_out)
+        self.assertIn("Temp -0.08°C", ctx_out)
+
+        insp_out = self.atlas("coach", "inspect", "--date", d1, "--no-stream-fetch").stdout
+        self.assertIn("TEMPORAL BIOMETRICS & WORKOUT TIMELINE", insp_out)
+        self.assertIn("pre-NEAT 10800 steps", insp_out)
+        self.assertIn("finish->bed 6.0h", insp_out)
+        self.assertIn(f"Following Night Recovery ({d0})", insp_out)
+
+        # 4. Multi-year history --search & --year + epoch compare with biometrics
+        h_out = self.atlas("coach", "history", "--search", "Alpine Classic").stdout
+        self.assertIn("Alpine Classic 2024", h_out)
+        h_yr = self.atlas("coach", "history", "--year", "2024").stdout
+        self.assertIn("Alpine Classic 2024", h_yr)
+        cmp_out = self.atlas(
+            "coach", "compare", "--epoch-a", "2024-07-01..2024-07-31", "--epoch-b", f"{d1}..{d0}"
+        ).stdout
+        self.assertIn("[Biometrics B", cmp_out)
 
 
 if __name__ == "__main__":

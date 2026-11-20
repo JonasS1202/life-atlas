@@ -1,0 +1,5 @@
+{
+  "notes": [
+    "Atlas Coach `1.5.0` adds the Google Health API v4 connector (24/7 sleep architecture, HRV RMSSD, RHR, respiratory rate, skin temperature delta, SpO2, weight/body-fat, hourly NEAT steps — zero workouts imported), the 2-layer biometrics store (`brain/coach/biometrics.json` + git-ignored 30-day rolling intraday cache), Strava <-> Biometrics temporal alignment (exact Strava ISO timestamps, pre-workout NEAT, finish-to-bedtime, post-workout HR recovery & T->T+1 autonomic response), multi-marker `ILLNESS_ALERT` (`>=2` markers -> `ROT`) + KFA protection guard, and multi-year Strava/Health history (`per_page=200` pagination, `180d` stream window + on-demand stream hydration in `coach inspect`, `coach history --search/--year`, `All-Time` & yearly curves, exact historical per-day PMC snapshots)."
+  ]
+}

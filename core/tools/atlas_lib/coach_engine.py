@@ -15,6 +15,7 @@ import re
 import statistics
 from typing import Any
 
+from . import health_engine
 from . import pillars_engine
 from .pillars_engine import (  # noqa: F401
     chorley_recovery_taus,
@@ -1731,6 +1732,7 @@ def compute_pmc_metrics(
     ctl = 0.0
     atl = 0.0
     ctl_hist: dict[dt.date, float] = {}
+    daily_map: dict[str, dict[str, Any]] = {}
     series_42d: list[dict[str, Any]] = []
 
     span_days = (ref_today - earliest).days
@@ -1741,9 +1743,18 @@ def compute_pmc_metrics(
         atl = atl + (ld - atl) / 7.0
         tsb = ctl - atl
         ctl_hist[cur_d] = ctl
+        d_iso = cur_d.isoformat()
+        acwr_d = round(atl / ctl, 2) if ctl >= 5.0 else None
+        daily_map[d_iso] = {
+            "load": round(ld, 1),
+            "ctl": round(ctl, 1),
+            "atl": round(atl, 1),
+            "tsb": round(tsb, 1),
+            "acwr": acwr_d,
+        }
         if (ref_today - cur_d).days < 42:
             series_42d.append({
-                "date": cur_d.isoformat(),
+                "date": d_iso,
                 "load": round(ld, 1),
                 "ctl": round(ctl, 1),
                 "atl": round(atl, 1),
@@ -1789,6 +1800,7 @@ def compute_pmc_metrics(
         "strain": strain,
         "warnings": warnings,
         "series_42d": series_42d,
+        "daily_map": daily_map,
     }
 
 
@@ -2193,7 +2205,7 @@ def aggregate_epoch_curves(
     activities: list[dict[str, Any]],
     today: dt.date | None = None,
 ) -> dict[str, Any]:
-    """Compute 3-epoch (`42d`, `90d`, `365d`) Fresh MMP, Legacy Fatigued MMP, Multi-Tier Durability, and Run Splits."""
+    """Compute multi-epoch (`42d`, `90d`, `365d`, `all_time`) Fresh MMP, Fatigued MMP, Durability, Run Splits & yearly buckets."""
     ref_today = today or dt.date.today()
     epochs = (("42d", 42), ("90d", 90), ("365d", 365))
     fresh_ep: dict[str, dict[str, int]] = {lbl: {} for lbl, _ in COACH_DURATIONS}
@@ -2204,6 +2216,7 @@ def aggregate_epoch_curves(
     }
     run_ep: dict[str, dict[str, tuple[float, str]]] = {d: {} for d, _ in RUN_SPLIT_DISTANCES}
     quarterly: dict[str, dict[str, Any]] = {}
+    yearly: dict[str, dict[str, Any]] = {}
 
     for a in activities or []:
         if not isinstance(a, dict) or not a.get("date"):
@@ -2216,8 +2229,9 @@ def aggregate_epoch_curves(
         if age < 0:
             continue
 
-        # Quarterly trajectory buckets (all available history, up to last 8 quarters kept in return)
+        # Quarterly & yearly trajectory buckets (all available multi-season history)
         q_key = f"{adate.year}-Q{(adate.month - 1) // 3 + 1}"
+        y_key = str(adate.year)
         qb = quarterly.setdefault(q_key, {
             "sessions": 0,
             "hours": 0.0,
@@ -2227,22 +2241,41 @@ def aggregate_epoch_curves(
             "run_1km_spk": None,
             "run_5km_spk": None,
         })
+        yb = yearly.setdefault(y_key, {
+            "sessions": 0,
+            "hours": 0.0,
+            "kj": 0,
+            "cycling_5s": 0,
+            "cycling_5m": 0,
+            "cycling_20m": 0,
+            "run_1km_spk": None,
+            "run_5km_spk": None,
+        })
+        dur_h_a = float(a.get("duration_min") or 0.0) / 60.0
         qb["sessions"] += 1
-        qb["hours"] = round(qb["hours"] + float(a.get("duration_min") or 0.0) / 60.0, 1)
+        qb["hours"] = round(qb["hours"] + dur_h_a, 1)
+        yb["sessions"] += 1
+        yb["hours"] = round(yb["hours"] + dur_h_a, 1)
+        if is_valid_cycling_power_activity(a):
+            yb["kj"] += int(a.get("work_kj") or 0)
         if is_valid_cycling_power_activity(a) and not a.get("locked_for_records"):
             pf_q = a.get("peaks_fresh") or {}
             for k_src, k_dst in (("5s", "cycling_5s"), ("5m", "cycling_5m"), ("20m", "cycling_20m")):
                 v_q = pf_q.get(k_src)
-                if v_q and int(v_q) > qb[k_dst]:
-                    qb[k_dst] = int(v_q)
+                if v_q:
+                    iv_q = int(v_q)
+                    if iv_q > qb[k_dst]:
+                        qb[k_dst] = iv_q
+                    if iv_q > yb[k_dst]:
+                        yb[k_dst] = iv_q
         bp_q = a.get("best_paces") or {}
         for d_src, d_dst in (("1km", "run_1km_spk"), ("5km", "run_5km_spk")):
             spk_q, _ = _extract_pace_spk(bp_q.get(d_src))
-            if spk_q and spk_q > 0 and (qb[d_dst] is None or spk_q < qb[d_dst]):
-                qb[d_dst] = spk_q
-
-        if age > 365:
-            continue
+            if spk_q and spk_q > 0:
+                if qb[d_dst] is None or spk_q < qb[d_dst]:
+                    qb[d_dst] = spk_q
+                if yb[d_dst] is None or spk_q < yb[d_dst]:
+                    yb[d_dst] = spk_q
 
         if is_valid_cycling_power_activity(a) and not a.get("locked_for_records"):
             pf = a.get("peaks_fresh") or {}
@@ -2252,29 +2285,41 @@ def aggregate_epoch_curves(
             for dur_lbl, _sec in COACH_DURATIONS:
                 val = pf.get(dur_lbl)
                 if val:
+                    ival = int(val)
+                    if ival > fresh_ep[dur_lbl].get("all_time", 0):
+                        fresh_ep[dur_lbl]["all_time"] = ival
                     for ep_name, ep_days in epochs:
-                        if age <= ep_days and int(val) > fresh_ep[dur_lbl].get(ep_name, 0):
-                            fresh_ep[dur_lbl][ep_name] = int(val)
+                        if age <= ep_days and ival > fresh_ep[dur_lbl].get(ep_name, 0):
+                            fresh_ep[dur_lbl][ep_name] = ival
                 fval = p_fat.get(dur_lbl)
                 if fval:
+                    ifval = int(fval)
+                    if ifval > fatig_ep[dur_lbl].get("all_time", 0):
+                        fatig_ep[dur_lbl]["all_time"] = ifval
                     for ep_name, ep_days in epochs:
-                        if age <= ep_days and int(fval) > fatig_ep[dur_lbl].get(ep_name, 0):
-                            fatig_ep[dur_lbl][ep_name] = int(fval)
+                        if age <= ep_days and ifval > fatig_ep[dur_lbl].get(ep_name, 0):
+                            fatig_ep[dur_lbl][ep_name] = ifval
 
             for tier_k in dur_ep:
                 t_peaks = p_dur.get(tier_k) or {}
                 for dur_lbl in dur_ep[tier_k]:
                     t_val = t_peaks.get(dur_lbl)
                     if t_val:
+                        it_val = int(t_val)
+                        if it_val > dur_ep[tier_k][dur_lbl].get("all_time", 0):
+                            dur_ep[tier_k][dur_lbl]["all_time"] = it_val
                         for ep_name, ep_days in epochs:
-                            if age <= ep_days and int(t_val) > dur_ep[tier_k][dur_lbl].get(ep_name, 0):
-                                dur_ep[tier_k][dur_lbl][ep_name] = int(t_val)
+                            if age <= ep_days and it_val > dur_ep[tier_k][dur_lbl].get(ep_name, 0):
+                                dur_ep[tier_k][dur_lbl][ep_name] = it_val
 
         bp = a.get("best_paces") or {}
         for d_lbl, _dist in RUN_SPLIT_DISTANCES:
             pinfo = bp.get(d_lbl)
             spk, fmt_s = _extract_pace_spk(pinfo)
             if spk and spk > 0:
+                cur_all = run_ep[d_lbl].get("all_time")
+                if cur_all is None or spk < cur_all[0]:
+                    run_ep[d_lbl]["all_time"] = (spk, fmt_s or format_pace(spk))
                 for ep_name, ep_days in epochs:
                     cur_best = run_ep[d_lbl].get(ep_name)
                     if age <= ep_days and (cur_best is None or spk < cur_best[0]):
@@ -2291,7 +2336,21 @@ def aggregate_epoch_curves(
                 k: format_pace(qv[src]) for k, src in (("1km", "run_1km_spk"), ("5km", "run_5km_spk")) if qv[src]
             },
         }
-        for qk, qv in sorted(quarterly.items())[-8:]
+        for qk, qv in sorted(quarterly.items())[-12:]
+    }
+    y_sorted = {
+        yk: {
+            "sessions": yv["sessions"],
+            "hours": yv["hours"],
+            "kj": yv["kj"],
+            "cycling": {
+                k: yv[src] for k, src in (("5s", "cycling_5s"), ("5m", "cycling_5m"), ("20m", "cycling_20m")) if yv[src]
+            },
+            "running": {
+                k: format_pace(yv[src]) for k, src in (("1km", "run_1km_spk"), ("5km", "run_5km_spk")) if yv[src]
+            },
+        }
+        for yk, yv in sorted(yearly.items())
     }
 
     return {
@@ -2300,6 +2359,7 @@ def aggregate_epoch_curves(
         "durability_tiers": dur_ep,
         "run_splits": run_ep,
         "quarterly": q_sorted,
+        "yearly": y_sorted,
     }
 
 
@@ -2486,11 +2546,14 @@ def build_coach_telemetry(
     dna_text: str = "",
     playbook_text: str = "",
     macro_info: dict[str, Any] | None = None,
+    biometrics_store: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build unified Simple/Standard/Pro + 7-Pillar telemetry snapshot in < 5 ms (0 LLM tokens)."""
     ref_today = today or dt.date.today()
     prof = parse_athlete_profile(profile_text, fallback_ftp=fallback_ftp, fallback_weight=fallback_weight)
     readiness_rows = parse_readiness_log(readiness_text)
+    if isinstance(biometrics_store, dict) and biometrics_store.get("days"):
+        readiness_rows = health_engine.biometrics_to_readiness_rows(biometrics_store, fallback_rows=readiness_rows)
     depth = resolve_coach_depth(
         explicit_depth=explicit_depth,
         profile_info=prof,
@@ -2662,6 +2725,12 @@ def build_coach_telemetry(
         readiness_rows=readiness_rows,
         today=ref_today,
     )
+    bio_signals = health_engine.evaluate_biometric_signals(
+        readiness_rows=readiness_rows,
+        profile=prof,
+        activities=sorted_acts,
+        today=ref_today,
+    )
     p7 = pillars_engine.compute_pillar7_and_stage2_readiness(
         readiness_rows=readiness_rows,
         activities=sorted_acts,
@@ -2671,13 +2740,22 @@ def build_coach_telemetry(
         myotype_z=p4.get("myotype_z_score"),
         today=ref_today,
         run_k_leg_kn_m=recent_k_leg,
+        biometric_signals=bio_signals,
     )
     readiness["flag_4stage"] = p7["readiness_flag_4stage"]
     readiness["today_logged"] = p7["today_logged"]
     readiness["coaching_directive"] = p7["coaching_directive"]
+    readiness["illness_alert"] = p7.get("illness_alert", False)
+    if p7.get("illness_alert"):
+        readiness["status"] = "RED"
+        for im in (p7.get("illness_markers") or []):
+            if im not in readiness["reasons"]:
+                readiness["reasons"].append(f"Illness marker: {im}")
 
     pb_info = pillars_engine.parse_playbook(playbook_text)
     resp_model = pillars_engine.compute_individual_response_model(sorted_acts, readiness_rows)
+    temp_resp = health_engine.compute_temporal_dose_response(sorted_acts, readiness_rows)
+    resp_model.update(temp_resp)
     coach_audit = pillars_engine.audit_missing_inputs_and_questions(
         profile=prof,
         body=body,
@@ -2725,6 +2803,7 @@ def build_coach_telemetry(
             "pillar7_readiness": p7,
         },
         "response_model": resp_model,
+        "biometrics_signals": bio_signals,
         "playbook": {"exists": pb_info["exists"], "rules": pb_info["rules"]},
         "coach_audit": coach_audit,
     }

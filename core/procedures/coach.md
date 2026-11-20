@@ -11,10 +11,10 @@ Atlas Coach strictly separates **Stage 1 deterministic biophysical pre-computati
 ### Canonical Grown Files (`brain/coach/` & `brain/calendar/README.md`)
 - `brain/coach/profile.md` — Biometrics (`M`, `H`, `KFA %`, `age`, `sex`, `creatine`), `depth` (`auto | simple | standard | pro`), `coach_style` (`direct-demanding | analytical | supportive`), `accountability` (`strict | balanced | gentle`), anchors (`CP/W'`, `CS/D'`, `HRmax/RHR`, `bike_weight_kg`, `CdA`), and schedule windows.
 - `brain/coach/playbook.md` — **Personal Athlete Playbook & Feelings-File:** inner motivation, lifestyle saboteurs, gut/fueling tolerance, indoor/sensor setup, orthopedic notes, and distilled empirical dose-response rules (`(Stand: YYYY-MM-DD)`).
-- `brain/coach/readiness.md` — Daily readiness log (`RHR`, `HRV RMSSD`, `sleep`, `soreness`, `leg_pain`, `fatigue_7d`, `GRÜN / GELB-A / GELB-B / ROT`) synced from Garmin/Intervals or logged via `atlas.py coach note`.
+- `brain/coach/readiness.md` & `brain/coach/biometrics.json` — Canonical timeless 24/7 biometrics store (`RHR`, `HRV RMSSD`, sleep architecture `Deep/REM/Light/Awake`, `HR-Nadir`, respiratory rate, skin temperature delta, `SpO2`, `weight_kg`, `body_fat_pct`, `hourly_steps` NEAT, exact historical `PMC` snapshots, and Strava temporal `workout_links`) paired with a git-ignored 30-day rolling intraday cache (`brain/_atlas/cache/health/intraday/`) and human-readable `readiness.md`.
 - `brain/coach/macro-plan.md` — Autonomous ISO-week season periodization (`Base | Build | Peak | Taper | Deload`).
 - `brain/coach/dna.md` — Autonomous Athlete/Rider DNA Scouting Report + `statcard` JSON.
-- `brain/coach/power-curve.md` & `activities.md` — 3-Epoch Peak Matrix, Multi-Tier Durability, Plan-vs-Actual interval execution scores, and subjective feedback.
+- `brain/coach/power-curve.md` & `activities.md` — Multi-Epoch Peak Matrix (`42d / 90d / 365d / All-Time` + yearly trajectory), Multi-Tier Durability, Plan-vs-Actual interval execution scores, and subjective feedback.
 - `brain/calendar/README.md` — Single source of truth for `[goal:A/B]`, `[blocked]`, `[event]`, and 14-day `[workout:cycling|running|strength]` sessions.
 - `brain/coach/workouts/` — Deterministically compiled `.zwo` and binary `.fit` workouts synced via `atlas.py coach push`.
 
@@ -23,13 +23,13 @@ Atlas Coach strictly separates **Stage 1 deterministic biophysical pre-computati
    ```bash
    python -I <ROOT>/brain/_atlas/tools/atlas.py coach context --mode auto
    ```
-2. **Pull deeper multi-month history or session internals ON DEMAND** whenever the user asks about past blocks (e.g., 6 months ago), seasonal comparisons, or a specific workout:
+2. **Pull deeper multi-year history, past races, or day biometrics+workout timelines ON DEMAND** whenever the user asks about past blocks, prior seasons (1–3+ years ago), or a specific day/workout:
    ```bash
-   python -I <ROOT>/brain/_atlas/tools/atlas.py coach history --months 6 [--sport cycling|running]
+   python -I <ROOT>/brain/_atlas/tools/atlas.py coach history --months 6 [--year 2025] [--search "race"] [--sport cycling|running]
    python -I <ROOT>/brain/_atlas/tools/atlas.py coach compare --epoch-a YYYY-MM-DD..YYYY-MM-DD --epoch-b YYYY-MM-DD..YYYY-MM-DD
    python -I <ROOT>/brain/_atlas/tools/atlas.py coach inspect --date YYYY-MM-DD
    ```
-   If the user asks further back than `history` currently shows and Strava is connected, pull older activities once via `atlas.py coach sync --days 180 --execute`. Use `atlas.py find <words>` whenever broader life context (bike geometry, work travel, medical notes) matters.
+   `coach inspect` shows the full **Temporal Timeline** (prior night sleep/autonomics -> pre-workout NEAT steps -> Strava workout with exact timestamps -> post-workout HR recovery & following night `D+1`) and automatically hydrates missing 1-Hz Strava streams on demand for older (`>180d`) activities! For initial multi-year history backfill (paginated metadata + up to 730d Google Health daily biometrics), run once: `atlas.py coach sync --days 1095 --health-days 730 --execute`. Use `atlas.py find <words>` whenever broader life context (bike geometry, work travel, medical notes) matters.
 
 ---
 
@@ -73,6 +73,9 @@ Act like a **real, proactive human head coach** working directly through the ath
 ## 4. Hardware & Biometric Connectors (Pre-Wired for Every User)
 
 All credentials stay local in `brain/_secrets/*.env` (`chmod 600`):
+- **Google Health API v4 (24/7 Sleep, HRV, RHR, Resp Rate, Skin Temp, SpO₂, Weight/KFA, Hourly NEAT — 0 workouts imported, Strava stays activity truth):**
+  - Import free Google Cloud Desktop-App OAuth JSON once: `atlas.py coach auth-google-health --client-json ~/Downloads/client_secret_*.json --login-hint you@example.com`, then connect/renew in 1 click directly from chat via `atlas.py coach auth-google-health --renew` (or `[💚 Google Health verbinden (1-Klick)](http://127.0.0.1:8765/google-health-connect)`).
+  - *Chat-First 7-Day Testing-Mode Renew:* Whenever `coach context` flags `GOOGLE HEALTH TOKEN EXPIRING/EXPIRED`, ask briefly in chat and on confirmation ("jo") run `atlas.py coach auth-google-health --renew` (opens Google consent with `login_hint` -> 1 click -> automatic catch-up sync).
 - **Strava (1-Click OAuth, no keys needed):** `[🧡 Mit Strava verbinden (1-Klick)](http://127.0.0.1:8765/strava-connect)` (`atlas.py coach auth-strava`).
 - **Hammerhead Karoo (1-Click OAuth, no keys or developer app needed; `.zwo` Calendar Auto-Push/Update/Delete):** `[💛 Karoo verbinden (1-Klick)](http://127.0.0.1:8765/hammerhead-connect)` (`atlas.py coach auth-hammerhead`). Never ask the athlete for `CLIENT_ID` or `CLIENT_SECRET` — clicking the link redirects straight to Hammerhead consent.
 - **Garmin Connect (Wellness `RHR/HRV/Sleep/Weight` Pull + Watch/Edge Workout Push + `.fit`):** `atlas.py coach auth-garmin --email ... --password ...` (password discarded immediately; offline `.fit` files always compiled into `brain/coach/workouts/`).
@@ -105,7 +108,8 @@ All credentials stay local in `brain/_secrets/*.env` (`chmod 600`):
 5. **Environment, Hardware, Sex Differences & Running Bridge (S6):**
    - Apply learned `indoor_cp_offset_w` on indoor rides, Townsend 2-segment altitude (`CP` drops `>1500m`; `W'` holds until `2760m`), and heat scaling (`>25°C`). Respect female supra-CP repeatability needs & watch `RED-S` flags. Budget systemic cardio load across Cycling + Running, but keep eccentric running load (`k_leg`, `+10%/wk` cap) modality-specific.
 6. **4-Stage Readiness Resolution (`GRÜN | GELB-A | GELB-B | ROT`, S7):**
-   - **`GELB-B` & `ROT` Overrides (Periphery & Blunted `HRmax` Override Green RHR/HRV!):** If autonomic `HRV`/`RHR` is green, yet local leg pain is high ("Beine wie Beton"), running leg-spring stiffness `k_leg` dropped `>=15%`, or yesterday's `Q_Strain` spiked -> **`GELB-B`** (postpone HIIT 24–48 h). If peak `HRmax` is blunted (`>=10 bpm` below `HRmax` on hard/RPE>=8 efforts) -> **`ROT`** (immediate 3–5d deload)!
+   - **`ILLNESS_ALERT` (`ROT`), `GELB-B` & `ROT` Overrides:** Whenever `>= 2` objective wearable markers spike simultaneously (`Skin Temp >= +0.5°C`, `Resp >= +1.5/min`, `RHR >= +5 bpm`, `HRV < 28d-SWC`, `SpO2 < 94%`) or `3d sleep debt >= 5h`, Stage 1 triggers **`ROT`** (`ILLNESS_ALERT` -> immediate rest/deload, never push through an onset infection!). If autonomic `HRV`/`RHR` is green, yet local leg pain is high ("Beine wie Beton"), running leg-spring stiffness `k_leg` dropped `>=15%`, or yesterday's `Q_Strain` spiked -> **`GELB-B`** (postpone HIIT 24–48 h). If peak `HRmax` is blunted (`>=10 bpm` below `HRmax` on hard/RPE>=8 efforts) -> **`ROT`** (immediate 3–5d deload)!
+   - **Body Fat (`KFA`) Protection Guard:** Wearable/scale `weight_kg` updates `mass_kg_7d` automatically, while noisy BIA `body_fat_pct` NEVER silently overwrites a calibrated `profile.md` KFA — surface `[KFA-Guard]` advisories in chat for explicit confirmation first.
    - When anchors are missing/stale, schedule standardized tests via `atlas.py coach field-test --unit 1|1-std|reconst|2|2a|2b|preload|lsct --date YYYY-MM-DD --execute`.
    - Always include the exact Dashboard URL printed by `atlas.py coach context` (fallback: `[📅 Coach Dashboard öffnen](http://127.0.0.1:8765/calendar.html?view=coach)`) when plans, workouts, or telemetry are discussed.
 

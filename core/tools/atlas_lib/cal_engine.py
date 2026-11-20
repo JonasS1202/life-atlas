@@ -2,7 +2,7 @@
 
 Loads `templates/calendar.html`, compiles the zero-token JSON payload (Calendar + Adaptive Coach +
 SQLite Knowledge Graph + CSRF token), safely toggles Markdown checkboxes inside `<BRAIN>/`, and
-manages the loopback `127.0.0.1` HTTP server (`atlas-cal-v5`).
+manages the loopback `127.0.0.1` HTTP server (`atlas-cal-v6`).
 """
 import contextlib
 import datetime as dt
@@ -23,7 +23,7 @@ sys.dont_write_bytecode = True
 
 from atlas_lib import graph_engine
 
-CAL_SERVER_HEALTH_TOKEN = b"atlas-cal-v5"
+CAL_SERVER_HEALTH_TOKEN = b"atlas-cal-v6"
 
 _THREAD_WRITE_LOCK = threading.RLock()
 _CHECKBOX_LINE_RX = re.compile(r"^(\s*(?:[-*+]|\d+\.)?\s*)\[([ xX-])\](\s+.*)$")
@@ -1041,7 +1041,7 @@ class _QuietHandler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/healthz":
-            body = b"atlas-cal-v5"
+            body = b"atlas-cal-v6"
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -1149,6 +1149,74 @@ class _QuietHandler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+        if parsed.path == "/google-health-connect":
+            srv_port = self.server.server_address[1]
+            from atlas_lib import coach_connectors
+            local_cb = f"http://127.0.0.1:{srv_port}/google-health-callback"
+            cfg = coach_connectors.google_health_oauth_config(BRAIN_DIR, local_redirect_uri=local_cb)
+            if not cfg.get("configured"):
+                body = (
+                    "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Atlas · Google Health Setup</title></head>"
+                    "<body style='font-family:Inter,sans-serif;background:#070a0f;color:#e2e8f0;display:flex;align-items:center;"
+                    "justify-content:center;height:100vh;margin:0'><div style='background:#0d121b;border:1px solid rgba(255,255,255,0.1);"
+                    "padding:32px 40px;border-radius:14px;max-width:540px'><h2 style='margin:0 0 12px;color:#34d399'>Google Health API v4 Setup</h2>"
+                    "<p style='color:#94a3b8;font-size:14px;line-height:1.5'>Import your Google Cloud OAuth Desktop-App JSON once via CLI:<br>"
+                    "<code style='color:#38bdf8'>atlas.py coach auth-google-health --client-json ~/Downloads/client_secret_*.json</code></p>"
+                    "<a href='/calendar.html?view=coach' style='color:#38bdf8;font-weight:600;text-decoration:none'>&larr; Zurück zum Coach Dashboard</a>"
+                    "</div></body></html>"
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            state, _ver, challenge = coach_connectors.mint_google_health_oauth_state(BRAIN_DIR, port=srv_port)
+            url = coach_connectors.build_google_health_authorize_url(
+                cfg["client_id"], cfg["redirect_uri"], state=state, code_challenge=challenge, login_hint=cfg.get("login_hint", "")
+            )
+            self.send_response(302)
+            self.send_header("Location", url)
+            self.end_headers()
+            return
+        if parsed.path == "/google-health-callback":
+            qs = urllib.parse.parse_qs(parsed.query)
+            code = (qs.get("code") or [None])[0]
+            state = (qs.get("state") or [None])[0]
+            srv_port = self.server.server_address[1]
+            local_cb = f"http://127.0.0.1:{srv_port}/google-health-callback"
+            from atlas_lib import coach_connectors
+            state_ok, verifier = coach_connectors.consume_google_health_oauth_state(BRAIN_DIR, state)
+            ok = False
+            if code and state_ok and os.path.isfile(ATLAS_PY):
+                cmd_gh = [
+                    sys.executable, "-I", "-B", ATLAS_PY, "--root", os.path.dirname(BRAIN_DIR),
+                    "coach", "auth-google-health", "--code", code, "--redirect-uri", local_cb, "--execute",
+                ]
+                if verifier:
+                    cmd_gh += ["--verifier", verifier]
+                res = subprocess.run(cmd_gh, capture_output=True, text=True, timeout=90)
+                ok = res.returncode == 0
+                if ok:
+                    _rerender_calendar()
+            msg = "&#10003; Google Health erfolgreich verbunden &amp; synchronisiert!" if ok else "Google-Health-Verbindung fehlgeschlagen oder abgebrochen."
+            col = "#34d399" if ok else "#f43f5e"
+            body = (
+                f"<!DOCTYPE html><html><head><meta charset='utf-8'><title>Atlas · Google Health Connect</title></head>"
+                f"<body style='font-family:Inter,sans-serif;background:#070a0f;color:{col};display:flex;align-items:center;"
+                f"justify-content:center;height:100vh;margin:0'><div style='background:#0d121b;border:1px solid rgba(255,255,255,0.1);"
+                f"padding:32px 40px;border-radius:14px;text-align:center;max-width:480px'><h2 style='margin:0 0 12px'>{msg}</h2>"
+                f"<p style='color:#94a3b8;font-size:14px;margin:0 0 18px'>Du kannst diesen Tab schließen und zurück in den Chat wechseln.</p>"
+                f"<a href='/calendar.html?view=coach' style='color:#38bdf8;font-weight:600;text-decoration:none'>Zum Coach Dashboard &rarr;</a>"
+                f"</div><script>sessionStorage.setItem('atlas_cal_filter','coach');</script>"
+                f"</body></html>"
+            ).encode("utf-8")
+            self.send_response(200 if ok else 400)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         return super().do_GET()
 
     def do_POST(self):
@@ -1225,7 +1293,7 @@ srv.serve_forever()
 
 
 def cal_http_ok(port):
-    """Verify the calendar server returns HTTP 200 on `/healthz` with `atlas-cal-v5`."""
+    """Verify the calendar server returns HTTP 200 on `/healthz` with `atlas-cal-v6`."""
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=0.25) as resp:
             return resp.status == 200 and CAL_SERVER_HEALTH_TOKEN in resp.read()

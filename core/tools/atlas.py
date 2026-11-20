@@ -62,7 +62,7 @@ DEFAULT_UPSTREAM = "https://github.com/JonasS1202/life-atlas.git"
 TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if TOOLS_DIR not in sys.path:
     sys.path.insert(0, TOOLS_DIR)
-from atlas_lib import cal_engine, coach_connectors, coach_engine, fit_writer, graph_engine
+from atlas_lib import cal_engine, coach_connectors, coach_engine, fit_writer, graph_engine, health_engine
 
 INSTALLED_BRAIN = os.path.normpath(os.path.join(TOOLS_DIR, "..", ".."))
 HOOK_FILE = os.path.normpath(os.path.join(TOOLS_DIR, "..", "hooks", "atlas_hook.py"))
@@ -2157,6 +2157,7 @@ def _rebuild_coach_markdown_files(brain, activities, ftp_watts=275, weight_kg=67
     rdy_text = read(rdy_path) if os.path.isfile(rdy_path) else ""
     pb_text = read(pb_path) if os.path.isfile(pb_path) else ""
     dna_text = read(dna_path) if os.path.isfile(dna_path) else ""
+    bio_store = health_engine.load_biometrics_store(brain)
 
     telemetry = coach_engine.build_coach_telemetry(
         profile_text=prof_text,
@@ -2168,6 +2169,7 @@ def _rebuild_coach_markdown_files(brain, activities, ftp_watts=275, weight_kg=67
         today=today,
         dna_text=dna_text,
         playbook_text=pb_text,
+        biometrics_store=bio_store,
     )
     curves = telemetry["curves"]
     fresh_ep = curves["fresh"]
@@ -2215,16 +2217,17 @@ def _rebuild_coach_markdown_files(brain, activities, ftp_watts=275, weight_kg=67
         pc_lines.append("")
 
     pc_lines += [
-        "| Duration | 42d (Current) | 90d (Meso) | 365d (Season) | W/kg (42d) |",
-        "|---|---|---|---|---|",
+        "| Duration | 42d (Current) | 90d (Meso) | 365d (Season) | All-Time | W/kg (42d) |",
+        "|---|---|---|---|---|---|",
     ]
     for dur_lbl, _sec in COACH_DURATIONS:
         r = fresh_ep[dur_lbl]
         v42 = f"{r['42d']} W" if r.get("42d") else "—"
         v90 = f"{r['90d']} W" if r.get("90d") else "—"
         v365 = f"{r['365d']} W" if r.get("365d") else "—"
+        vall = f"{r['all_time']} W" if r.get("all_time") else "—"
         wkg = f"{r['42d'] / eff_bw:.2f} W/kg" if r.get("42d") and eff_bw > 0 else "—"
-        pc_lines.append(f"| **{dur_lbl}** | {v42} | {v90} | {v365} | {wkg} |")
+        pc_lines.append(f"| **{dur_lbl}** | {v42} | {v90} | {v365} | {vall} | {wkg} |")
 
     pc_lines += [
         "",
@@ -2288,15 +2291,37 @@ def _rebuild_coach_markdown_files(brain, activities, ftp_watts=275, weight_kg=67
         pc_lines.append("")
 
     pc_lines += [
-        "| Distance | 42d (Current) | 90d (Meso) | 365d (Season) |",
-        "|---|---|---|---|",
+        "| Distance | 42d (Current) | 90d (Meso) | 365d (Season) | All-Time |",
+        "|---|---|---|---|---|",
     ]
     for d_lbl, disp in (("1km", "1 km"), ("3km", "3 km"), ("5km", "5 km"), ("10km", "10 km")):
         rr = run_ep[d_lbl]
         p42 = rr["42d"][1] if rr.get("42d") else "—"
         p90 = rr["90d"][1] if rr.get("90d") else "—"
         p365 = rr["365d"][1] if rr.get("365d") else "—"
-        pc_lines.append(f"| **{disp}** | {p42} | {p90} | {p365} |")
+        pall = rr["all_time"][1] if rr.get("all_time") else "—"
+        pc_lines.append(f"| **{disp}** | {p42} | {p90} | {p365} | {pall} |")
+
+    yearly_ep = curves.get("yearly") or {}
+    if len(yearly_ep) >= 2:
+        pc_lines += [
+            "",
+            "## 4. Multi-Season Yearly Trajectory",
+            "",
+            "| Year | Sessions | Hours | Work (kJ) | Best 5s | Best 5m | Best 20m | Run 5k |",
+            "|---|---|---|---|---|---|---|---|",
+        ]
+        for yk in sorted(yearly_ep.keys(), reverse=True):
+            yv = yearly_ep[yk]
+            cyc = yv.get("cycling") or {}
+            run_y = yv.get("running") or {}
+            pc_lines.append(
+                f"| **{yk}** | {yv.get('sessions', 0)} | {yv.get('hours', 0.0):.1f} h | {yv.get('kj', 0)} kJ | "
+                f"{(str(cyc['5s']) + ' W') if cyc.get('5s') else '—'} | "
+                f"{(str(cyc['5m']) + ' W') if cyc.get('5m') else '—'} | "
+                f"{(str(cyc['20m']) + ' W') if cyc.get('20m') else '—'} | "
+                f"{run_y.get('5km') or '—'} |"
+            )
 
     write(os.path.join(brain, "coach", "power-curve.md"), "\n".join(pc_lines) + "\n")
 
@@ -2507,8 +2532,21 @@ def _strava_refresh_if_needed(brain, env_dict):
     return env_dict["STRAVA_ACCESS_TOKEN"]
 
 
-def _coach_sync(root, brain, hk, days=90, mock_file=None, wellness_mock=None, execute=True, quiet=False):
-    """Sync Strava activities + 1Hz streams & Garmin/Intervals wellness, score Plan-vs-Actual execution, & match calendar."""
+def _coach_sync(
+    root,
+    brain,
+    hk,
+    days=90,
+    mock_file=None,
+    wellness_mock=None,
+    google_health_mock=None,
+    health_days=None,
+    stream_days=180,
+    max_stream_fetches=65,
+    execute=True,
+    quiet=False,
+):
+    """Sync paginated Strava activities + timestamps + rate-limit-safe 1Hz streams, multi-provider wellness (`biometrics.json` + 30d intraday), & temporal alignment."""
     _coach_init(root, brain, hk, execute=execute, quiet=True)
     ftp_w, weight_kg = _extract_profile_numbers(brain, hk)
     prof_path = os.path.join(brain, "coach", "profile.md")
@@ -2526,6 +2564,16 @@ def _coach_sync(root, brain, hk, days=90, mock_file=None, wellness_mock=None, ex
         existing = []
     by_id = {str(a.get("id")): a for a in existing if isinstance(a, dict) and a.get("id") is not None}
 
+    conn_stat = coach_connectors.connector_status_summary(brain)
+    has_wellness_source = bool(
+        wellness_mock
+        or google_health_mock
+        or conn_stat.get("google_health_connected")
+        or conn_stat.get("google_health_needs_renew")
+        or conn_stat.get("garmin_connected")
+        or conn_stat.get("intervals_connected")
+    )
+
     raw_activities = []
     if mock_file:
         mock_data = load_json(os.path.expanduser(mock_file), [])
@@ -2533,7 +2581,7 @@ def _coach_sync(root, brain, hk, days=90, mock_file=None, wellness_mock=None, ex
     else:
         env_dict = _load_strava_env(brain)
         if not env_dict.get("STRAVA_ACCESS_TOKEN") and not env_dict.get("STRAVA_REFRESH_TOKEN"):
-            if wellness_mock or coach_connectors.connector_status_summary(brain).get("garmin_connected") or coach_connectors.connector_status_summary(brain).get("intervals_connected"):
+            if has_wellness_source:
                 raw_activities = []
             else:
                 if not quiet:
@@ -2542,11 +2590,18 @@ def _coach_sync(root, brain, hk, days=90, mock_file=None, wellness_mock=None, ex
         else:
             import urllib.request
             token = _strava_refresh_if_needed(brain, env_dict)
-            after_ts = int((dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)).timestamp())
-            url = f"https://www.strava.com/api/v3/athlete/activities?after={after_ts}&per_page=100"
-            req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                raw_activities = json.loads(resp.read().decode("utf-8", errors="replace"))
+            after_ts = int((dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=max(1, int(days or 90)))).timestamp())
+            # Paginated multi-year pull (`per_page=200`, `page=1..25`) so 2-5+ seasons load cleanly in 3-6 requests
+            for page_i in range(1, 26):
+                url = f"https://www.strava.com/api/v3/athlete/activities?after={after_ts}&per_page=200&page={page_i}"
+                req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+                with urllib.request.urlopen(req, timeout=25) as resp:
+                    page_items = json.loads(resp.read().decode("utf-8", errors="replace"))
+                if not isinstance(page_items, list) or not page_items:
+                    break
+                raw_activities.extend(page_items)
+                if len(page_items) < 200:
+                    break
 
     today = dt.date.today()
     stream_cache_dir = os.path.join(brain, "_atlas", "cache", "strava", "streams")
@@ -2554,6 +2609,7 @@ def _coach_sync(root, brain, hk, days=90, mock_file=None, wellness_mock=None, ex
         os.makedirs(stream_cache_dir, exist_ok=True)
 
     synced_count = 0
+    stream_fetches = 0
     synced_streams_mem = {}
     for raw in raw_activities:
         if not isinstance(raw, dict):
@@ -2572,10 +2628,33 @@ def _coach_sync(root, brain, hk, days=90, mock_file=None, wellness_mock=None, ex
             sport = s_type
 
         start_date = (raw.get("start_date_local") or raw.get("date") or today.isoformat())[:10]
-        dur_sec = int(raw.get("moving_time") or raw.get("elapsed_time") or (raw.get("duration_min", 0) * 60) or 0)
+        mov_sec = int(raw.get("moving_time") or (raw.get("duration_min", 0) * 60) or 0)
+        elap_sec = int(raw.get("elapsed_time") or mov_sec or 0)
+        dur_sec = mov_sec or elap_sec
         dur_min = int(round(dur_sec / 60.0))
         dist_km = round(float(raw.get("distance") or (raw.get("distance_km", 0) * 1000.0) or 0.0) / 1000.0, 2)
         elev_m = int(round(float(raw.get("total_elevation_gain") or raw.get("elevation_m") or 0)))
+
+        # Preserve full ISO timestamps & timezone offset for Strava <-> Biometrics temporal alignment
+        raw_start_utc = str(raw.get("start_date") or raw.get("start_time_utc") or "").strip()
+        raw_start_local = str(raw.get("start_date_local") or raw.get("start_time_local") or "").strip()
+        if raw_start_local.endswith("Z"):
+            raw_start_local = raw_start_local[:-1]
+        utc_off_s = None
+        if raw.get("utc_offset") is not None:
+            utc_off_s = health_engine.safe_int(raw.get("utc_offset"))
+        elif raw.get("utc_offset_s") is not None:
+            utc_off_s = health_engine.safe_int(raw.get("utc_offset_s"))
+        start_utc_dt = health_engine.parse_iso_utc(raw_start_utc) if raw_start_utc else None
+        start_loc_dt = health_engine.parse_local_iso(raw_start_local) if raw_start_local else None
+        if utc_off_s is None and start_utc_dt and start_loc_dt:
+            utc_off_s = int(round((start_loc_dt - start_utc_dt.replace(tzinfo=None)).total_seconds()))
+        if start_utc_dt and not raw_start_local and utc_off_s is not None:
+            raw_start_local = health_engine.utc_to_local_iso(start_utc_dt, utc_off_s) or ""
+        end_utc_iso = (
+            (start_utc_dt + dt.timedelta(seconds=elap_sec)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            if (start_utc_dt and elap_sec > 0) else str(raw.get("end_time_utc") or "")
+        )
 
         prev = by_id.get(aid, {})
         if "device_watts" in raw and raw.get("device_watts") is not None:
@@ -2596,6 +2675,20 @@ def _coach_sync(root, brain, hk, days=90, mock_file=None, wellness_mock=None, ex
             "distance_km": dist_km,
             "elevation_m": elev_m,
         })
+        if raw_start_utc:
+            entry["start_time_utc"] = raw_start_utc
+        if raw_start_local and len(raw_start_local) >= 16:
+            entry["start_time_local"] = raw_start_local
+        if end_utc_iso:
+            entry["end_time_utc"] = end_utc_iso
+        if elap_sec > 0:
+            entry["elapsed_sec"] = elap_sec
+        if mov_sec > 0:
+            entry["moving_sec"] = mov_sec
+        if utc_off_s is not None:
+            entry["utc_offset_s"] = utc_off_s
+        if raw.get("timezone"):
+            entry["timezone"] = str(raw["timezone"])
         valid_cycling_power = coach_engine.is_valid_cycling_power_activity(entry)
         if valid_cycling_power:
             if raw.get("average_watts") and not entry.get("avg_w"):
@@ -2624,7 +2717,11 @@ def _coach_sync(root, brain, hk, days=90, mock_file=None, wellness_mock=None, ex
         if raw.get("laps") and isinstance(raw["laps"], list):
             entry["laps"] = raw["laps"]
 
-        # Load or fetch 1Hz streams (including altitude & temp)
+        # Load cached 1Hz stream or rate-limit-safely fetch for recent `<= stream_days` activities
+        try:
+            act_age_d = (today - dt.date.fromisoformat(start_date)).days
+        except ValueError:
+            act_age_d = 9999
         s_file = os.path.join(stream_cache_dir, f"{aid}.json")
         streams = None
         if isinstance(raw.get("streams"), dict):
@@ -2633,7 +2730,13 @@ def _coach_sync(root, brain, hk, days=90, mock_file=None, wellness_mock=None, ex
                 dump_json(s_file, streams)
         elif os.path.isfile(s_file):
             streams = load_json(s_file, None)
-        elif not mock_file and sport in ("cycling", "running") and dur_min >= 10:
+        elif (
+            not mock_file
+            and sport in ("cycling", "running")
+            and dur_min >= 10
+            and act_age_d <= int(stream_days or 180)
+            and stream_fetches < int(max_stream_fetches or 65)
+        ):
             try:
                 env_dict = _load_strava_env(brain)
                 token = _strava_refresh_if_needed(brain, env_dict)
@@ -2645,6 +2748,7 @@ def _coach_sync(root, brain, hk, days=90, mock_file=None, wellness_mock=None, ex
                 req = urllib.request.Request(s_url, headers={"Authorization": f"Bearer {token}"})
                 with urllib.request.urlopen(req, timeout=20) as resp:
                     s_raw = json.loads(resp.read().decode("utf-8", errors="replace"))
+                    stream_fetches += 1
                     if isinstance(s_raw, dict):
                         streams = {k: (v.get("data", []) if isinstance(v, dict) else v) for k, v in s_raw.items()}
                         if execute:
@@ -2757,55 +2861,93 @@ def _coach_sync(root, brain, hk, days=90, mock_file=None, wellness_mock=None, ex
             if ex_eval:
                 a["execution"] = ex_eval
 
-    # Pull Garmin / Intervals.icu wellness biometrics (RHR, Sleep, HRV RMSSD, Weight) into readiness.md
-    wellness_rows = coach_connectors.garmin_pull_wellness(brain, days=min(days, 14), mock_file=wellness_mock, today=today)
-    if not wellness_rows and not wellness_mock:
-        wellness_rows = coach_connectors.intervals_pull_wellness(brain, days=min(days, 14), today=today)
-    wellness_imported = 0
-    if wellness_rows and execute:
-        rdy_path = os.path.join(brain, "coach", "readiness.md")
-        rdy_existing = read(rdy_path) if os.path.isfile(rdy_path) else ""
-        r_by_d = {r["date"]: r for r in coach_engine.parse_readiness_log(rdy_existing)}
-        for w_row in wellness_rows:
-            wd = w_row["date"]
-            cur_r = dict(r_by_d.get(wd) or {
-                "date": wd, "rhr": None, "sleep_h": None, "sleep_quality": None, "rpe": None, "soreness": None,
-                "ctl": None, "atl": None, "tsb": None, "acwr": None, "status": "", "notes": "",
-            })
-            for fld in ("rhr", "sleep_h", "sleep_quality", "hrv_rmssd", "weight_kg"):
-                if w_row.get(fld) is not None and cur_r.get(fld) is None:
-                    cur_r[fld] = w_row[fld]
-            if w_row.get("soreness") is not None and cur_r.get("soreness") is None:
-                cur_r["soreness"] = w_row["soreness"]
-            r_by_d[wd] = cur_r
-            wellness_imported += 1
-        merged_w = sorted(r_by_d.values(), key=lambda x: x["date"], reverse=True)
-        pmc_now = coach_engine.compute_pmc_metrics(all_acts, profile=prof_info, cs_mps=eff_cs_final, cp_watts=eff_cp_final, today=today)
-        for wr in merged_w[:7]:
-            d_obj = dt.date.fromisoformat(wr["date"])
-            ev_d = coach_engine.evaluate_readiness_and_guardrails(merged_w, prof_info, pmc_now, all_acts, cal_items=cal_for_exec, today=d_obj)
-            wr["ctl"] = pmc_now["ctl"]
-            wr["atl"] = pmc_now["atl"]
-            wr["tsb"] = pmc_now["tsb"]
-            wr["acwr"] = pmc_now["acwr"]
-            wr["status"] = ev_d["status"]
-        write(rdy_path, coach_engine.render_readiness_markdown(rdy_existing, merged_w, today.isoformat()))
-        _ensure_coach_readiness_link(brain, execute=True)
+    # Unified multi-provider wellness sync (Google Health API v4 + Garmin + Intervals -> biometrics.json + 30d intraday)
+    rdy_path = os.path.join(brain, "coach", "readiness.md")
+    rdy_existing = read(rdy_path) if os.path.isfile(rdy_path) else ""
+    existing_rdy_rows = coach_engine.parse_readiness_log(rdy_existing)
+    bio_store = health_engine.load_biometrics_store(brain)
+    if existing_rdy_rows:
+        health_engine.merge_readiness_rows_into_biometrics(bio_store, existing_rdy_rows)
+
+    eff_health_days = int(health_days) if health_days else max(14, min(int(days or 90), 730))
+    w_sync = coach_connectors.pull_all_wellness_into_biometrics(
+        brain=brain,
+        store=bio_store,
+        days=eff_health_days,
+        intraday_days=min(eff_health_days, 30),
+        google_health_mock=google_health_mock,
+        wellness_mock=wellness_mock,
+        execute=execute,
+        today=today,
+    )
+    wellness_imported = int(w_sync.get("imported_days") or 0)
+    wellness_auth_warns = list(w_sync.get("auth_warnings") or [])
+
+    # Exact historical per-day PMC snapshots + Strava <-> Biometrics temporal alignment
+    pmc_now = coach_engine.compute_pmc_metrics(
+        all_acts, profile=prof_info, cs_mps=eff_cs_final, cp_watts=eff_cp_final, today=today,
+    )
+    pmc_daily = pmc_now.get("daily_map") or {}
+    has_bio_days = bool(bio_store.get("days"))
+    if has_bio_days:
+        health_engine.align_activities_with_biometrics(all_acts, bio_store, brain=brain)
+        merged_all_rows = health_engine.biometrics_to_readiness_rows(bio_store, fallback_rows=existing_rdy_rows)
+        for d_iso, day_rec in bio_store["days"].items():
+            if not isinstance(day_rec, dict):
+                continue
+            d_pmc = pmc_daily.get(d_iso)
+            if d_pmc:
+                day_rec["pmc_snapshot"] = {
+                    "ctl": d_pmc["ctl"],
+                    "atl": d_pmc["atl"],
+                    "tsb": d_pmc["tsb"],
+                    "acwr": d_pmc["acwr"],
+                }
+        for wr in merged_all_rows[:14]:
+            d_iso = wr["date"]
+            d_pmc = pmc_daily.get(d_iso) or pmc_now
+            try:
+                d_obj = dt.date.fromisoformat(d_iso)
+            except ValueError:
+                continue
+            ev_d = coach_engine.evaluate_readiness_and_guardrails(
+                merged_all_rows, prof_info, d_pmc, all_acts, cal_items=cal_for_exec, today=d_obj,
+            )
+            bio_sig_d = health_engine.evaluate_biometric_signals(merged_all_rows, profile=prof_info, activities=all_acts, today=d_obj)
+            st_d = "RED" if bio_sig_d.get("illness_alert") else ev_d["status"]
+            wr["ctl"] = d_pmc["ctl"]
+            wr["atl"] = d_pmc["atl"]
+            wr["tsb"] = d_pmc["tsb"]
+            wr["acwr"] = d_pmc["acwr"]
+            wr["status"] = st_d
+            if d_iso in bio_store["days"]:
+                bio_store["days"][d_iso]["status"] = st_d
+        if execute and (wellness_imported > 0 or os.path.isfile(health_engine.biometrics_path(brain))):
+            health_engine.save_biometrics_store(brain, bio_store)
+            write(rdy_path, coach_engine.render_readiness_markdown(rdy_existing, merged_all_rows, today.isoformat()))
+            _ensure_coach_readiness_link(brain, execute=True)
 
     if execute:
         dump_json(act_json_path, all_acts)
         _rebuild_coach_markdown_files(brain, all_acts, ftp_watts=ftp_w, weight_kg=weight_kg)
         matched = _match_activities_to_calendar(brain, all_acts)
-        set_state(brain, last_strava_sync=now_iso())
+        state_updates = {"last_strava_sync": now_iso()}
+        if wellness_imported > 0 or "google_health" in (w_sync.get("providers") or []):
+            state_updates["last_health_sync"] = now_iso()
+        set_state(brain, **state_updates)
         hk.load_index()
         hk.render_calendar_html(hk.load_index(), start_server=False)
     else:
         matched = 0
     if not quiet:
         pend_cnt = sum(1 for a in all_acts if a.get("feedback") == "pending")
-        w_bit = f", {wellness_imported} wellness day(s) imported" if wellness_imported else ""
+        provs = ",".join(w_sync.get("providers") or [])
+        w_bit = f", {wellness_imported} wellness day(s) imported ({provs})" if wellness_imported else ""
+        i_bit = f", {w_sync.get('intraday_written', 0)}d intraday cached" if w_sync.get("intraday_written") else ""
         say(f"coach sync ({'applied' if execute else 'dry-run'}): {synced_count} activity/ies processed, "
-            f"{matched} calendar workout(s) marked [x], {pend_cnt} ride check-in(s) pending{w_bit}.")
+            f"{matched} calendar workout(s) marked [x], {pend_cnt} ride check-in(s) pending{w_bit}{i_bit}.")
+        if "google_health_refresh_expired" in wellness_auth_warns:
+            say("  [!] Google Health refresh token expired (7d Testing Mode). Run `atlas.py coach auth-google-health --renew` (1 click) to resume.")
     return synced_count
 
 
@@ -2944,6 +3086,17 @@ def _coach_note(
         final_rows = sorted(by_date_r.values(), key=lambda x: x["date"], reverse=True)
         write(rdy_path, coach_engine.render_readiness_markdown(rdy_existing, final_rows, dt.date.today().isoformat()))
         _ensure_coach_readiness_link(brain, execute=True)
+        # Keep canonical biometrics.json synchronized with manual readiness check-ins (manual subjective always wins)
+        bio_n = health_engine.load_biometrics_store(brain)
+        if bio_n.get("days") or os.path.isfile(health_engine.biometrics_path(brain)):
+            health_engine.merge_readiness_rows_into_biometrics(bio_n, [cur_row])
+            d_pmc = (pmc.get("daily_map") or {}).get(eff_date) or pmc
+            if eff_date in bio_n.get("days", {}):
+                bio_n["days"][eff_date]["pmc_snapshot"] = {
+                    "ctl": d_pmc["ctl"], "atl": d_pmc["atl"], "tsb": d_pmc["tsb"], "acwr": d_pmc["acwr"],
+                }
+                bio_n["days"][eff_date]["status"] = rdy_eval["status"]
+            health_engine.save_biometrics_store(brain, bio_n)
         rdy_status_msg = f" [readiness={rdy_eval['status']}, TSB={pmc['tsb']:+.1f}]"
 
     _rebuild_coach_markdown_files(brain, acts, ftp_watts=ftp_w, weight_kg=weight_kg)
@@ -3084,8 +3237,9 @@ def _coach_context(
     _coach_init(root, brain, hk, execute=True, quiet=True)
     st = get_state(brain)
     c_state = hk.load_coach_state()
-    if c_state["strava_connected"] and not no_sync:
-        last_sync = st.get("last_strava_sync")
+    conn_pre = coach_connectors.connector_status_summary(brain)
+    if (c_state["strava_connected"] or conn_pre.get("google_health_connected")) and not no_sync:
+        last_sync = st.get("last_strava_sync") or st.get("last_health_sync")
         age_min = ((dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(last_sync)).total_seconds() / 60.0) if last_sync else 9999
         if age_min >= 30:
             try:
@@ -3107,6 +3261,7 @@ def _coach_context(
     rdy_text = read(rdy_path) if os.path.isfile(rdy_path) else ""
     dna_text = read(dna_path) if os.path.isfile(dna_path) else ""
     pb_text = read(pb_path) if os.path.isfile(pb_path) else ""
+    bio_store = health_engine.load_biometrics_store(brain)
 
     telemetry = coach_engine.build_coach_telemetry(
         profile_text=prof_text,
@@ -3119,6 +3274,7 @@ def _coach_context(
         dna_text=dna_text,
         playbook_text=pb_text,
         macro_info=macro,
+        biometrics_store=bio_store,
     )
     depth = telemetry["depth"]
 
@@ -3164,17 +3320,32 @@ def _coach_context(
         if conn["hammerhead_connected"]
         else f"not connected — 1-Click link (NO API keys needed): `[💛 Karoo verbinden (1-Klick)]({base_url_ctx}/hammerhead-connect)`"
     )
+    bio_days_cnt = len(bio_store.get("days") or {})
+    if conn.get("google_health_connected"):
+        gh_days_s = f", ~{conn['google_health_days_left']}d left" if conn.get("google_health_days_left") is not None else ""
+        gh_status_str = f"connected ({bio_days_cnt} bio days{gh_days_s})"
+    elif conn.get("google_health_needs_renew"):
+        gh_status_str = f"RENEW NEEDED — `[💚 Google Health erneuern (1-Klick)]({base_url_ctx}/google-health-connect)`"
+    elif conn.get("google_health_configured"):
+        gh_status_str = f"configured — `[💚 Google Health verbinden (1-Klick)]({base_url_ctx}/google-health-connect)`"
+    else:
+        gh_status_str = "optional (`atlas.py coach auth-google-health`)"
     say(
-        f"  Devices & Wellness: Hammerhead Karoo={hh_status_str} | "
+        f"  Devices & Wellness: Google Health={gh_status_str} | Hammerhead Karoo={hh_status_str} | "
         f"Garmin Connect={'connected' if conn['garmin_connected'] else 'not connected (`atlas.py coach auth-garmin` + `.fit` ready)'} | "
         f"Intervals.icu={'connected' if conn['intervals_connected'] else 'optional'}"
     )
+    if conn.get("google_health_needs_renew"):
+        say(
+            f"  [!] GOOGLE HEALTH TOKEN EXPIRING/EXPIRED (7d Testing Mode): Offer 1-click renew directly in chat "
+            f"(`[💚 Google Health erneuern (1-Klick)]({base_url_ctx}/google-health-connect)` or on 'jo' run `atlas.py coach auth-google-health --renew`)."
+        )
     say("  On-Demand Pull & 1-Hz Simulation CLI (NEVER compute W'bal/VO2 in your head!):")
     say("    - `atlas.py coach simulate --dsl \"15m WU 55-68%, 3x (13x 30s@388W / 15s@205W) / 4m@150W\" [--prior-kj 1600 --cho-g-h 60]`")
     say("    - `atlas.py coach simulate --solve [all|float-30-15|classic-30-15|hard-start-4x4|shuttle-1-4] [--prior-kj 1782 --cho-g-h 42.5,90 --form-pct 0,-2]`")
-    say("    - `atlas.py coach history --months 6 [--sport cycling|running]`")
+    say("    - `atlas.py coach history --months 6 [--year YYYY] [--search \"race\"] [--sport cycling|running]`")
     say("    - `atlas.py coach compare --epoch-a YYYY-MM-DD..YYYY-MM-DD --epoch-b YYYY-MM-DD..YYYY-MM-DD`")
-    say("    - `atlas.py coach inspect --date YYYY-MM-DD` | `atlas.py coach push --execute` | `atlas.py coach set-profile ... --execute` | `atlas.py coach add-rule --text \"...\" --execute`")
+    say("    - `atlas.py coach inspect --date YYYY-MM-DD` (full Biometrics+Workout timeline + on-demand stream fetch!) | `atlas.py coach push --execute` | `atlas.py coach set-profile ... --execute` | `atlas.py coach add-rule --text \"...\" --execute`")
 
     pend = c_state.get("pending_feedback", [])
     if pend:
@@ -3332,6 +3503,95 @@ def _coach_auth_hammerhead(root, brain, hk, args):
     if not ok:
         sys.exit(f"hammerhead auth failed: {msg}")
     say(f"hammerhead auth: connected -> {fwd(msg)}")
+
+
+def _coach_auth_google_health(root, brain, hk, args):
+    """Chat-First OAuth 2.0 + PKCE loopback connect/renew for Google Health API v4 (`brain/_secrets/google_health.env`)."""
+    client_json = getattr(args, "client_json", None)
+    login_hint = getattr(args, "login_hint", None) or ""
+    if client_json:
+        ok_imp, msg_imp = coach_connectors.import_google_health_client_json(brain, client_json, login_hint=login_hint)
+        if not ok_imp:
+            sys.exit(f"google-health auth: {msg_imp}")
+        say(f"google-health auth: imported OAuth client credentials -> {fwd(msg_imp)}")
+
+    env = coach_connectors.load_secret_env(brain, "google_health")
+    changed = False
+    if getattr(args, "client_id", None):
+        env["GOOGLE_HEALTH_CLIENT_ID"] = args.client_id.strip()
+        changed = True
+    if getattr(args, "client_secret", None):
+        env["GOOGLE_HEALTH_CLIENT_SECRET"] = args.client_secret.strip()
+        changed = True
+    if login_hint:
+        env["GOOGLE_HEALTH_LOGIN_HINT"] = login_hint.strip()
+        changed = True
+    if getattr(args, "access_token", None):
+        env["GOOGLE_HEALTH_ACCESS_TOKEN"] = args.access_token.strip()
+        changed = True
+    if getattr(args, "refresh_token", None):
+        env["GOOGLE_HEALTH_REFRESH_TOKEN"] = args.refresh_token.strip()
+        env["GOOGLE_HEALTH_REFRESH_ISSUED_AT"] = str(int(time.time()))
+        env.pop("GOOGLE_HEALTH_AUTH_ERROR", None)
+        changed = True
+    if changed:
+        coach_connectors.save_secret_env(brain, "google_health", env)
+
+    if getattr(args, "access_token", None) and not getattr(args, "code", None):
+        say(f"google-health auth: saved tokens -> {fwd(coach_connectors.secret_env_path(brain, 'google_health'))}")
+        return
+
+    cal_url = hk.render_calendar_html(hk.load_index(), start_server=True)
+    base_url = cal_url.rsplit("/", 1)[0]
+    local_cb = getattr(args, "redirect_uri", None) or f"{base_url}/google-health-callback"
+    connect_url = f"{base_url}/google-health-connect"
+    srv_port = 8765
+    try:
+        srv_port = int(base_url.rsplit(":", 1)[1])
+    except Exception:
+        pass
+    cfg = coach_connectors.google_health_oauth_config(brain, local_redirect_uri=local_cb)
+    if not cfg.get("configured"):
+        say("=== Google Health API v4 Setup (0 EUR, Personal Testing Mode) ===")
+        say("1. Create/select a Google Cloud project -> enable `Google Health API` (`health.googleapis.com`).")
+        say("2. Google Auth Platform -> Audience: `External` + keep status on `Testing` + add your Gmail under `Test users`.")
+        say("3. Clients -> `+ Create client` -> Type: `Desktop app` -> Download JSON.")
+        say("4. Import once: `atlas.py coach auth-google-health --client-json ~/Downloads/client_secret_*.json --login-hint you@example.com`")
+        return
+
+    code = getattr(args, "code", None)
+    if not code:
+        state, _ver, challenge = coach_connectors.mint_google_health_oauth_state(brain, port=srv_port)
+        auth_url = coach_connectors.build_google_health_authorize_url(
+            cfg["client_id"], cfg["redirect_uri"], state=state, code_challenge=challenge, login_hint=cfg.get("login_hint", "")
+        )
+        if not os.environ.get("ATLAS_NO_CAL_SERVER"):
+            try:
+                import webbrowser
+                webbrowser.open(auth_url)
+            except Exception:
+                pass
+        lbl = "Token Renew" if getattr(args, "renew", False) else "1-Click Connect"
+        say(f"=== Google Health API v4 ({lbl} Ready) ===")
+        say(f"Click this 1-click link (opens Google consent with login_hint, then syncs automatically):\n  [💚 Google Health verbinden / erneuern (1-Klick)]({connect_url})")
+        say(f"Direct OAuth URL:\n  {auth_url}")
+        return
+
+    ok, msg = coach_connectors.google_health_exchange_code(
+        brain,
+        code=code,
+        redirect_uri=local_cb,
+        code_verifier=getattr(args, "verifier", None) or "",
+        client_id=getattr(args, "client_id", None),
+        client_secret=getattr(args, "client_secret", None),
+    )
+    if not ok:
+        sys.exit(f"google-health auth failed: {msg}")
+    say(f"google-health auth: connected -> {fwd(msg)}")
+    try:
+        _coach_sync(root, brain, hk, days=30, health_days=30, execute=True, quiet=False)
+    except Exception as exc:
+        say(f"google-health auth: initial sync note ({exc})")
 
 
 def _coach_auth_garmin(brain, args):
@@ -3980,12 +4240,107 @@ def _coach_compare_epochs(brain, hk, epoch_a, epoch_b):
     acts_b = [a for a in acts if isinstance(a, dict) and b_lo <= str(a.get("date", ""))[:10] <= b_hi]
     ref_a = _safe_end_date(a_hi, a_lo)
     ref_b = _safe_end_date(b_hi, b_lo)
+    bio_store = health_engine.load_biometrics_store(brain)
 
-    tel_a = coach_engine.build_coach_telemetry(prof_txt, acts_a, today=ref_a)
-    tel_b = coach_engine.build_coach_telemetry(prof_txt, acts_b, today=ref_b)
+    tel_a = coach_engine.build_coach_telemetry(prof_txt, acts_a, today=ref_a, biometrics_store=bio_store)
+    tel_b = coach_engine.build_coach_telemetry(prof_txt, acts_b, today=ref_b, biometrics_store=bio_store)
     say(f"=== COACH 7-PILLAR EPOCH COMPARISON ({epoch_a} [{len(acts_a)} acts, ref {ref_a}] vs {epoch_b} [{len(acts_b)} acts, ref {ref_b}]) ===")
     say(f"\n--- Epoch A ({epoch_a}) ---\n" + coach_engine.format_seven_pillar_blocks(tel_a, include_actions=False))
+    bio_a = health_engine.summarize_biometrics_epoch(bio_store, a_lo, a_hi)
+    if bio_a.get("days"):
+        say(
+            f"  [Biometrics A ({bio_a['days']}d)] RHR={bio_a['avg_rhr'] or '—'} | HRV={bio_a['avg_hrv'] or '—'}ms | "
+            f"Sleep={bio_a['avg_sleep_h'] or '—'}h (Deep {bio_a['avg_deep_min'] or '—'}m / REM {bio_a['avg_rem_min'] or '—'}m) | "
+            f"Steps={bio_a['avg_steps'] or '—'} | Weight={bio_a['avg_weight_kg'] or '—'}kg"
+        )
     say(f"\n--- Epoch B ({epoch_b}) ---\n" + coach_engine.format_seven_pillar_blocks(tel_b, include_actions=False))
+    bio_b = health_engine.summarize_biometrics_epoch(bio_store, b_lo, b_hi)
+    if bio_b.get("days"):
+        say(
+            f"  [Biometrics B ({bio_b['days']}d)] RHR={bio_b['avg_rhr'] or '—'} | HRV={bio_b['avg_hrv'] or '—'}ms | "
+            f"Sleep={bio_b['avg_sleep_h'] or '—'}h (Deep {bio_b['avg_deep_min'] or '—'}m / REM {bio_b['avg_rem_min'] or '—'}m) | "
+            f"Steps={bio_b['avg_steps'] or '—'} | Weight={bio_b['avg_weight_kg'] or '—'}kg"
+        )
+
+
+def _coach_inspect(brain, hk, target, fetch_stream=True):
+    """Chat-First deep-dive for a date or Strava ID: full Biometrics+Workout timeline + on-demand 1Hz stream hydration."""
+    c_state = hk.load_coach_state()
+    acts = list(c_state.get("activities") or [])
+    tgt = str(target or "").strip()
+    matches = [a for a in acts if str(a.get("date", ""))[:10] == tgt[:10] or str(a.get("id", "")) == tgt]
+
+    # On-demand lazy 1Hz stream hydration for historical (>180d) Strava activities missing local streams
+    hydrated = False
+    if fetch_stream and matches and c_state.get("strava_connected"):
+        stream_cache_dir = os.path.join(brain, "_atlas", "cache", "strava", "streams")
+        os.makedirs(stream_cache_dir, exist_ok=True)
+        ftp_w, weight_kg = _extract_profile_numbers(brain, hk)
+        prof_path = os.path.join(brain, "coach", "profile.md")
+        prof_info = coach_engine.parse_athlete_profile(
+            read(prof_path) if os.path.isfile(prof_path) else "",
+            fallback_ftp=ftp_w,
+            fallback_weight=weight_kg,
+        )
+        eff_cp = float(prof_info.get("cp_w") or ftp_w)
+        eff_wp_j = float(prof_info["w_prime_kj"] * 1000.0) if prof_info.get("w_prime_kj") else 20000.0
+        for ma in matches:
+            aid = str(ma.get("id") or "")
+            sp = str(ma.get("sport") or "").lower()
+            s_file = os.path.join(stream_cache_dir, f"{aid}.json")
+            needs_s = (
+                aid.isdigit()
+                and sp in ("cycling", "running")
+                and int(ma.get("duration_min") or 0) >= 10
+                and (not os.path.isfile(s_file) or (sp == "cycling" and ma.get("device_watts") and not ma.get("peaks_fresh")))
+            )
+            if not needs_s:
+                continue
+            try:
+                env_dict = _load_strava_env(brain)
+                token = _strava_refresh_if_needed(brain, env_dict)
+                if not token:
+                    continue
+                import urllib.request
+                s_url = (
+                    f"https://www.strava.com/api/v3/activities/{aid}/streams"
+                    "?keys=watts,heartrate,cadence,velocity_smooth,altitude,temp,time&key_by_type=true"
+                )
+                req = urllib.request.Request(s_url, headers={"Authorization": f"Bearer {token}"})
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    s_raw = json.loads(resp.read().decode("utf-8", errors="replace"))
+                if isinstance(s_raw, dict):
+                    streams = {k: (v.get("data", []) if isinstance(v, dict) else v) for k, v in s_raw.items()}
+                    dump_json(s_file, streams)
+                    m_calc = _compute_stream_metrics(
+                        streams,
+                        ftp_watts=ftp_w,
+                        weight_kg=weight_kg,
+                        sport=sp,
+                        cp_watts=eff_cp,
+                        w_prime_j=eff_wp_j,
+                        device_watts=ma.get("device_watts"),
+                        title=str(ma.get("name") or ""),
+                        creatine_flag=prof_info.get("creatine_flag"),
+                        tau_w_mult=float(prof_info.get("tau_w_mult") or 1.0),
+                    )
+                    ma.update(m_calc)
+                    hydrated = True
+            except Exception:
+                pass
+        if hydrated:
+            dump_json(os.path.join(brain, "coach", "activities.json"), acts)
+
+    bio_store = health_engine.load_biometrics_store(brain)
+    eff_date = str(matches[0]["date"])[:10] if (matches and not re.match(r"^\d{4}-\d{2}-\d{2}$", tgt[:10])) else tgt[:10]
+    if bio_store.get("days"):
+        health_engine.align_activities_with_biometrics(matches, bio_store, brain=brain)
+        say(health_engine.format_day_timeline_inspect(eff_date, matches, bio_store))
+        say("")
+    hyd_note = " (1Hz stream hydrated on-demand)" if hydrated else ""
+    say(f"=== COACH ACTIVITY INSPECT ({tgt} | {len(matches)} match(es){hyd_note}) ===")
+    for ma in matches:
+        say(json.dumps(ma, indent=2, ensure_ascii=False))
 
 
 def _coach_field_test(root, brain, hk, unit, date_str=None, execute=True, depth_override=None):
@@ -4079,23 +4434,28 @@ def cmd_coach(args):
         conn = coach_connectors.connector_status_summary(brain)
         prof_p = os.path.join(brain, "coach", "profile.md")
         rdy_p = os.path.join(brain, "coach", "readiness.md")
+        bio_s = health_engine.load_biometrics_store(brain)
         tel = coach_engine.build_coach_telemetry(
             profile_text=read(prof_p) if os.path.isfile(prof_p) else "",
             activities=c_state.get("activities", []),
             readiness_text=read(rdy_p) if os.path.isfile(rdy_p) else "",
             strava_connected=bool(c_state.get("strava_connected")),
             explicit_depth=getattr(args, "depth", None),
+            biometrics_store=bio_s,
         )
         say(f"coach status: module={'coach' in get_state(brain).get('modules', [])}, "
             f"depth={tel['depth']}, readiness={tel['readiness']['status']} ({tel['readiness'].get('flag_4stage')}), "
             f"ctl={tel['pmc']['ctl']:.1f}, tsb={tel['pmc']['tsb']:+.1f}, "
             f"strava_connected={c_state['strava_connected']}, "
+            f"google_health_connected={conn['google_health_connected']}, "
             f"hammerhead_connected={conn['hammerhead_connected']}, garmin_connected={conn['garmin_connected']}, "
-            f"activities={len(c_state['activities'])}, "
+            f"activities={len(c_state['activities'])}, bio_days={len(bio_s.get('days') or {})}, "
             f"pending_feedback={len(c_state['pending_feedback'])}, "
             f"macro_phase='{macro['active_phase']}', macro_stale={macro['stale']} ({macro['stale_reason']})")
     elif action == "auth-strava":
         _coach_auth_strava(root, brain, args)
+    elif action == "auth-google-health":
+        _coach_auth_google_health(root, brain, hk, args)
     elif action == "auth-hammerhead":
         _coach_auth_hammerhead(root, brain, hk, args)
     elif action == "auth-garmin":
@@ -4106,7 +4466,10 @@ def cmd_coach(args):
         eff_days = args.days if getattr(args, "days", None) not in (None, 14) else 90
         _coach_sync(
             root, brain, hk, days=eff_days, mock_file=args.mock_file,
-            wellness_mock=getattr(args, "wellness_mock", None), execute=args.execute, quiet=False,
+            wellness_mock=getattr(args, "wellness_mock", None),
+            google_health_mock=getattr(args, "google_health_mock", None),
+            health_days=getattr(args, "health_days", None),
+            execute=args.execute, quiet=False,
         )
     elif action == "note":
         has_rdy = any(getattr(args, k, None) is not None for k in (
@@ -4142,22 +4505,23 @@ def cmd_coach(args):
         )
     elif action == "history":
         c_state = hk.load_coach_state()
+        bio_s = health_engine.load_biometrics_store(brain)
         say(coach_engine.query_coach_history(
             c_state.get("activities", []),
             date_from=getattr(args, "from_date", None),
             date_to=getattr(args, "to_date", None),
             months=getattr(args, "months", 6),
             sport_filter=getattr(args, "sport", None),
+            search_query=getattr(args, "search", None),
+            year=getattr(args, "year", None),
+            biometrics_store=bio_s,
+            limit=getattr(args, "limit", 80),
         ))
     elif action == "inspect":
         target_d = getattr(args, "date", None) or getattr(args, "deep_dive", None)
         if not target_d:
-            sys.exit("coach inspect requires `--date YYYY-MM-DD`")
-        c_state = hk.load_coach_state()
-        matches = [a for a in c_state.get("activities", []) if str(a.get("date", ""))[:10] == target_d[:10] or str(a.get("id", "")) == target_d]
-        say(f"=== COACH ACTIVITY INSPECT ({target_d} | {len(matches)} match(es)) ===")
-        for ma in matches:
-            say(json.dumps(ma, indent=2, ensure_ascii=False))
+            sys.exit("coach inspect requires `--date YYYY-MM-DD` (or Strava activity ID)")
+        _coach_inspect(brain, hk, target_d, fetch_stream=not bool(getattr(args, "no_stream_fetch", False)))
     elif action == "compare":
         if not (getattr(args, "epoch_a", None) and getattr(args, "epoch_b", None)):
             sys.exit("coach compare requires `--epoch-a YYYY-MM-DD..YYYY-MM-DD --epoch-b YYYY-MM-DD..YYYY-MM-DD`")
@@ -5735,7 +6099,7 @@ def main():
         nargs="?",
         default="context",
         choices=(
-            "context", "status", "auth-strava", "auth-hammerhead", "auth-garmin", "auth-intervals",
+            "context", "status", "auth-strava", "auth-google-health", "auth-hammerhead", "auth-garmin", "auth-intervals",
             "sync", "note", "zwo", "fit", "push", "history", "inspect", "compare", "simulate", "field-test",
             "set-profile", "add-rule",
         ),
@@ -5795,8 +6159,13 @@ def main():
     p.add_argument("--soreness", type=int, help="muscle soreness (1-5) for `note` readiness check-in")
     p.add_argument("--leg-pain", type=int, help="peripheral local leg soreness/pain (1-5) for `note` GELB-B detection")
     p.add_argument("--fatigue-7d", type=int, help="weekly 7-day global fatigue rating (1-5) for `note`")
-    p.add_argument("--days", type=int, default=14, help="horizon in days for `sync` (default 90), `zwo`, or `push` (default 14)")
+    p.add_argument("--days", type=int, default=14, help="horizon in days for `sync` (default 90; supports 365-1825 for multi-year), `zwo`, or `push` (default 14)")
+    p.add_argument("--health-days", type=int, default=None, help="optional override lookback days (14-730) for Google Health / wellness sync")
     p.add_argument("--months", type=int, default=6, help="lookback months for `history` (default 6)")
+    p.add_argument("--year", type=int, default=None, help="calendar year filter (e.g. `2025`) for `history`")
+    p.add_argument("--search", help="keyword/race-name filter for `history` (automatically searches full multi-year archive)")
+    p.add_argument("--limit", type=int, default=80, help="max matching sessions displayed by `history` (default 80)")
+    p.add_argument("--no-stream-fetch", action="store_true", help="skip on-demand Strava 1Hz stream hydration during `inspect`")
     p.add_argument("--from-date", help="start date YYYY-MM-DD for `history`")
     p.add_argument("--to-date", help="end date YYYY-MM-DD for `history`")
     p.add_argument("--sport", help="sport filter (`cycling`, `running`, `strength`) for `history`")
@@ -5806,7 +6175,13 @@ def main():
     p.add_argument("--all-14d", action="store_true", help="compile all cycling workouts in the next 14 days")
     p.add_argument("--mock-file", help="offline Strava JSON fixture for `sync`")
     p.add_argument("--wellness-mock", help="offline Garmin/Intervals wellness JSON fixture for `sync`")
+    p.add_argument("--google-health-mock", help="offline Google Health API v4 JSON bundle fixture for `sync`")
     p.add_argument("--mock-dir", help="offline device sync directory for `push`")
+    p.add_argument("--client-json", help="Google Cloud OAuth Desktop-App JSON path for `auth-google-health`")
+    p.add_argument("--login-hint", help="Google account email hint for `auth-google-health`")
+    p.add_argument("--verifier", help="PKCE code_verifier for headless `auth-google-health`")
+    p.add_argument("--redirect-uri", help="OAuth redirect_uri override for `auth-google-health`")
+    p.add_argument("--renew", action="store_true", help="trigger 1-click Google Health token renewal (`auth-google-health --renew`)")
     p.add_argument("--client-id", help="OAuth Client ID for `auth-strava` or `auth-hammerhead`")
     p.add_argument("--client-secret", help="OAuth Client Secret for `auth-strava` or `auth-hammerhead`")
     p.add_argument("--access-token", help="OAuth Access Token for `auth-strava` or `auth-hammerhead`")

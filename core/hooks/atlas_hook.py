@@ -39,7 +39,7 @@ sys.dont_write_bytecode = True
 _TOOLS_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools"))
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
-from atlas_lib import cal_engine, coach_connectors, coach_engine, graph_engine
+from atlas_lib import cal_engine, coach_connectors, coach_engine, graph_engine, health_engine
 
 BRAIN = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 PROBE = bool(os.environ.get("ATLAS_PROBE"))  # set by `atlas.py probe`: run, but change nothing
@@ -1522,6 +1522,7 @@ def _extract_coach_context(idx, cal_items=None):
                 pb_txt = fh.read(HEAD_BYTES)
         except OSError:
             pass
+    bio_store = health_engine.load_biometrics_store(BRAIN)
     try:
         tel = coach_engine.build_coach_telemetry(
             profile_text=prof_txt_full,
@@ -1533,6 +1534,7 @@ def _extract_coach_context(idx, cal_items=None):
             dna_text=dna_txt,
             playbook_text=pb_txt,
             macro_info=macro,
+            biometrics_store=bio_store,
         )
         tel_compact = {k: v for k, v in tel.items() if k != "curves"}
         raw_pc = c_state["power_curve"]
@@ -1674,7 +1676,7 @@ CAL_SERVER_SCRIPT = cal_engine.CAL_SERVER_SCRIPT
 
 
 def _cal_http_ok(port):
-    """Verify the calendar server returns HTTP 200 on `/healthz` (`atlas-cal-v5`)."""
+    """Verify the calendar server returns HTTP 200 on `/healthz` (`atlas-cal-v6`)."""
     return cal_engine.cal_http_ok(port)
 
 
@@ -1897,7 +1899,7 @@ def session_warmup(cwd, session):
     idx = load_index(budget=INDEX_BUDGET_S)
     try:
         conn_w = coach_connectors.connector_status_summary(BRAIN)
-        if conn_w.get("strava_connected") or conn_w.get("garmin_connected"):
+        if conn_w.get("strava_connected") or conn_w.get("garmin_connected") or conn_w.get("google_health_connected"):
             last_s = st.get("last_strava_sync")
             age_m = ((dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(last_s)).total_seconds() / 60.0) if last_s else 9999
             if age_m >= 60:
@@ -2012,6 +2014,9 @@ def session_text(cwd, session, skip_pull=False):
                     p0 = pend[0]
                     np_bit = f", NP {p0.get('np_w')}W" if p0.get("np_w") else ""
                     coach_bits.append(f"Session '{p0.get('name', 'Workout')}' on {p0.get('date')} ({p0.get('duration_min', 0)}m{np_bit}) has no feedback note yet -> ask 1 short question & save via `atlas.py coach note --date {p0.get('date')} --text \"...\"`")
+                gh_st = coach_connectors.google_health_token_status(BRAIN)
+                if gh_st.get("needs_renew"):
+                    coach_bits.append("Google Health Token erneuern (`atlas.py coach auth-google-health --renew`)")
                 if coach_bits:
                     parts.append("Coach pulse: " + " | ".join(coach_bits) + ".")
         except Exception as exc:
@@ -2324,7 +2329,9 @@ COACH_RX_CHECKIN = re.compile(
     r"(?:ruhepuls|rhr|hrv|rmssd|kfa|k[oö]rperfett\w*|kreatin\w*)\s*(?:ist|war|liegt|betr[aä]gt|=|:|bei|nehm\w*|ja|nein|\d)|"
     r"(?:kein\s+)?kreatin\b.*\b(?:ja|nein|nehm\w*|supplement\w*)|"
     r"schlecht\s+geschlafen|nur\s+\d+(?:[.,]\d+)?\s*h\s+geschlafen|halsschmerzen|erk[aä]ltet|krank\s+train\w*|"
-    r"strava\s+sync\w*|garmin\s+(?:sync\w*|verbinden|connect)|hammerhead|karoo\s+(?:sync\w*|verbinden|push)|"
+    r"strava\s+sync\w*|garmin\s+(?:sync\w*|verbinden|connect)|google\s+health\b|pixel\s+watch\b|"
+    r"schlaf(?:daten|analyse|phasen|qualit[aä]t|schuld)\b|tiefschlaf\b|rem-?schlaf\b|hauttemperatur\b|atemfrequenz\b|"
+    r"hammerhead|karoo\s+(?:sync\w*|verbinden|push)|"
     r"ride\s+check-?in|readiness\s+check|feedback\s+zum\s+(?:ride|training|workout|lauf)|"
     r"training\s+gestern\s+war|einheit\s+gestern|ausfahrt\s+war|"
     r"letzte[rn]?\s+(?:ride|ausfahrt|einheit|lauf)|(?:ride|ausfahrt|einheit|training)\s+am\s+\d{1,2}\.\d{1,2})\b"

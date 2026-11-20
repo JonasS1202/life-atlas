@@ -1,8 +1,8 @@
-"""Hardware & Wellness Connectors for Atlas Coach (Hammerhead Karoo, Garmin Connect, Intervals.icu).
+"""Hardware & Wellness Connectors for Atlas Coach (Google Health API v4, Hammerhead Karoo, Garmin Connect, Intervals.icu).
 
 Python 3 standard library only (`base64`, `datetime`, `hashlib`, `json`, `os`, `re`,
 `subprocess`, `sys`, `time`, `urllib`, `uuid`). Credentials live exclusively in
-`brain/_secrets/{hammerhead,garmin,intervals}.env` (`0o600`, git-ignored).
+`brain/_secrets/{google_health,hammerhead,garmin,intervals}.env` (`0o600`, git-ignored).
 """
 from __future__ import annotations
 
@@ -23,7 +23,22 @@ import uuid
 from typing import Any
 
 from . import fit_writer
+from . import health_engine
 from . import pillars_engine
+
+# ---------------------------------------------------------------------------
+# Google Health API v4 (OAuth 2.0 + PKCE Loopback, Pure-Stdlib REST)
+# ---------------------------------------------------------------------------
+GOOGLE_HEALTH_AUTHORIZE_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_HEALTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GOOGLE_HEALTH_API_BASE = "https://health.googleapis.com/v4/users/me"
+GOOGLE_HEALTH_SCOPES = (
+    "https://www.googleapis.com/auth/googlehealth.sleep.readonly",
+    "https://www.googleapis.com/auth/googlehealth.health_metrics_and_measurements.readonly",
+    "https://www.googleapis.com/auth/googlehealth.activity_and_fitness.readonly",
+)
+GOOGLE_HEALTH_TESTING_TOKEN_TTL_DAYS = 7.0
+GOOGLE_HEALTH_RENEW_WARN_DAYS = 6.0
 
 # ---------------------------------------------------------------------------
 # Hammerhead Karoo OAuth 2.0 & Workout API Endpoints
@@ -93,16 +108,55 @@ def save_secret_env(brain: str, service: str, env_dict: dict[str, str]) -> str:
     return p
 
 
+def google_health_token_status(brain: str) -> dict[str, Any]:
+    """Return Google Health OAuth configuration, connection, and 7-day Testing-Mode renew status."""
+    gh = load_secret_env(brain, "google_health")
+    cid = (gh.get("GOOGLE_HEALTH_CLIENT_ID") or os.environ.get("ATLAS_GOOGLE_HEALTH_CLIENT_ID") or "").strip()
+    csec = (gh.get("GOOGLE_HEALTH_CLIENT_SECRET") or os.environ.get("ATLAS_GOOGLE_HEALTH_CLIENT_SECRET") or "").strip()
+    broker = (gh.get("GOOGLE_HEALTH_BROKER_URL") or os.environ.get("ATLAS_GOOGLE_HEALTH_BROKER_URL") or "").strip()
+    configured = bool((cid and csec) or (cid and broker))
+    has_tok = bool(gh.get("GOOGLE_HEALTH_REFRESH_TOKEN") or gh.get("GOOGLE_HEALTH_ACCESS_TOKEN"))
+    auth_err = (gh.get("GOOGLE_HEALTH_AUTH_ERROR") or "").strip()
+    is_internal = str(gh.get("GOOGLE_HEALTH_WORKSPACE_INTERNAL") or "").strip().lower() in ("1", "true", "yes")
+    issued_at = health_engine.safe_int(gh.get("GOOGLE_HEALTH_REFRESH_ISSUED_AT"))
+    days_left: float | None = None
+    needs_renew = False
+    if has_tok:
+        if auth_err == "refresh_expired":
+            needs_renew = True
+            days_left = 0.0
+        elif issued_at and not is_internal:
+            age_days = max(0.0, (time.time() - float(issued_at)) / 86400.0)
+            days_left = round(max(0.0, GOOGLE_HEALTH_TESTING_TOKEN_TTL_DAYS - age_days), 1)
+            if age_days >= GOOGLE_HEALTH_RENEW_WARN_DAYS:
+                needs_renew = True
+    return {
+        "configured": configured,
+        "connected": has_tok and auth_err != "refresh_expired",
+        "has_tokens": has_tok,
+        "needs_renew": needs_renew,
+        "days_until_testing_expiry": days_left,
+        "auth_error": auth_err,
+        "login_hint": (gh.get("GOOGLE_HEALTH_LOGIN_HINT") or "").strip(),
+    }
+
+
 def connector_status_summary(brain: str) -> dict[str, Any]:
-    """Return connection flags for Strava, Hammerhead Karoo, Garmin Connect, and Intervals.icu."""
+    """Return connection flags for Strava, Hammerhead Karoo, Google Health, Garmin Connect, and Intervals.icu."""
     strava = load_secret_env(brain, "strava")
     hh = load_secret_env(brain, "hammerhead")
     garmin = load_secret_env(brain, "garmin")
     icu = load_secret_env(brain, "intervals")
+    gh_st = google_health_token_status(brain)
     return {
         "strava_connected": bool(strava.get("STRAVA_REFRESH_TOKEN") or strava.get("STRAVA_ACCESS_TOKEN")),
         "hammerhead_connected": bool(hh.get("HAMMERHEAD_REFRESH_TOKEN") or hh.get("HAMMERHEAD_ACCESS_TOKEN")),
         "hammerhead_configured": True,
+        "google_health_configured": gh_st["configured"],
+        "google_health_connected": gh_st["connected"],
+        "google_health_needs_renew": gh_st["needs_renew"],
+        "google_health_days_left": gh_st["days_until_testing_expiry"],
+        "google_health_auth_error": gh_st["auth_error"],
         "garmin_connected": bool(garmin.get("GARMIN_TOKENS_B64") or garmin.get("GARMIN_ACCESS_TOKEN")),
         "intervals_connected": bool(icu.get("INTERVALS_API_KEY") and icu.get("INTERVALS_ATHLETE_ID")),
     }
@@ -809,6 +863,891 @@ def intervals_pull_wellness(
             "source": "intervals",
         })
     return out
+
+
+# ---------------------------------------------------------------------------
+# 4B. Google Health API v4 (Dual-Mode PKCE OAuth + Live-Verified REST Puller)
+# ---------------------------------------------------------------------------
+
+def _gh_state_store_path(brain: str) -> str:
+    return os.path.join(brain, "_atlas", "cache", "gh_oauth_states.json")
+
+
+def import_google_health_client_json(brain: str, json_path: str, login_hint: str = "") -> tuple[bool, str]:
+    """Import Google Cloud OAuth Client JSON (`installed` Desktop app or `web`) into `brain/_secrets/google_health.env`."""
+    p_in = os.path.expanduser(str(json_path or "").strip())
+    if not p_in or not os.path.isfile(p_in):
+        return False, f"OAuth client JSON file not found: {p_in}"
+    try:
+        with open(p_in, encoding="utf-8", errors="replace") as fh:
+            raw = json.load(fh)
+        blk = raw.get("installed") or raw.get("web") or raw
+        cid = str(blk.get("client_id") or "").strip()
+        csec = str(blk.get("client_secret") or "").strip()
+        if not (cid and csec):
+            return False, "JSON did not contain `client_id` and `client_secret`."
+    except Exception as exc:
+        return False, f"Failed to parse client JSON: {exc}"
+    env = load_secret_env(brain, "google_health")
+    env["GOOGLE_HEALTH_CLIENT_ID"] = cid
+    env["GOOGLE_HEALTH_CLIENT_SECRET"] = csec
+    if login_hint:
+        env["GOOGLE_HEALTH_LOGIN_HINT"] = login_hint.strip()
+    saved = save_secret_env(brain, "google_health", env)
+    return True, saved
+
+
+def google_health_oauth_config(brain: str, local_redirect_uri: str = "") -> dict[str, Any]:
+    """Resolve Google Health OAuth config (BYO Desktop/Web credentials or optional broker hook)."""
+    env = load_secret_env(brain, "google_health")
+    cid = (env.get("GOOGLE_HEALTH_CLIENT_ID") or os.environ.get("ATLAS_GOOGLE_HEALTH_CLIENT_ID") or "").strip()
+    csec = (env.get("GOOGLE_HEALTH_CLIENT_SECRET") or os.environ.get("ATLAS_GOOGLE_HEALTH_CLIENT_SECRET") or "").strip()
+    broker = (env.get("GOOGLE_HEALTH_BROKER_URL") or os.environ.get("ATLAS_GOOGLE_HEALTH_BROKER_URL") or "").strip()
+    redir = (env.get("GOOGLE_HEALTH_REDIRECT_URI") or os.environ.get("ATLAS_GOOGLE_HEALTH_REDIRECT_URI") or local_redirect_uri).strip()
+    return {
+        "configured": bool((cid and csec) or (cid and broker)),
+        "use_broker": bool(broker and not csec),
+        "client_id": cid,
+        "client_secret": csec,
+        "broker_url": broker,
+        "redirect_uri": redir,
+        "login_hint": (env.get("GOOGLE_HEALTH_LOGIN_HINT") or "").strip(),
+    }
+
+
+def mint_google_health_oauth_state(brain: str, port: int = 8765) -> tuple[str, str, str]:
+    """Mint CSRF state + PKCE (`S256`) `code_verifier` & `code_challenge` with 30-min TTL (`0o600`)."""
+    eff_port = port if 1024 <= int(port) <= 65535 else 8765
+    state = f"atlas:{eff_port}:{secrets.token_urlsafe(20)}"
+    verifier = secrets.token_urlsafe(48)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest()).rstrip(b"=").decode("ascii")
+    p = _gh_state_store_path(brain)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    now_ts = int(time.time())
+    store: dict[str, dict[str, Any]] = {}
+    if os.path.isfile(p):
+        try:
+            with open(p, encoding="utf-8") as fh:
+                raw = json.load(fh)
+            if isinstance(raw, dict):
+                store = {
+                    str(k): v for k, v in raw.items()
+                    if isinstance(v, dict) and now_ts - int(v.get("ts") or 0) < 1800
+                }
+        except Exception:
+            store = {}
+    store[state] = {"ts": now_ts, "verifier": verifier, "port": eff_port}
+    if len(store) > 12:
+        store = dict(sorted(store.items(), key=lambda kv: int(kv[1].get("ts") or 0))[-12:])
+    fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, json.dumps(store).encode("utf-8"))
+    finally:
+        os.close(fd)
+    return state, verifier, challenge
+
+
+def consume_google_health_oauth_state(brain: str, state: str | None) -> tuple[bool, str]:
+    """Verify & consume a previously minted Google Health OAuth state; returns `(ok, code_verifier)`."""
+    cand = str(state or "").strip()
+    if not cand:
+        return False, ""
+    p = _gh_state_store_path(brain)
+    if not os.path.isfile(p):
+        return False, ""
+    now_ts = int(time.time())
+    try:
+        with open(p, encoding="utf-8") as fh:
+            raw = json.load(fh)
+        if not isinstance(raw, dict):
+            return False, ""
+    except Exception:
+        return False, ""
+    matched = False
+    verifier = ""
+    remaining: dict[str, dict[str, Any]] = {}
+    for k, entry in raw.items():
+        if not isinstance(entry, dict):
+            continue
+        if now_ts - int(entry.get("ts") or 0) >= 1800:
+            continue
+        if secrets.compare_digest(str(k), cand):
+            matched = True
+            verifier = str(entry.get("verifier") or "")
+        else:
+            remaining[str(k)] = entry
+    if matched:
+        try:
+            fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.write(fd, json.dumps(remaining).encode("utf-8"))
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
+    return matched, verifier
+
+
+def build_google_health_authorize_url(
+    client_id: str,
+    redirect_uri: str,
+    state: str,
+    code_challenge: str,
+    login_hint: str = "",
+) -> str:
+    params = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": " ".join(GOOGLE_HEALTH_SCOPES),
+        "access_type": "offline",
+        "prompt": "consent",
+        "include_granted_scopes": "true",
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+        "state": state,
+    }
+    if login_hint:
+        params["login_hint"] = login_hint.strip()
+    return f"{GOOGLE_HEALTH_AUTHORIZE_URL}?{urllib.parse.urlencode(params)}"
+
+
+def google_health_exchange_code(
+    brain: str,
+    code: str,
+    redirect_uri: str,
+    code_verifier: str = "",
+    client_id: str | None = None,
+    client_secret: str | None = None,
+) -> tuple[bool, str]:
+    env = load_secret_env(brain, "google_health")
+    cid = (client_id or env.get("GOOGLE_HEALTH_CLIENT_ID") or os.environ.get("ATLAS_GOOGLE_HEALTH_CLIENT_ID") or "").strip()
+    csec = (client_secret or env.get("GOOGLE_HEALTH_CLIENT_SECRET") or os.environ.get("ATLAS_GOOGLE_HEALTH_CLIENT_SECRET") or "").strip()
+    broker = (env.get("GOOGLE_HEALTH_BROKER_URL") or os.environ.get("ATLAS_GOOGLE_HEALTH_BROKER_URL") or "").strip()
+
+    if cid and csec:
+        form = {
+            "grant_type": "authorization_code",
+            "code": code,
+            "client_id": cid,
+            "client_secret": csec,
+            "redirect_uri": redirect_uri,
+        }
+        if code_verifier:
+            form["code_verifier"] = code_verifier
+        req = urllib.request.Request(
+            GOOGLE_HEALTH_TOKEN_URL,
+            data=urllib.parse.urlencode(form).encode("utf-8"),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        )
+    elif broker:
+        body = {"grant_type": "authorization_code", "code": code, "redirect_uri": redirect_uri}
+        if code_verifier:
+            body["code_verifier"] = code_verifier
+        req = urllib.request.Request(
+            broker,
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json", "User-Agent": "AtlasCoach/1.5"},
+            method="POST",
+        )
+    else:
+        return False, "Google Health OAuth client credentials missing in `brain/_secrets/google_health.env`."
+
+    try:
+        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as he:
+        err_t = he.read().decode("utf-8", errors="replace")[:300]
+        return False, f"Google Health OAuth token exchange failed (HTTP {he.code}): {err_t}"
+    except Exception as exc:
+        return False, f"Google Health OAuth token exchange failed: {exc}"
+
+    access = str(data.get("access_token") or "").strip()
+    if not access:
+        return False, "Google Health OAuth response did not include `access_token`."
+    now_ts = int(time.time())
+    if cid:
+        env["GOOGLE_HEALTH_CLIENT_ID"] = cid
+    if csec:
+        env["GOOGLE_HEALTH_CLIENT_SECRET"] = csec
+    env["GOOGLE_HEALTH_ACCESS_TOKEN"] = access
+    if data.get("refresh_token"):
+        env["GOOGLE_HEALTH_REFRESH_TOKEN"] = str(data["refresh_token"]).strip()
+        env["GOOGLE_HEALTH_REFRESH_ISSUED_AT"] = str(now_ts)
+    env["GOOGLE_HEALTH_EXPIRES_AT"] = str(now_ts + int(data.get("expires_in") or 3600))
+    if data.get("scope"):
+        env["GOOGLE_HEALTH_SCOPES"] = str(data["scope"]).strip()
+    env.pop("GOOGLE_HEALTH_AUTH_ERROR", None)
+    p = save_secret_env(brain, "google_health", env)
+    return True, p
+
+
+def google_health_refresh_if_needed(brain: str, env_dict: dict[str, str] | None = None) -> tuple[str, str]:
+    """Return `(access_token, auth_error)` — auto-refreshes expired access tokens and flags Testing-Mode 7d expiry."""
+    env = dict(env_dict) if env_dict is not None else load_secret_env(brain, "google_health")
+    exp = int(env.get("GOOGLE_HEALTH_EXPIRES_AT") or 0)
+    if env.get("GOOGLE_HEALTH_ACCESS_TOKEN") and exp > time.time() + 120:
+        return env["GOOGLE_HEALTH_ACCESS_TOKEN"], ""
+    rtok = (env.get("GOOGLE_HEALTH_REFRESH_TOKEN") or "").strip()
+    if not rtok:
+        return env.get("GOOGLE_HEALTH_ACCESS_TOKEN", ""), ("refresh_expired" if not env.get("GOOGLE_HEALTH_ACCESS_TOKEN") else "")
+    cid = (env.get("GOOGLE_HEALTH_CLIENT_ID") or os.environ.get("ATLAS_GOOGLE_HEALTH_CLIENT_ID") or "").strip()
+    csec = (env.get("GOOGLE_HEALTH_CLIENT_SECRET") or os.environ.get("ATLAS_GOOGLE_HEALTH_CLIENT_SECRET") or "").strip()
+    broker = (env.get("GOOGLE_HEALTH_BROKER_URL") or os.environ.get("ATLAS_GOOGLE_HEALTH_BROKER_URL") or "").strip()
+    if cid and csec:
+        req = urllib.request.Request(
+            GOOGLE_HEALTH_TOKEN_URL,
+            data=urllib.parse.urlencode({
+                "grant_type": "refresh_token",
+                "refresh_token": rtok,
+                "client_id": cid,
+                "client_secret": csec,
+            }).encode("utf-8"),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        )
+    elif broker:
+        req = urllib.request.Request(
+            broker,
+            data=json.dumps({"grant_type": "refresh_token", "refresh_token": rtok}).encode("utf-8"),
+            headers={"Content-Type": "application/json", "User-Agent": "AtlasCoach/1.5"},
+            method="POST",
+        )
+    else:
+        return env.get("GOOGLE_HEALTH_ACCESS_TOKEN", ""), "missing_client_credentials"
+
+    try:
+        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+        if data.get("access_token"):
+            now_ts = int(time.time())
+            env["GOOGLE_HEALTH_ACCESS_TOKEN"] = str(data["access_token"]).strip()
+            if data.get("refresh_token"):
+                env["GOOGLE_HEALTH_REFRESH_TOKEN"] = str(data["refresh_token"]).strip()
+                env["GOOGLE_HEALTH_REFRESH_ISSUED_AT"] = str(now_ts)
+            env["GOOGLE_HEALTH_EXPIRES_AT"] = str(now_ts + int(data.get("expires_in") or 3600))
+            env.pop("GOOGLE_HEALTH_AUTH_ERROR", None)
+            save_secret_env(brain, "google_health", env)
+            return env["GOOGLE_HEALTH_ACCESS_TOKEN"], ""
+    except urllib.error.HTTPError as he:
+        err_body = he.read().decode("utf-8", errors="replace").lower()
+        if he.code in (400, 401) and ("invalid_grant" in err_body or "expired" in err_body or "revoked" in err_body):
+            env["GOOGLE_HEALTH_AUTH_ERROR"] = "refresh_expired"
+            save_secret_env(brain, "google_health", env)
+            return "", "refresh_expired"
+        return "", f"http_{he.code}"
+    except Exception:
+        return "", "network_error"
+    return "", "refresh_failed"
+
+
+def _local_tz_offset_seconds() -> int:
+    try:
+        off = dt.datetime.now().astimezone().utcoffset()
+        return int(off.total_seconds()) if off is not None else 0
+    except Exception:
+        return 0
+
+
+def _gh_api_get(token: str, url: str) -> tuple[int, dict[str, Any]]:
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            return resp.status, (json.loads(raw) if raw.strip().startswith("{") else {})
+    except urllib.error.HTTPError as he:
+        return he.code, {}
+    except Exception:
+        return 0, {}
+
+
+def _gh_api_post(token: str, url: str, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json", "Accept": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            return resp.status, (json.loads(raw) if raw.strip().startswith("{") else {})
+    except urllib.error.HTTPError as he:
+        return he.code, {}
+    except Exception:
+        return 0, {}
+
+
+def _gh_reconcile_all(
+    token: str,
+    data_type: str,
+    filter_expr: str = "",
+    page_size: int = 200,
+    max_pages: int = 20,
+) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    page_token = ""
+    for _ in range(max_pages):
+        params = [f"pageSize={int(page_size)}"]
+        if filter_expr:
+            params.append("filter=" + urllib.parse.quote(filter_expr, safe=""))
+        if page_token:
+            params.append("pageToken=" + urllib.parse.quote(page_token, safe=""))
+        url = f"{GOOGLE_HEALTH_API_BASE}/dataTypes/{data_type}/dataPoints:reconcile?" + "&".join(params)
+        st, payload = _gh_api_get(token, url)
+        if st != 200 or not isinstance(payload, dict):
+            break
+        dps = payload.get("dataPoints")
+        if isinstance(dps, list):
+            out.extend(x for x in dps if isinstance(x, dict))
+        page_token = str(payload.get("nextPageToken") or "").strip()
+        if not page_token:
+            break
+    return out
+
+
+def _gh_rollup_all(
+    token: str,
+    data_type: str,
+    method: str,
+    body: dict[str, Any],
+    max_pages: int = 20,
+) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    page_token = ""
+    for _ in range(max_pages):
+        req_body = dict(body)
+        if page_token:
+            req_body["pageToken"] = page_token
+        url = f"{GOOGLE_HEALTH_API_BASE}/dataTypes/{data_type}/dataPoints:{method}"
+        st, payload = _gh_api_post(token, url, req_body)
+        if st != 200 or not isinstance(payload, dict):
+            break
+        dps = payload.get("rollupDataPoints")
+        if isinstance(dps, list):
+            out.extend(x for x in dps if isinstance(x, dict))
+        page_token = str(payload.get("nextPageToken") or "").strip()
+        if not page_token:
+            break
+    return out
+
+
+def parse_google_health_payloads(
+    raw_bundle: dict[str, Any],
+    intraday_cutoff_iso: str = "",
+    default_utc_offset_s: int | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    """Deterministically parse Google Health API v4 response bundles into canonical daily records + rolling intraday cache.
+
+    Never imports `exercise` activities (Strava stays the single source of truth for workouts).
+    """
+    eff_off_default = _local_tz_offset_seconds() if default_utc_offset_s is None else int(default_utc_offset_s)
+    days: dict[str, dict[str, Any]] = {}
+    intraday: dict[str, dict[str, Any]] = {}
+    day_offsets: dict[str, int] = {}
+
+    def _day(d_iso: str) -> dict[str, Any]:
+        rec = days.get(d_iso)
+        if rec is None:
+            rec = {
+                "date": d_iso,
+                "source": "google_health",
+                "sleep": {},
+                "autonomic": {},
+                "body": {},
+                "daytime_load": {},
+            }
+            days[d_iso] = rec
+        return rec
+
+    def _intra(d_iso: str) -> dict[str, Any]:
+        rec = intraday.get(d_iso)
+        if rec is None:
+            rec = {"date": d_iso, "source": "google_health", "hr_5m": [], "hrv_samples": [], "sleep_stages": []}
+            intraday[d_iso] = rec
+        return rec
+
+    # 1. Sleep sessions (`sleep`) — wake-up civil date attribution, mainSleep vs naps
+    sleep_by_date: dict[str, list[dict[str, Any]]] = {}
+    for dp in raw_bundle.get("sleep") or []:
+        slp = dp.get("sleep") if isinstance(dp, dict) and isinstance(dp.get("sleep"), dict) else (dp if isinstance(dp, dict) else {})
+        iv = slp.get("interval") if isinstance(slp.get("interval"), dict) else {}
+        end_utc_s = iv.get("endTime")
+        start_utc_s = iv.get("startTime")
+        end_off = health_engine.parse_utc_offset_seconds(iv.get("endUtcOffset") or iv.get("startUtcOffset") or eff_off_default)
+        start_off = health_engine.parse_utc_offset_seconds(iv.get("startUtcOffset") or end_off)
+        end_local = health_engine.utc_to_local_iso(end_utc_s, end_off)
+        start_local = health_engine.utc_to_local_iso(start_utc_s, start_off)
+        if not end_local:
+            continue
+        wake_date = end_local[:10]
+        day_offsets[wake_date] = end_off
+        summ = slp.get("summary") if isinstance(slp.get("summary"), dict) else {}
+        asleep_m = health_engine.safe_int(summ.get("minutesAsleep"))
+        period_m = health_engine.safe_int(summ.get("minutesInSleepPeriod"))
+        awake_m = health_engine.safe_int(summ.get("minutesAwake"))
+        stage_mins: dict[str, int] = {}
+        for st_item in (summ.get("stagesSummary") or []):
+            if isinstance(st_item, dict) and st_item.get("type"):
+                m_val = health_engine.safe_int(st_item.get("minutes"))
+                if m_val is not None:
+                    stage_mins[str(st_item["type"]).upper()] = m_val
+        if asleep_m is None and stage_mins:
+            asleep_m = sum(stage_mins.get(k, 0) for k in ("LIGHT", "DEEP", "REM"))
+        if period_m is None and asleep_m is not None:
+            period_m = asleep_m + (awake_m or stage_mins.get("AWAKE", 0))
+        meta = slp.get("metadata") if isinstance(slp.get("metadata"), dict) else {}
+        parsed_slp = {
+            "main": bool(meta.get("mainSleep", True)),
+            "start_utc": start_utc_s,
+            "end_utc": end_utc_s,
+            "start_local": start_local,
+            "end_local": end_local,
+            "utc_offset_s": end_off,
+            "asleep_min": asleep_m,
+            "period_min": period_m,
+            "awake_min": awake_m if awake_m is not None else stage_mins.get("AWAKE"),
+            "light_min": stage_mins.get("LIGHT"),
+            "deep_min": stage_mins.get("DEEP"),
+            "rem_min": stage_mins.get("REM"),
+            "short_awakenings_count": len(slp.get("shortAwakenings") or []) if isinstance(slp.get("shortAwakenings"), list) else None,
+            "stages": slp.get("stages") if isinstance(slp.get("stages"), list) else [],
+        }
+        sleep_by_date.setdefault(wake_date, []).append(parsed_slp)
+
+    for d_iso, sess_list in sleep_by_date.items():
+        sess_list.sort(key=lambda s: (1 if s["main"] else 0, int(s.get("asleep_min") or 0)), reverse=True)
+        main_s = sess_list[0]
+        rec_s = _day(d_iso)["sleep"]
+        asleep_m = main_s.get("asleep_min")
+        period_m = main_s.get("period_min")
+        rec_s.update({
+            "start_utc": main_s["start_utc"],
+            "end_utc": main_s["end_utc"],
+            "start_local": main_s["start_local"],
+            "end_local": main_s["end_local"],
+            "utc_offset_s": main_s["utc_offset_s"],
+            "asleep_min": asleep_m,
+            "period_min": period_m,
+            "awake_min": main_s.get("awake_min"),
+            "light_min": main_s.get("light_min"),
+            "deep_min": main_s.get("deep_min"),
+            "rem_min": main_s.get("rem_min"),
+            "duration_h": round(asleep_m / 60.0, 2) if asleep_m else None,
+            "efficiency_pct": round((asleep_m / period_m) * 100.0, 1) if (asleep_m and period_m and period_m > 0) else None,
+            "short_awakenings_count": main_s.get("short_awakenings_count"),
+        })
+        rec_s["quality"] = health_engine.derive_sleep_quality(rec_s)
+        naps = [
+            {"start_local": x["start_local"], "end_local": x["end_local"], "asleep_min": x["asleep_min"]}
+            for x in sess_list[1:] if x.get("asleep_min")
+        ]
+        if naps:
+            rec_s["naps"] = naps
+        if main_s.get("stages") and (not intraday_cutoff_iso or d_iso >= intraday_cutoff_iso):
+            _intra(d_iso)["utc_offset_s"] = main_s["utc_offset_s"]
+            _intra(d_iso)["sleep_stages"] = [
+                {"start_utc": st_e.get("startTime"), "end_utc": st_e.get("endTime"), "type": st_e.get("type")}
+                for st_e in main_s["stages"]
+                if isinstance(st_e, dict) and st_e.get("startTime")
+            ]
+
+    # 2. Daily Resting Heart Rate (`daily-resting-heart-rate`)
+    for dp in raw_bundle.get("daily_rhr") or []:
+        obj = dp.get("dailyRestingHeartRate") if isinstance(dp, dict) and isinstance(dp.get("dailyRestingHeartRate"), dict) else {}
+        d_iso = health_engine.civil_date_dict_to_iso(obj.get("date"))
+        bpm = health_engine.safe_int(obj.get("beatsPerMinute"))
+        if d_iso and bpm and 25 <= bpm <= 130:
+            _day(d_iso)["autonomic"]["rhr_bpm"] = bpm
+
+    # 3. Daily HRV (`daily-heart-rate-variability`)
+    for dp in raw_bundle.get("daily_hrv") or []:
+        obj = dp.get("dailyHeartRateVariability") if isinstance(dp, dict) and isinstance(dp.get("dailyHeartRateVariability"), dict) else {}
+        d_iso = health_engine.civil_date_dict_to_iso(obj.get("date"))
+        if not d_iso:
+            continue
+        aut = _day(d_iso)["autonomic"]
+        avg_ms = health_engine.safe_float(obj.get("averageHeartRateVariabilityMilliseconds"))
+        deep_ms = health_engine.safe_float(obj.get("deepSleepRootMeanSquareOfSuccessiveDifferencesMilliseconds"))
+        nrem_hr = health_engine.safe_int(obj.get("nonRemHeartRateBeatsPerMinute"))
+        ent = health_engine.safe_float(obj.get("entropy"))
+        if avg_ms is not None and 5.0 <= avg_ms <= 300.0:
+            aut["hrv_rmssd_ms"] = round(avg_ms, 2)
+        if deep_ms is not None and 5.0 <= deep_ms <= 300.0:
+            aut["hrv_deep_rmssd_ms"] = round(deep_ms, 2)
+        if nrem_hr is not None and 25 <= nrem_hr <= 130:
+            aut["hrv_non_rem_hr_bpm"] = nrem_hr
+        if ent is not None:
+            aut["hrv_entropy"] = round(ent, 3)
+
+    # 4. Daily Respiratory Rate (`daily-respiratory-rate`)
+    for dp in raw_bundle.get("daily_resp") or []:
+        obj = dp.get("dailyRespiratoryRate") if isinstance(dp, dict) and isinstance(dp.get("dailyRespiratoryRate"), dict) else {}
+        d_iso = health_engine.civil_date_dict_to_iso(obj.get("date"))
+        brpm = health_engine.safe_float(obj.get("breathsPerMinute"))
+        if d_iso and brpm is not None and 5.0 <= brpm <= 40.0:
+            _day(d_iso)["autonomic"]["resp_rate_brpm"] = round(brpm, 1)
+
+    # 5. Daily Sleep Temperature Derivations (`daily-sleep-temperature-derivations`)
+    for dp in raw_bundle.get("daily_temp") or []:
+        obj = dp.get("dailySleepTemperatureDerivations") if isinstance(dp, dict) and isinstance(dp.get("dailySleepTemperatureDerivations"), dict) else {}
+        d_iso = health_engine.civil_date_dict_to_iso(obj.get("date"))
+        if not d_iso:
+            continue
+        nightly = health_engine.safe_float(obj.get("nightlyTemperatureCelsius"))
+        base_t = health_engine.safe_float(obj.get("baselineTemperatureCelsius"))
+        sd_30 = health_engine.safe_float(obj.get("relativeNightlyStddev30dCelsius"))
+        if nightly is not None and base_t is not None:
+            _day(d_iso)["autonomic"]["skin_temp_delta_c"] = round(nightly - base_t, 2)
+        elif health_engine.safe_float(obj.get("skinTemperatureVariation")) is not None:
+            _day(d_iso)["autonomic"]["skin_temp_delta_c"] = round(float(obj["skinTemperatureVariation"]), 2)
+        if sd_30 is not None:
+            _day(d_iso)["autonomic"]["skin_temp_stddev_30d_c"] = round(sd_30, 2)
+
+    # 6. Daily Oxygen Saturation (`daily-oxygen-saturation`)
+    for dp in raw_bundle.get("daily_spo2") or []:
+        obj = dp.get("dailyOxygenSaturation") if isinstance(dp, dict) and isinstance(dp.get("dailyOxygenSaturation"), dict) else {}
+        d_iso = health_engine.civil_date_dict_to_iso(obj.get("date"))
+        if not d_iso:
+            continue
+        avg_p = health_engine.safe_float(obj.get("averagePercentage"))
+        lo_p = health_engine.safe_float(obj.get("lowerBoundPercentage"))
+        hi_p = health_engine.safe_float(obj.get("upperBoundPercentage"))
+        if avg_p is not None and 70.0 <= avg_p <= 100.0:
+            _day(d_iso)["autonomic"]["spo2_avg_pct"] = round(avg_p, 1)
+        if lo_p is not None and 70.0 <= lo_p <= 100.0:
+            _day(d_iso)["autonomic"]["spo2_min_pct"] = round(lo_p, 1)
+        if hi_p is not None and 70.0 <= hi_p <= 100.0:
+            _day(d_iso)["autonomic"]["spo2_max_pct"] = round(hi_p, 1)
+
+    # 7. Body Composition (`weight`, `body-fat`, `vo2-max`)
+    def _sample_date(st_obj: Any) -> str | None:
+        if not isinstance(st_obj, dict):
+            return None
+        ct = st_obj.get("civilTime")
+        if isinstance(ct, dict):
+            d_c = health_engine.civil_date_dict_to_iso(ct.get("date"))
+            if d_c:
+                return d_c
+        off = health_engine.parse_utc_offset_seconds(st_obj.get("utcOffset") or eff_off_default)
+        loc = health_engine.utc_to_local_iso(st_obj.get("physicalTime"), off)
+        return loc[:10] if loc else None
+
+    for dp in raw_bundle.get("weight") or []:
+        obj = dp.get("weight") if isinstance(dp, dict) and isinstance(dp.get("weight"), dict) else {}
+        d_iso = _sample_date(obj.get("sampleTime"))
+        wg = health_engine.safe_float(obj.get("weightGrams"))
+        if d_iso and wg and 30000.0 <= wg <= 220000.0:
+            _day(d_iso)["body"].setdefault("weight_kg", round(wg / 1000.0, 2))
+
+    for dp in raw_bundle.get("body_fat") or []:
+        obj = dp.get("bodyFat") if isinstance(dp, dict) and isinstance(dp.get("bodyFat"), dict) else {}
+        d_iso = _sample_date(obj.get("sampleTime"))
+        pct = health_engine.safe_float(obj.get("percentage"))
+        if d_iso and pct is not None and 3.0 <= pct <= 55.0:
+            _day(d_iso)["body"].setdefault("body_fat_pct", round(pct, 1))
+
+    for dp in raw_bundle.get("vo2_max") or []:
+        obj = dp.get("vo2Max") if isinstance(dp, dict) and isinstance(dp.get("vo2Max"), dict) else {}
+        d_iso = _sample_date(obj.get("sampleTime"))
+        vm = health_engine.safe_float(obj.get("vo2Max"))
+        if d_iso and vm is not None and 20.0 <= vm <= 100.0:
+            _day(d_iso)["body"].setdefault("vo2max_watch", round(vm, 1))
+
+    # 8. Daily Steps & Active Zone Minutes (`:dailyRollUp`)
+    for dp in raw_bundle.get("steps_daily") or []:
+        if not isinstance(dp, dict):
+            continue
+        cst = dp.get("civilStartTime") if isinstance(dp.get("civilStartTime"), dict) else {}
+        d_iso = health_engine.civil_date_dict_to_iso(cst.get("date"))
+        cnt = health_engine.safe_int((dp.get("steps") or {}).get("countSum"))
+        if d_iso and cnt is not None and cnt >= 0:
+            _day(d_iso)["daytime_load"]["steps_total"] = cnt
+
+    for dp in raw_bundle.get("azm_daily") or []:
+        if not isinstance(dp, dict):
+            continue
+        cst = dp.get("civilStartTime") if isinstance(dp.get("civilStartTime"), dict) else {}
+        d_iso = health_engine.civil_date_dict_to_iso(cst.get("date"))
+        azm = dp.get("activeZoneMinutes") if isinstance(dp.get("activeZoneMinutes"), dict) else {}
+        if not d_iso or not azm:
+            continue
+        fb = health_engine.safe_int(azm.get("sumInFatBurnHeartZone")) or 0
+        ca = health_engine.safe_int(azm.get("sumInCardioHeartZone")) or 0
+        pk = health_engine.safe_int(azm.get("sumInPeakHeartZone")) or 0
+        dl = _day(d_iso)["daytime_load"]
+        dl["azm_fat_burn_min"] = fb
+        dl["azm_cardio_min"] = ca
+        dl["azm_peak_min"] = pk
+        dl["azm_total_min"] = fb + ca + pk
+
+    # 9. Hourly Steps (`steps:rollUp` windowSize=3600s) -> 24-int local `hourly_steps`
+    hourly_buckets: dict[str, list[int]] = {}
+    for dp in raw_bundle.get("steps_hourly") or []:
+        if not isinstance(dp, dict):
+            continue
+        st_u = dp.get("startTime")
+        cnt = health_engine.safe_int((dp.get("steps") or {}).get("countSum"))
+        if not st_u or cnt is None:
+            continue
+        t_utc = health_engine.parse_iso_utc(st_u)
+        if not t_utc:
+            continue
+        approx_d = t_utc.strftime("%Y-%m-%d")
+        off_s = day_offsets.get(approx_d, eff_off_default)
+        loc = health_engine.utc_to_local_iso(t_utc, off_s)
+        if not loc:
+            continue
+        d_iso = loc[:10]
+        hr_i = int(loc[11:13])
+        arr = hourly_buckets.setdefault(d_iso, [0] * 24)
+        arr[hr_i] += max(0, cnt)
+    for d_iso, arr in hourly_buckets.items():
+        if sum(arr) > 0:
+            dl = _day(d_iso)["daytime_load"]
+            dl["hourly_steps"] = arr
+            if dl.get("steps_total") is None:
+                dl["steps_total"] = sum(arr)
+
+    # 10. Intraday 5-Min HR RollUp (`heart-rate:rollUp` windowSize=300s) & 5-Min HRV Samples
+    for dp in raw_bundle.get("hr_5m") or []:
+        if not isinstance(dp, dict):
+            continue
+        st_u = dp.get("startTime")
+        en_u = dp.get("endTime")
+        hr_obj = dp.get("heartRate") if isinstance(dp.get("heartRate"), dict) else {}
+        avg_b = health_engine.safe_float(hr_obj.get("beatsPerMinuteAvg"))
+        if not st_u or avg_b is None:
+            continue
+        t_utc = health_engine.parse_iso_utc(st_u)
+        if not t_utc:
+            continue
+        approx_d = t_utc.strftime("%Y-%m-%d")
+        off_s = day_offsets.get(approx_d, eff_off_default)
+        loc = health_engine.utc_to_local_iso(t_utc, off_s)
+        if not loc:
+            continue
+        d_iso = loc[:10]
+        if intraday_cutoff_iso and d_iso < intraday_cutoff_iso:
+            continue
+        intr = _intra(d_iso)
+        intr["utc_offset_s"] = off_s
+        intr["hr_5m"].append({
+            "start_utc": st_u,
+            "end_utc": en_u,
+            "avg": round(avg_b, 1),
+            "min": health_engine.safe_int(hr_obj.get("beatsPerMinuteMin")),
+            "max": health_engine.safe_int(hr_obj.get("beatsPerMinuteMax")),
+        })
+
+    for dp in raw_bundle.get("hrv_intraday") or []:
+        obj = dp.get("heartRateVariability") if isinstance(dp, dict) and isinstance(dp.get("heartRateVariability"), dict) else {}
+        st_obj = obj.get("sampleTime") if isinstance(obj.get("sampleTime"), dict) else {}
+        rmssd = health_engine.safe_float(obj.get("rootMeanSquareOfSuccessiveDifferencesMilliseconds"))
+        d_iso = _sample_date(st_obj)
+        if not d_iso or rmssd is None:
+            continue
+        if intraday_cutoff_iso and d_iso < intraday_cutoff_iso:
+            continue
+        off_s = health_engine.parse_utc_offset_seconds(st_obj.get("utcOffset") or day_offsets.get(d_iso, eff_off_default))
+        phys = st_obj.get("physicalTime")
+        loc = health_engine.utc_to_local_iso(phys, off_s)
+        meta = obj.get("metadata") if isinstance(obj.get("metadata"), dict) else {}
+        _intra(d_iso)["hrv_samples"].append({
+            "time_utc": phys,
+            "local": loc,
+            "rmssd": round(rmssd, 1),
+            "hf": health_engine.safe_float(meta.get("highFrequencyPower")),
+            "lf": health_engine.safe_float(meta.get("lowFrequencyPower")),
+        })
+
+    for intr in intraday.values():
+        intr["hr_5m"].sort(key=lambda x: str(x.get("start_utc") or ""))
+        intr["hrv_samples"].sort(key=lambda x: str(x.get("time_utc") or ""))
+
+    out_days = sorted(days.values(), key=lambda x: x["date"], reverse=True)
+    return out_days, intraday
+
+
+def google_health_pull_biometrics(
+    brain: str,
+    days: int = 30,
+    intraday_days: int = 30,
+    mock_file: str | None = None,
+    today: dt.date | None = None,
+) -> dict[str, Any]:
+    """Pull Sleep, Autonomics, Body & Daytime NEAT from Google Health API v4 (0 workouts/exercises!)."""
+    ref_today = today or dt.date.today()
+    eff_days = max(1, min(int(days or 30), 730))
+    eff_intra = max(1, min(int(intraday_days or 30), eff_days, 30))
+    start_date = ref_today - dt.timedelta(days=eff_days)
+    start_iso = start_date.isoformat()
+    intra_cutoff = (ref_today - dt.timedelta(days=eff_intra)).isoformat()
+
+    if mock_file and os.path.isfile(mock_file):
+        try:
+            with open(mock_file, encoding="utf-8", errors="replace") as fh:
+                raw_bundle = json.load(fh)
+            parsed_days, parsed_intra = parse_google_health_payloads(
+                raw_bundle if isinstance(raw_bundle, dict) else {},
+                intraday_cutoff_iso=intra_cutoff,
+                default_utc_offset_s=int((raw_bundle or {}).get("default_utc_offset_s", 3600)) if isinstance(raw_bundle, dict) else 3600,
+            )
+            return {"ok": True, "source": "google_health", "days": parsed_days, "intraday": parsed_intra, "auth_error": ""}
+        except Exception as exc:
+            return {"ok": False, "source": "google_health", "days": [], "intraday": {}, "auth_error": str(exc)}
+
+    status = google_health_token_status(brain)
+    if not status["has_tokens"]:
+        return {"ok": False, "source": "google_health", "days": [], "intraday": {}, "auth_error": "not_connected"}
+
+    token, auth_err = google_health_refresh_if_needed(brain)
+    if not token:
+        return {"ok": False, "source": "google_health", "days": [], "intraday": {}, "auth_error": auth_err or "refresh_expired"}
+
+    # 1. Reconciled daily & session streams (fast, paginated cleanly via AIP-160 filters)
+    max_p_daily = max(6, int(eff_days / 80) + 4)
+    raw_bundle: dict[str, Any] = {
+        "sleep": _gh_reconcile_all(token, "sleep", f'sleep.interval.end_time >= "{start_iso}T00:00:00Z"', page_size=100, max_pages=max_p_daily),
+        "daily_rhr": _gh_reconcile_all(token, "daily-resting-heart-rate", f'daily_resting_heart_rate.date >= "{start_iso}"', page_size=200, max_pages=max_p_daily),
+        "daily_hrv": _gh_reconcile_all(token, "daily-heart-rate-variability", f'daily_heart_rate_variability.date >= "{start_iso}"', page_size=200, max_pages=max_p_daily),
+        "daily_resp": _gh_reconcile_all(token, "daily-respiratory-rate", f'daily_respiratory_rate.date >= "{start_iso}"', page_size=200, max_pages=max_p_daily),
+        "daily_temp": _gh_reconcile_all(token, "daily-sleep-temperature-derivations", f'daily_sleep_temperature_derivations.date >= "{start_iso}"', page_size=200, max_pages=max_p_daily),
+        "daily_spo2": _gh_reconcile_all(token, "daily-oxygen-saturation", f'daily_oxygen_saturation.date >= "{start_iso}"', page_size=200, max_pages=max_p_daily),
+        "weight": _gh_reconcile_all(token, "weight", f'weight.sample_time.physical_time >= "{start_iso}T00:00:00Z"', page_size=200, max_pages=6),
+        "body_fat": _gh_reconcile_all(token, "body-fat", f'body_fat.sample_time.physical_time >= "{start_iso}T00:00:00Z"', page_size=200, max_pages=6),
+        "vo2_max": _gh_reconcile_all(token, "vo2-max", f'vo2_max.sample_time.physical_time >= "{start_iso}T00:00:00Z"', page_size=100, max_pages=4),
+        "steps_daily": [],
+        "azm_daily": [],
+        "steps_hourly": [],
+        "hr_5m": [],
+        "hrv_intraday": [],
+    }
+
+    # 2. Chunked `:dailyRollUp` (max 90 days per request) for steps & active-zone-minutes
+    end_excl = ref_today + dt.timedelta(days=1)
+    cur_s = start_date
+    while cur_s < end_excl:
+        cur_e = min(end_excl, cur_s + dt.timedelta(days=85))
+        body_d = {
+            "range": {
+                "start": {"date": {"year": cur_s.year, "month": cur_s.month, "day": cur_s.day}},
+                "end": {"date": {"year": cur_e.year, "month": cur_e.month, "day": cur_e.day}},
+            },
+            "windowSizeDays": 1,
+        }
+        raw_bundle["steps_daily"].extend(_gh_rollup_all(token, "steps", "dailyRollUp", body_d, max_pages=5))
+        raw_bundle["azm_daily"].extend(_gh_rollup_all(token, "active-zone-minutes", "dailyRollUp", body_d, max_pages=5))
+        cur_s = cur_e
+
+    # 3. Hourly steps `:rollUp` (windowSize=3600s, rolling window <= 30d) for permanent pre-workout NEAT
+    now_utc = dt.datetime.now(dt.timezone.utc)
+    intra_start_utc = dt.datetime.combine(ref_today - dt.timedelta(days=eff_intra), dt.time(0, 0), tzinfo=dt.timezone.utc)
+    raw_bundle["steps_hourly"].extend(_gh_rollup_all(token, "steps", "rollUp", {
+        "range": {
+            "startTime": intra_start_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "endTime": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        },
+        "windowSize": "3600s",
+        "pageSize": 1000,
+    }, max_pages=4))
+
+    # 4. 5-Min HR `:rollUp` (max 14 days per request -> 2-3 chunks for 30 days)
+    hr_cur = intra_start_utc
+    while hr_cur < now_utc:
+        hr_end = min(now_utc, hr_cur + dt.timedelta(days=13))
+        raw_bundle["hr_5m"].extend(_gh_rollup_all(token, "heart-rate", "rollUp", {
+            "range": {
+                "startTime": hr_cur.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "endTime": hr_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            },
+            "windowSize": "300s",
+            "pageSize": 1000,
+        }, max_pages=6))
+        hr_cur = hr_end
+
+    # 5. Intraday nocturnal HRV samples (capped to last min(eff_intra, 14) days to keep sync snappy)
+    hrv_cut = (ref_today - dt.timedelta(days=min(eff_intra, 14))).isoformat()
+    raw_bundle["hrv_intraday"] = _gh_reconcile_all(
+        token,
+        "heart-rate-variability",
+        f'heart_rate_variability.sample_time.physical_time >= "{hrv_cut}T00:00:00Z"',
+        page_size=200,
+        max_pages=10,
+    )
+
+    parsed_days, parsed_intra = parse_google_health_payloads(raw_bundle, intraday_cutoff_iso=intra_cutoff)
+    return {"ok": True, "source": "google_health", "days": parsed_days, "intraday": parsed_intra, "auth_error": ""}
+
+
+def pull_all_wellness_into_biometrics(
+    brain: str,
+    store: dict[str, Any],
+    days: int = 30,
+    intraday_days: int = 30,
+    google_health_mock: str | None = None,
+    wellness_mock: str | None = None,
+    execute: bool = True,
+    today: dt.date | None = None,
+) -> dict[str, Any]:
+    """Unified multi-provider wellness sync: Google Health API v4 + Garmin Connect + Intervals.icu -> `biometrics.json` + 30d cache."""
+    ref_today = today or dt.date.today()
+    imported_days = 0
+    providers_used: list[str] = []
+    auth_warnings: list[str] = []
+    intraday_written = 0
+
+    # 1. Google Health API v4 (highest priority wearable provider)
+    gh_status = google_health_token_status(brain)
+    if google_health_mock or gh_status["has_tokens"]:
+        gh_res = google_health_pull_biometrics(
+            brain,
+            days=days,
+            intraday_days=intraday_days,
+            mock_file=google_health_mock,
+            today=ref_today,
+        )
+        if gh_res.get("auth_error") == "refresh_expired":
+            auth_warnings.append("google_health_refresh_expired")
+        if gh_res.get("days"):
+            cnt = health_engine.merge_biometrics_days(store, gh_res["days"], source="google_health")
+            imported_days += cnt
+            providers_used.append("google_health")
+        intraday_map = gh_res.get("intraday") or {}
+        for d_iso, intr in intraday_map.items():
+            if execute:
+                health_engine.save_intraday_day(brain, d_iso, intr)
+                intraday_written += 1
+            day_rec = (store.get("days") or {}).get(d_iso)
+            if isinstance(day_rec, dict):
+                health_engine.extract_intraday_day_features(day_rec, intr)
+
+    # 2. Garmin Connect (or legacy `--wellness-mock`)
+    status = connector_status_summary(brain)
+    if wellness_mock or status.get("garmin_connected"):
+        g_rows = garmin_pull_wellness(brain, days=min(days, 28), mock_file=wellness_mock, today=ref_today)
+        if g_rows:
+            cnt = health_engine.merge_biometrics_days(store, g_rows, source="garmin")
+            imported_days += cnt
+            providers_used.append("garmin")
+
+    # 3. Intervals.icu REST Bridge (runs alongside other providers via field-level merge, never exclusive fallback!)
+    if status.get("intervals_connected") and not wellness_mock:
+        i_rows = intervals_pull_wellness(brain, days=min(days, 90), today=ref_today)
+        if i_rows:
+            cnt = health_engine.merge_biometrics_days(store, i_rows, source="intervals")
+            imported_days += cnt
+            providers_used.append("intervals")
+
+    pruned = health_engine.prune_intraday_cache(brain, keep_days=health_engine.DEFAULT_INTRADAY_RETENTION_DAYS, today=ref_today) if execute else []
+    return {
+        "imported_days": imported_days,
+        "providers": providers_used,
+        "intraday_written": intraday_written,
+        "intraday_pruned": len(pruned),
+        "auth_warnings": auth_warnings,
+    }
 
 
 # ---------------------------------------------------------------------------

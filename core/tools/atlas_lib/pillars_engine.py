@@ -2292,9 +2292,10 @@ def compute_pillar7_and_stage2_readiness(
     today: dt.date | None = None,
     run_k_leg_kn_m: float | None = None,
     run_k_leg_drop_pct: float | None = None,
+    biometric_signals: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Compute `ln RMSSD_7d`, `CV`, `SWC`, Sanders `Q_Strain`/`Q_RPE:PO`, `HRmax` blunting,
-    eccentric running `k_leg` collapse, & 4-Stage Readiness Flag (`GRÜN`/`GELB-A`/`GELB-B`/`ROT`)."""
+    eccentric running `k_leg` collapse, multi-marker `ILLNESS_ALERT`, sleep architecture & 4-Stage Readiness Flag."""
     ref_today = today or dt.date.today()
     cutoff_2d = (ref_today - dt.timedelta(days=2)).isoformat()
     cutoff_7d = (ref_today - dt.timedelta(days=7)).isoformat()
@@ -2390,11 +2391,26 @@ def compute_pillar7_and_stage2_readiness(
     notes_low = str((today_row or {}).get("notes") or "").lower()
     heavy_legs_text = any(w in notes_low for w in ("beine wie beton", "schwere beine", "leere beine", "dead legs", "heavy legs"))
 
+    bio = biometric_signals if isinstance(biometric_signals, dict) else {}
+    illness_alert = bool(bio.get("illness_alert"))
+    illness_markers = list(bio.get("illness_markers") or [])
+    sleep_debt_3d = bio.get("sleep_debt_3d_h")
+    sleep_flags = list(bio.get("sleep_flags") or [])
+    severe_sleep_debt = bool(sleep_debt_3d is not None and float(sleep_debt_3d) >= 5.0)
+    mod_sleep_stress = bool((sleep_debt_3d is not None and float(sleep_debt_3d) >= 3.0) or len(sleep_flags) >= 2)
+
     base_st = base_readiness.get("status", "GREEN")
-    if base_st == "RED" or (fatigue_7d is not None and fatigue_7d >= 5) or hrmax_blunted:
+    if illness_alert or base_st == "RED" or (fatigue_7d is not None and fatigue_7d >= 5) or hrmax_blunted or severe_sleep_debt:
         flag_4 = "ROT"
-        if hrmax_blunted:
+        if illness_alert:
+            directive = (
+                f"Illness / Systemic Stress Early Warning ({len(illness_markers)} objective markers: "
+                f"{', '.join(illness_markers)}): Immediate rest/deload + hydration/CHO; cancel all HIIT."
+            )
+        elif hrmax_blunted:
             directive = "Overreaching / HRmax Ceiling Blunted (overrides green RHR): Immediate 3–5d deload + high CHO availability; cancel all HIIT."
+        elif severe_sleep_debt:
+            directive = f"Severe 3-Day Sleep Debt ({float(sleep_debt_3d):.1f}h): Prioritize sleep recovery today; cancel HIIT."
         else:
             directive = "Overreaching / Red Guardrail: Immediate recovery or 3–5d deload + high CHO availability; cancel all HIIT."
     elif k_leg_collapsed or (leg_pain is not None and leg_pain >= 4) or heavy_legs_text or (latest_q_strain is not None and latest_q_strain >= 8.5):
@@ -2407,9 +2423,12 @@ def compute_pillar7_and_stage2_readiness(
             )
         else:
             directive = f"Peripheral Conflict — Subjective Legs Override Autonomic HRV{myo_note}: postpone HIIT 24–48h; spin easy Z1."
-    elif base_st == "AMBER" or hrv_below_swc:
+    elif base_st == "AMBER" or hrv_below_swc or mod_sleep_stress:
         flag_4 = "GELB-A"
-        directive = "Acute Stimulus Stress: swap today's HIIT for relaxed Zone 1/2 endurance; keep macro block intact."
+        if mod_sleep_stress and not (base_st == "AMBER" or hrv_below_swc):
+            directive = f"Sleep Architecture / Debt Caution ({'; '.join(sleep_flags[:2])}): swap today's HIIT for relaxed Zone 1/2 endurance."
+        else:
+            directive = "Acute Stimulus Stress: swap today's HIIT for relaxed Zone 1/2 endurance; keep macro block intact."
     else:
         flag_4 = "GRÜN"
         directive = "All Systems Clear: execute planned key intervals or progression at full target."
@@ -2433,6 +2452,15 @@ def compute_pillar7_and_stage2_readiness(
         "q_rpe_po": latest_q_rpe_po,
         "leg_pain_today": leg_pain,
         "fatigue_7d": fatigue_7d,
+        "illness_alert": illness_alert,
+        "illness_markers": illness_markers,
+        "sleep_debt_3d_h": sleep_debt_3d,
+        "sleep_flags": sleep_flags,
+        "post_hiit_rebound": bio.get("post_hiit_rebound"),
+        "kfa_drift_advisory": bio.get("kfa_drift_advisory"),
+        "has_wearable_data": bool(bio.get("has_wearable_data")),
+        "latest_wearable_date": bio.get("latest_date"),
+        "latest_wearable": bio.get("latest_summary") or {},
     }
 
 
@@ -2831,11 +2859,23 @@ def query_coach_history(
     months: int = 6,
     sport_filter: str | None = None,
     today: dt.date | None = None,
+    search_query: str | None = None,
+    year: int | None = None,
+    biometrics_store: dict[str, Any] | None = None,
+    limit: int = 80,
 ) -> str:
-    """On-demand multi-month historical query (`atlas.py coach history`) so daily context stays compact."""
+    """On-demand multi-year historical query (`atlas.py coach history`) with name search, year filter & biometrics averages."""
     ref_today = today or dt.date.today()
-    d_end = date_to or ref_today.isoformat()
-    d_start = date_from or (ref_today - dt.timedelta(days=max(7, int(months * 30.5)))).isoformat()
+    q_low = str(search_query or "").strip().lower()
+    if year:
+        d_start = date_from or f"{int(year):04d}-01-01"
+        d_end = date_to or f"{int(year):04d}-12-31"
+    elif q_low and not date_from:
+        d_start = "1970-01-01"
+        d_end = date_to or ref_today.isoformat()
+    else:
+        d_end = date_to or ref_today.isoformat()
+        d_start = date_from or (ref_today - dt.timedelta(days=max(7, int(months * 30.5)))).isoformat()
 
     matched = []
     for a in activities or []:
@@ -2846,8 +2886,12 @@ def query_coach_history(
             continue
         if sport_filter and str(a.get("sport") or "").lower() != sport_filter.lower():
             continue
+        if q_low:
+            hay = f"{a.get('name') or ''} {a.get('feedback') or ''} {a.get('sport') or ''} {ds}".lower()
+            if not all(tok in hay for tok in q_low.split()):
+                continue
         matched.append(a)
-    matched.sort(key=lambda x: str(x.get("date", "")), reverse=True)
+    matched.sort(key=lambda x: (str(x.get("date", "")), str(x.get("start_time_local", ""))), reverse=True)
 
     by_month: dict[str, dict[str, Any]] = {}
     for a in matched:
@@ -2862,20 +2906,60 @@ def query_coach_history(
             b["best_5m"] = max(b["best_5m"], int(pf.get("5m") or 0))
             b["best_20m"] = max(b["best_20m"], int(pf.get("20m") or 0))
 
+    bio_days = biometrics_store.get("days") if isinstance(biometrics_store, dict) and isinstance(biometrics_store.get("days"), dict) else {}
+    bio_by_month: dict[str, dict[str, list[float]]] = {}
+    for bd, brec in bio_days.items():
+        if not (d_start <= bd <= d_end) or not isinstance(brec, dict):
+            continue
+        ym = bd[:7]
+        mb = bio_by_month.setdefault(ym, {"rhr": [], "hrv": [], "sleep": [], "steps": [], "wt": []})
+        aut = brec.get("autonomic") or {}
+        slp = brec.get("sleep") or {}
+        dl = brec.get("daytime_load") or {}
+        bod = brec.get("body") or {}
+        if aut.get("rhr_bpm") is not None:
+            mb["rhr"].append(float(aut["rhr_bpm"]))
+        if aut.get("hrv_rmssd_ms") is not None:
+            mb["hrv"].append(float(aut["hrv_rmssd_ms"]))
+        if slp.get("duration_h") is not None:
+            mb["sleep"].append(float(slp["duration_h"]))
+        if dl.get("steps_total") is not None:
+            mb["steps"].append(float(dl["steps_total"]))
+        if bod.get("weight_kg") is not None:
+            mb["wt"].append(float(bod["weight_kg"]))
+
+    span_lbl = f"{d_start} .. {d_end}" + (f" | search='{search_query}'" if q_low else "")
     lines = [
-        f"=== COACH ON-DEMAND HISTORY ({d_start} .. {d_end} | {len(matched)} sessions) ===",
+        f"=== COACH ON-DEMAND HISTORY ({span_lbl} | {len(matched)} sessions) ===",
         "Monthly Summary:",
     ]
-    for ym, b in sorted(by_month.items(), reverse=True):
+    all_months = sorted(set(by_month.keys()) | (set(bio_by_month.keys()) if not q_low else set()), reverse=True)
+    for ym in all_months:
+        b = by_month.get(ym, {"count": 0, "min": 0, "kj": 0, "above_cp_kj": 0.0, "best_5m": 0, "best_20m": 0})
+        bio_m = bio_by_month.get(ym) or {}
+        bio_parts = []
+        if bio_m.get("rhr"):
+            bio_parts.append(f"RHR {sum(bio_m['rhr'])/len(bio_m['rhr']):.0f}")
+        if bio_m.get("hrv"):
+            bio_parts.append(f"HRV {sum(bio_m['hrv'])/len(bio_m['hrv']):.0f}ms")
+        if bio_m.get("sleep"):
+            bio_parts.append(f"Sleep {sum(bio_m['sleep'])/len(bio_m['sleep']):.1f}h")
+        if bio_m.get("steps"):
+            bio_parts.append(f"Steps {int(round(sum(bio_m['steps'])/len(bio_m['steps'])))}")
+        if bio_m.get("wt"):
+            bio_parts.append(f"Wt {sum(bio_m['wt'])/len(bio_m['wt']):.1f}kg")
+        bio_str = (" | Bio: " + ", ".join(bio_parts)) if bio_parts else ""
         lines.append(
             f"  - {ym}: {b['count']} sessions | {b['min']/60.0:.1f} h | {b['kj']} kJ total ({b['above_cp_kj']:.0f} kJ >CP) | "
-            f"Best 5m={b['best_5m'] or '—'}W, 20m={b['best_20m'] or '—'}W"
+            f"Best 5m={b['best_5m'] or '—'}W, 20m={b['best_20m'] or '—'}W{bio_str}"
         )
-    lines.append("\nMatching Sessions (up to 40):")
-    for a in matched[:40]:
+    eff_lim = max(1, int(limit or 80))
+    lines.append(f"\nMatching Sessions (showing {min(len(matched), eff_lim)}/{len(matched)}):")
+    for a in matched[:eff_lim]:
+        t_bit = f" {str(a['start_time_local'])[11:16]}" if a.get("start_time_local") else ""
         pwr = f"NP {a['np_w']}W (IF {a.get('if', '—')}, {a.get('work_kj', 0)}kJ)" if a.get("np_w") else f"{a.get('distance_km', 0):.1f}km"
         fb = f" | feel: {a['feedback']}" if a.get("feedback") and a.get("feedback") != "pending" else ""
-        lines.append(f"  - {a['date']} [{a.get('sport', 'ride')}] '{a.get('name', 'Session')}' ({a.get('duration_min', 0)}m | {pwr}){fb}")
+        lines.append(f"  - {a['date']}{t_bit} [{a.get('sport', 'ride')}] '{a.get('name', 'Session')}' ({a.get('duration_min', 0)}m | {pwr}){fb}")
     return "\n".join(lines)
 
 
@@ -3068,10 +3152,54 @@ def format_seven_pillar_blocks(telemetry: dict[str, Any], include_actions: bool 
             f"Q_Strain(sRPE/TSS)={p7.get('q_strain_srpe_tss') or '—'} | Q_RPE:PO={p7.get('q_rpe_po') or '—'} | "
             f"Directive: {p7.get('coaching_directive')}"
         )
+        if p7.get("illness_alert"):
+            lines.append(f"  [!] ILLNESS EARLY-WARNING ({len(p7.get('illness_markers') or [])} markers): {', '.join(p7.get('illness_markers') or [])}")
+        if p7.get("has_wearable_data"):
+            lw = p7.get("latest_wearable") or {}
+            w_bits = []
+            if lw.get("sleep_h") is not None:
+                arch = ""
+                if lw.get("deep_min") is not None or lw.get("rem_min") is not None:
+                    arch = f" (Deep {lw.get('deep_min', '—')}m/REM {lw.get('rem_min', '—')}m"
+                    if lw.get("efficiency_pct") is not None:
+                        arch += f", Eff {lw['efficiency_pct']:.0f}%"
+                    if lw.get("hr_nadir_local"):
+                        arch += f", Nadir {lw['hr_nadir_local']}"
+                    arch += ")"
+                w_bits.append(f"Sleep {lw['sleep_h']:.2f}h{arch}")
+            if lw.get("rhr") is not None:
+                w_bits.append(f"RHR {lw['rhr']}")
+            if lw.get("hrv_rmssd") is not None:
+                w_bits.append(f"HRV {lw['hrv_rmssd']}ms")
+            if lw.get("resp_rate_brpm") is not None:
+                w_bits.append(f"Resp {lw['resp_rate_brpm']}/m")
+            if lw.get("skin_temp_delta_c") is not None:
+                w_bits.append(f"Temp {float(lw['skin_temp_delta_c']):+.2f}°C")
+            if lw.get("spo2_avg_pct") is not None:
+                w_bits.append(f"SpO2 {lw['spo2_avg_pct']}%")
+            if lw.get("steps_total") is not None:
+                w_bits.append(f"Steps {lw['steps_total']}")
+            if p7.get("sleep_debt_3d_h") is not None:
+                w_bits.append(f"3dDebt {p7['sleep_debt_3d_h']:.1f}h")
+            reb = p7.get("post_hiit_rebound")
+            if isinstance(reb, dict):
+                w_bits.append(f"Rebound({reb.get('session_date')}: {reb.get('status')})")
+            if w_bits:
+                lines.append(f"  [7B_wearable {p7.get('latest_wearable_date') or 'latest'}] " + " | ".join(w_bits))
+        if p7.get("kfa_drift_advisory"):
+            lines.append(f"  [KFA-Guard] {p7['kfa_drift_advisory']}")
 
     # Individual Dose-Response Model
     if resp_m:
-        sigs = [x for x in (resp_m.get("sleep_sensitivity"), resp_m.get("heavy_load_recovery")) if x]
+        sigs = [
+            x for x in (
+                resp_m.get("sleep_sensitivity"),
+                resp_m.get("heavy_load_recovery"),
+                resp_m.get("late_workout_sleep_impact"),
+                resp_m.get("supra_cp_hrv_response"),
+                resp_m.get("pre_workout_neat_impact"),
+            ) if x
+        ]
         lines.append(
             f"  [dose_response] {resp_m.get('status')}" + (f" -> {'; '.join(sigs)}" if sigs else "")
         )

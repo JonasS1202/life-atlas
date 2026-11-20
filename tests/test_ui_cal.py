@@ -654,7 +654,7 @@ class UiCalUnit(unittest.TestCase):
                     except (OSError, ValueError):
                         pass
                 time.sleep(0.05)
-            self.assertIsNotNone(bound_port, "atlas-cal-v5 server failed /healthz")
+            self.assertIsNotNone(bound_port, "atlas-cal-v6 server failed /healthz")
 
             base_url = f"http://127.0.0.1:{bound_port}"
 

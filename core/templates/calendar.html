@@ -818,6 +818,14 @@ function renderCoachRibbon(coach){
           ? `<span class="tag ok">✓ Karoo verbunden</span>`
           : `<a href="/hammerhead-connect" class="tag" style="background:rgba(250,204,21,0.16);color:#fde047;border:1px solid rgba(250,204,21,0.4);text-decoration:none;cursor:pointer;font-weight:700">💛 Karoo verbinden (1-Klick)</a>`
         }
+        ${(coach.connectors&&coach.connectors.google_health_connected)
+          ? `<span class="tag ok">✓ Google Health</span>`
+          : ((coach.connectors&&coach.connectors.google_health_needs_renew)
+              ? `<a href="/google-health-connect" class="tag med" style="text-decoration:none;cursor:pointer;font-weight:700">💚 Google Health erneuern (1-Klick)</a>`
+              : ((coach.connectors&&coach.connectors.google_health_configured)
+                  ? `<a href="/google-health-connect" class="tag" style="background:rgba(16,185,129,0.16);color:#6ee7b7;border:1px solid rgba(16,185,129,0.4);text-decoration:none;cursor:pointer;font-weight:700">💚 Google Health verbinden (1-Klick)</a>`
+                  : ``))
+        }
         ${(coach.connectors&&coach.connectors.garmin_connected)
           ? `<span class="tag ok">✓ Garmin Wellness &amp; Watch</span>`
           : ``
