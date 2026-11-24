@@ -2,6 +2,12 @@
 
 Written for users: `/atlas-update` shows the sections between the installed and the new version.
 
+## [1.6.1] - 2026-11-24
+
+- **Calendar Sync Patch (`cal_sync.py`):**
+  - Prevented decentralized frontmatter `due:` events pushed into `Atlas Tasks & Fristen` from being echo-pulled into `calendar/README.md` on subsequent incremental `syncToken` pulls (cross-layer `event_links` + `atlas_layer` ownership guard).
+  - Hardened the Smart-Formatter's long-title splitter to only split on ` — ` / ` – ` / `: ` outside open parentheses so parenthetical amounts/notes are never cut mid-clause.
+
 ## [1.6.0] - 2026-11-24
 
 - **Multi-Account Bidirectional Google Calendar 3-Way Sync (`gcal_provider.py`, `cal_sync.py`, `atlas.py`, `atlas_hook.py`, `cal_engine.py`, `calendar.html`, `calendar.md`):**

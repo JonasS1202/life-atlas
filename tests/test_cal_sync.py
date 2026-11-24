@@ -387,6 +387,22 @@ class CalSyncUnit(unittest.TestCase):
             self.assertEqual(te["transparency"], "transparent")
             self.assertIn("Atlas: areas/finance/", te["description"])
 
+        # Regression: second sync receiving those exact `due:` events in tasks delta must NOT echo-pull them into README.md!
+        for te in task_evs:
+            self.fake.deltas.setdefault(("personal", tasks_cid), []).append(te)
+        res_echo = cal_sync.run_sync(self.brain, provider=self.provider, execute=True, today=self.today)
+        self.assertEqual(res_echo["pulled_new"], 0)
+        with open(os.path.join(self.brain, "calendar", "README.md"), encoding="utf-8") as fh:
+            self.assertNotIn("Renew insurance policy", fh.read())
+
+        # Regression: long title with `: ` inside parentheses must NOT truncate inside open parens
+        paren_ev = cal_sync.format_atlas_for_gcal({
+            "rel": "areas/career/job.md", "start": "2026-11-24", "end": "2026-11-24", "time": "",
+            "kind": "deadline", "subkind": "", "status": "open",
+            "what": "November salary payment including bonus (arrives 24th-26th, target: 8,600 EUR gross / 5,023 EUR net, check slip)",
+        }, "d999999", timezone="Europe/Berlin")
+        self.assertEqual(paren_ev["summary"].count("("), paren_ev["summary"].count(")"))
+
         # 3. Primary personal calendar got forced `#sync` birthday + goal, NOT `#local` and NOT default birthday
         prim_evs = list(self.fake.events.get(("personal", "user@example.com"), {}).values())
         prim_sums = {e["summary"] for e in prim_evs}

@@ -780,14 +780,24 @@ def format_atlas_for_gcal(
     clean_title = re.sub(r"\s+", " ", clean_title).strip()
     clean_title = LEADING_SYNC_ICON_RX.sub("", clean_title).strip()
 
-    # Smart-Split very long `[todo]` / `[deadline]` headlines (>110 chars) so Google Calendar stays legible
+    # Smart-Split very long `[todo]` / `[deadline]` headlines (>110 chars) outside parentheses so Google stays legible
     long_detail = ""
     if kind in ("todo", "deadline") and len(clean_title) > 110:
         for sep in (" — ", " – ", ": "):
-            pos = clean_title.find(sep)
-            if 18 <= pos <= 110:
+            start_search = 0
+            found_pos = -1
+            while True:
+                pos = clean_title.find(sep, start_search)
+                if pos == -1 or pos > 110:
+                    break
+                prefix_sub = clean_title[:pos]
+                if pos >= 18 and prefix_sub.count("(") == prefix_sub.count(")"):
+                    found_pos = pos
+                    break
+                start_search = pos + len(sep)
+            if found_pos != -1:
                 long_detail = clean_title
-                clean_title = clean_title[:pos].strip()
+                clean_title = clean_title[:found_pos].strip()
                 break
 
     ico = _kind_icon(kind, subkind)
@@ -970,6 +980,7 @@ def parse_gcal_event(ev: dict[str, Any], default_kind: str = "event") -> dict[st
         "ical_uid": str(ev.get("iCalUID") or ""),
         "etag": str(ev.get("etag") or ""),
         "atlas_uid": str(priv.get("atlas_uid") or ""),
+        "atlas_layer": str(priv.get("atlas_layer") or ""),
         "status_remote": status_remote,
         "status": atlas_status,
         "start": start_date,
@@ -1934,6 +1945,17 @@ def run_sync(
                 md_insertions: list[tuple[str, str]] = []
                 matched_remote_keys: set[tuple[str, str, str]] = set()
                 matched_local_lines: set[int] = set()
+
+                # Never echo-pull events already owned by another layer or by decentralized frontmatter `due:` files!
+                for orow in conn.execute(
+                    "SELECT account_id, calendar_id, gcal_event_id FROM event_links WHERE layer_file != ?",
+                    (rel,),
+                ).fetchall():
+                    matched_remote_keys.add((str(orow["account_id"]), str(orow["calendar_id"]), str(orow["gcal_event_id"])))
+                for rkey, ev in pulled_remote_by_key.items():
+                    ev_owner_layer = str(ev.get("atlas_layer") or "")
+                    if ev_owner_layer and ev_owner_layer != rel and not ev_owner_layer.startswith("calendar/"):
+                        matched_remote_keys.add(rkey)
 
                 # --- B1. Process existing linked events (3-Way Diff) ---
                 for uid, link in list(links_by_uid.items()):
