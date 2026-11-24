@@ -26,6 +26,7 @@ Commands
   probe       run the registered hooks with sample input and check their output
   check       verify the charter: sizes, links, reachability, duplicates, secrets, Git, backup, hooks, registry
   deadlines   list `due:` items; `--ics FILE` writes a calendar file
+  cal         multi-account Google Calendar bidirectional 3-way sync, FreeBusy, Meet/invites & RSVP (`auth`, `discover`, `sync`, `status`, `list`, `show`, `freebusy`, `create`, `rsvp`, `conflicts`)
   todo        quick task triage (`list`, `done`, `skip`, `reopen`, `move --to <date|+Nd>`, `add`)
   ext         inspect update-safe user extensions (`skills/`, `howto/scripts/`, `_secrets/`); `run <cmd>` executes one
   mail        multi-account IMAP mail engine (`accounts`, `folders`, `list`, `read`, `search`, `audit`, plus
@@ -62,7 +63,7 @@ DEFAULT_UPSTREAM = "https://github.com/JonasS1202/life-atlas.git"
 TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if TOOLS_DIR not in sys.path:
     sys.path.insert(0, TOOLS_DIR)
-from atlas_lib import cal_engine, coach_connectors, coach_engine, fit_writer, graph_engine, health_engine
+from atlas_lib import cal_engine, cal_sync, coach_connectors, coach_engine, fit_writer, gcal_provider, graph_engine, health_engine
 
 INSTALLED_BRAIN = os.path.normpath(os.path.join(TOOLS_DIR, "..", ".."))
 HOOK_FILE = os.path.normpath(os.path.join(TOOLS_DIR, "..", "hooks", "atlas_hook.py"))
@@ -1579,6 +1580,16 @@ def cmd_calendar(args):
             say("Applied to brain/calendar/README.md.")
         _open_visual_calendar(hk, hk.load_index(), getattr(args, "open", False), view=req_view)
         return
+    if getattr(args, "sync", False):
+        sres = cal_sync.run_sync(brain, execute=True)
+        if not sres.get("ok"):
+            say(f"cal sync skipped: {sres.get('error')}")
+        else:
+            say(
+                f"cal sync: +{sres['pulled_new']}/~{sres['pulled_updated']}/-{sres['pulled_cancelled']} pulled, "
+                f"+{sres['pushed_new']}/~{sres['pushed_updated']}/-{sres['pushed_deleted']} pushed, "
+                f"{sres['auto_linked']} linked, {sres['open_conflicts']} conflict(s)."
+            )
     idx = hk.load_index()
     if getattr(args, "for_role", None) == "coach":
         all_items = hk.calendar_items(idx, days=365, past_days=14, include_done=True)
@@ -1671,6 +1682,336 @@ def _resolve_todo_target(hk, idx, query, file_rel=None, line_no=None):
     return "calendar/README.md", line_no, clean_q
 
 
+def cmd_cal(args):
+    """Multi-account Google Calendar 3-way sync, FreeBusy, Meet/invites & RSVP CLI."""
+    _root, brain = paths(args)
+    hk = hook_module(brain)
+    action = (getattr(args, "action", None) or "status").lower()
+    as_json = bool(getattr(args, "json", False))
+
+    if action == "auth":
+        acct = gcal_provider.sanitize_account_id(getattr(args, "account", None) or "personal")
+        if getattr(args, "client_json", None):
+            ok, msg = gcal_provider.import_client_json(brain, args.client_json)
+            if not ok:
+                sys.exit(f"cal auth failed: {msg}")
+            say(f"Imported Google OAuth client JSON into {msg}")
+        elif getattr(args, "client_id", None):
+            saved = gcal_provider.save_client_credentials(
+                brain,
+                args.client_id,
+                client_secret=getattr(args, "client_secret", None) or "",
+                broker_url=getattr(args, "broker_url", None) or "",
+            )
+            say(f"Saved Google OAuth client credentials into {saved}")
+        if getattr(args, "login_hint", None):
+            env = gcal_provider.load_gcal_env(brain)
+            env[gcal_provider._acct_key(acct, "LOGIN_HINT")] = str(args.login_hint).strip()
+            gcal_provider.save_gcal_env(brain, env)
+        if getattr(args, "code", None):
+            redir = getattr(args, "redirect_uri", None) or "http://127.0.0.1:8765/gcal-callback"
+            ok, msg = gcal_provider.gcal_exchange_code(
+                brain,
+                acct,
+                args.code,
+                redirect_uri=redir,
+                code_verifier=getattr(args, "verifier", None) or "",
+                client_id=getattr(args, "client_id", None),
+                client_secret=getattr(args, "client_secret", None),
+            )
+            if not ok:
+                sys.exit(f"cal auth failed: {msg}")
+            say(f"Google Calendar account '{acct}' connected: {msg}")
+            return
+        cal_url = hk.render_calendar_html(hk.load_index(), start_server=True)
+        base_url = cal_url.rsplit("/", 1)[0]
+        port_s = base_url.rsplit(":", 1)[-1]
+        port_n = int(port_s) if port_s.isdigit() else 8765
+        local_cb = f"http://127.0.0.1:{port_n}/gcal-callback"
+        cfg = gcal_provider.gcal_oauth_config(brain, account_id=acct, local_redirect_uri=local_cb)
+        if not cfg.get("configured"):
+            say("Google Calendar OAuth client credentials are not configured yet.")
+            say("1. Create an OAuth Desktop-App client in Google Cloud Console (enable Google Calendar API, set Consent Screen to 'In Production' so refresh tokens never expire after 7 days).")
+            say(f"2. Import the downloaded JSON: `atlas.py cal auth --account {acct} --client-json ~/Downloads/client_secret_*.json`")
+            return
+        connect_url = f"{base_url}/gcal-connect?account={acct}"
+        say(f"Connect Google Calendar account '{acct}' (1-Click): [📅 Google Calendar verbinden ({acct})]({connect_url})")
+        if not getattr(args, "no_browser", False):
+            try:
+                if os.name == "nt":
+                    os.startfile(connect_url)
+                elif sys.platform == "darwin":
+                    subprocess.Popen(["open", connect_url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                else:
+                    import webbrowser
+                    webbrowser.open(connect_url)
+            except Exception:
+                pass
+        return
+
+    if action == "discover":
+        res = cal_sync.discover_calendars(brain, execute=bool(getattr(args, "execute", False)))
+        if as_json:
+            say(json.dumps(res, ensure_ascii=False, indent=2))
+            return
+        if not res.get("ok"):
+            sys.exit(f"cal discover: {res.get('error')}")
+        say(f"cal discover ({'applied' if res['applied'] else 'dry-run'}): {len(res['layers'])} layer(s) across {', '.join(res['accounts'])}")
+        for ly in res["layers"]:
+            say(f"  [{ly['mode']:13s}] calendar/{ly['file']:16s}  <- {ly['account']}:{ly['label']} ({ly['calendar_id']})")
+        subs = res.get("subcalendars_created_or_planned") or {}
+        say(f"  Subcalendars: workout={subs.get('workout')} | tasks={subs.get('tasks')}")
+        if res.get("duplicates_skipped"):
+            say(f"  Shared calendar deduplication: {len(res['duplicates_skipped'])} duplicate view(s) skipped automatically.")
+        if res.get("skipped_freebusy_only"):
+            for fb_cal in res["skipped_freebusy_only"]:
+                say(f"  [!] Skipped freeBusy-only calendar '{fb_cal['summary']}' ({fb_cal['calendar_id']}) in '{fb_cal['account']}' — {fb_cal['hint']}")
+        if not res["applied"]:
+            say("Re-run with `--execute` to write `brain/calendar/sync.yaml` and create layer files + subcalendars.")
+        else:
+            hk.render_calendar_html(hk.load_index(), start_server=False)
+        return
+
+    if action == "sync":
+        execute = bool(getattr(args, "execute", False)) and not bool(getattr(args, "dry_run", False))
+        res = cal_sync.run_sync(
+            brain,
+            execute=execute,
+            pull_only=bool(getattr(args, "pull_only", False)),
+            push_only=bool(getattr(args, "push_only", False)),
+            layer_filter=getattr(args, "layer", None) or "",
+            allow_bulk_delete=bool(getattr(args, "allow_bulk_delete", False)),
+        )
+        if execute and res.get("ok"):
+            hk.render_calendar_html(hk.load_index(), start_server=False)
+        if getattr(args, "quiet", False) and not as_json:
+            return
+        if as_json:
+            say(json.dumps(res, ensure_ascii=False, indent=2))
+            return
+        if not res.get("ok"):
+            sys.exit(f"cal sync: {res.get('error')}")
+        mode_s = "applied" if res["applied"] else "dry-run"
+        say(
+            f"cal sync ({mode_s}): "
+            f"pull +{res['pulled_new']}/~{res['pulled_updated']}/-{res['pulled_cancelled']} | "
+            f"push +{res['pushed_new']}/~{res['pushed_updated']}/-{res['pushed_deleted']} | "
+            f"linked={res['auto_linked']} merged={res['smart_merged']} conflicts={res['open_conflicts']}"
+        )
+        for act in res.get("actions", [])[:40]:
+            say(f"  {act}")
+        if len(res.get("actions", [])) > 40:
+            say(f"  ... (+{len(res['actions']) - 40} more)")
+        for w in res.get("warnings", []):
+            say(f"  [!] {w}")
+        if not res["applied"] and res.get("actions"):
+            say("Pass `--execute` to apply these sync actions.")
+        return
+
+    if action == "status":
+        st = cal_sync.get_sync_ui_summary(brain)
+        if as_json:
+            say(json.dumps(st, ensure_ascii=False, indent=2))
+            return
+        say(f"Calendar Sync: {'enabled' if st['enabled'] else ('disabled' if st['configured'] else 'not configured')}")
+        if st["accounts"]:
+            for a in st["accounts"]:
+                s_tag = "connected" if a["connected"] else (a["auth_error"] or "disconnected")
+                say(f"  Account {a['id']}: {a['email'] or '(no email)'} [{s_tag}]")
+        else:
+            say("  Accounts: none (run `atlas.py cal auth --account personal`)")
+        for ly in st["layers"]:
+            say(f"  Layer {ly['id']} ({ly['mode']}): {ly['file']} [{ly['label']}]")
+        if st["last_pull_iso"]:
+            say(f"  Last pull: {st['last_pull_iso']} | Open conflicts: {st['open_conflicts']}")
+        if st["auth_warnings"]:
+            say(f"  [!] Auth renewal needed for: {', '.join(st['auth_warnings'])}")
+        return
+
+    if action == "list":
+        hits = cal_sync.find_event_details(brain, getattr(args, "query", None) or "")
+        today = dt.date.today()
+        days = int(getattr(args, "days", 30) or 30)
+        past = int(getattr(args, "past", 0) or 0)
+        lf = (getattr(args, "layer", None) or "").strip().lower()
+        inc_done = bool(getattr(args, "include_done", False))
+        filtered = []
+        for h in hits:
+            if not inc_done and h["status"] != "open":
+                continue
+            if lf and lf not in h["rel"].lower() and lf != h.get("layer_label", "").lower():
+                continue
+            try:
+                sd = dt.date.fromisoformat(h["start"])
+                ed = dt.date.fromisoformat(h["end"])
+            except ValueError:
+                continue
+            if ed < today - dt.timedelta(days=past) or sd > today + dt.timedelta(days=days):
+                continue
+            filtered.append(h)
+        if as_json:
+            say(json.dumps(filtered, ensure_ascii=False, indent=2))
+            return
+        if not filtered:
+            say("cal list: no matching events.")
+            return
+        for h in filtered:
+            t_s = f"{h['time']} " if h["time"] else ""
+            uid_s = f" [{h['atlas_uid']}]" if h["atlas_uid"] else ""
+            loc_s = f" @ {h['location']}" if h["location"] else ""
+            meet_s = " [Meet]" if h["meet_link"] else ""
+            say(f"  {h['start']} {t_s}[{h['kind']}] {h['what']}{loc_s}{meet_s}{uid_s} ({h['rel']})")
+        return
+
+    if action == "show":
+        q = " ".join(getattr(args, "target", None) or []).strip() or (getattr(args, "query", None) or "")
+        if not q:
+            sys.exit("cal show: pass an event title substring or atlas_uid.")
+        hits = cal_sync.find_event_details(brain, q)
+        if as_json:
+            say(json.dumps(hits[:5], ensure_ascii=False, indent=2))
+            return
+        if not hits:
+            say(f"cal show: no event matching '{q}'.")
+            return
+        for h in hits[:5]:
+            say(f"=== {h['start']}{'..' + h['end'] if h['end'] != h['start'] else ''} {h['time']} [{h['kind']}] {h['what']} ===")
+            say(f"  Source: {h['rel']}:{h['line']} | UID: {h['atlas_uid'] or '(local only)'} | Status: {h['status']}")
+            if h["account_id"]:
+                say(f"  Google: account={h['account_id']} calendar={h['calendar_id']}")
+            if h["location"]:
+                say(f"  Location: {h['location']}")
+            if h["meet_link"]:
+                say(f"  Google Meet: {h['meet_link']}")
+            if h["organizer"]:
+                say(f"  Organizer: {h['organizer']} | My RSVP: {h['self_rsvp'] or '—'}")
+            if h["attendees"]:
+                atts = ", ".join(f"{a.get('name') or a['email']} ({a['status']})" for a in h["attendees"][:12])
+                say(f"  Attendees: {atts}")
+            if h["description"]:
+                say(f"  Description:\n    " + "\n    ".join(h["description"].splitlines()[:15]))
+        return
+
+    if action == "freebusy":
+        res = cal_sync.compute_freebusy(
+            brain,
+            days=int(getattr(args, "days", 7) or 7),
+            start_date_iso=getattr(args, "date", None) or "",
+            work_start_hour=int(getattr(args, "start_hour", 8) or 8),
+            work_end_hour=int(getattr(args, "end_hour", 20) or 20),
+            min_slot_minutes=int(getattr(args, "min_min", 30) or 30),
+            use_remote=not bool(getattr(args, "local_only", False)),
+        )
+        if as_json:
+            say(json.dumps(res, ensure_ascii=False, indent=2))
+            return
+        say(f"FreeBusy ({res['start']} .. {res['end']}, window {res['window']}, min {res['min_slot_minutes']}m):")
+        for day in res["days"]:
+            free_s = ", ".join(f"{s['start']}-{s['end']} ({s['minutes']}m)" for s in day["free"]) or "(fully booked)"
+            busy_s = ", ".join(f"{b['start']}-{b['end']}" for b in day["busy"]) or "none"
+            say(f"  {day['date']}  FREE: {free_s}  | BUSY: {busy_s}")
+        return
+
+    if action == "create":
+        title = (getattr(args, "title", None) or " ".join(getattr(args, "target", None) or [])).strip()
+        date_s = getattr(args, "date", None) or ""
+        if not title or not date_s:
+            sys.exit("cal create: require `--title <text>` and `--date <YYYY-MM-DD|tomorrow|+Nd>`.")
+        target_iso = cal_engine.parse_target_date(date_s)
+        raw_atts = getattr(args, "attendees", None) or ""
+        att_list = [x.strip() for x in raw_atts.split(",") if x.strip()]
+        res = cal_sync.create_event_guarded(
+            brain,
+            title=title,
+            date_iso=target_iso,
+            time_spec=getattr(args, "time", None) or "",
+            account_id=getattr(args, "account", None) or "",
+            calendar_id=getattr(args, "calendar_id", None) or "",
+            layer_id=getattr(args, "layer", None) or "",
+            location=getattr(args, "location", None) or "",
+            description=getattr(args, "description", None) or "",
+            attendees=att_list,
+            add_meet=bool(getattr(args, "meet", False)),
+            kind=getattr(args, "kind", None) or "event",
+            execute=bool(getattr(args, "yes", False) or getattr(args, "execute", False)),
+        )
+        if as_json:
+            say(json.dumps(res, ensure_ascii=False, indent=2))
+            return
+        if not res.get("ok"):
+            sys.exit(f"cal create: {res.get('error')}")
+        if res.get("dry_run"):
+            p = res["preview"]
+            say("SAFETY-GATE PREVIEW (not sent yet — pass `--yes` after user approval):")
+            say(f"  Sender/Account: {p['sender']} ({p['account']}) -> {p['layer_file']}")
+            say(f"  Event: {p['date']} {p['time']} {p['title']}")
+            if p["attendees"]:
+                say(f"  Attendees (email invites): {', '.join(p['attendees'])}")
+            if p["google_meet"]:
+                say("  Google Meet: will generate conference link")
+            if p["location"]:
+                say(f"  Location: {p['location']}")
+            return
+        hk.render_calendar_html(hk.load_index(), start_server=False)
+        say(f"Created event [{res['atlas_uid']}] in {res['layer_file']}: {res['line']}")
+        if res.get("meet_link"):
+            say(f"  Google Meet: {res['meet_link']}")
+        return
+
+    if action == "rsvp":
+        q = " ".join(getattr(args, "target", None) or []).strip() or (getattr(args, "query", None) or "")
+        st_val = getattr(args, "status", None) or ""
+        if not q or not st_val:
+            sys.exit("cal rsvp: pass `<query_or_uid>` and `--status accepted|declined|tentative`.")
+        res = cal_sync.rsvp_event_guarded(
+            brain, q, st_val,
+            execute=bool(getattr(args, "yes", False) or getattr(args, "execute", False)),
+        )
+        if as_json:
+            say(json.dumps(res, ensure_ascii=False, indent=2))
+            return
+        if not res.get("ok"):
+            sys.exit(f"cal rsvp: {res.get('error')}")
+        if res.get("dry_run"):
+            p = res["preview"]
+            say("SAFETY-GATE PREVIEW (not sent yet — pass `--yes` after user approval):")
+            say(f"  Event: {p['date']} {p['time']} {p['title']} [{p['atlas_uid']}]")
+            say(f"  Account: {p['account']} | Organizer: {p['organizer']}")
+            say(f"  RSVP: {p['current_rsvp']} -> {p['new_rsvp']}")
+            return
+        hk.render_calendar_html(hk.load_index(), start_server=False)
+        say(f"RSVP updated to '{res['rsvp']}' for {res['title']} [{res['atlas_uid']}].")
+        return
+
+    if action == "conflicts":
+        if getattr(args, "resolve", None):
+            act = getattr(args, "resolve_action", None) or ""
+            if not act:
+                sys.exit("cal conflicts --resolve <id>: pass `--action link|keep-both|use-atlas|use-google|dismiss`.")
+            res = cal_sync.resolve_conflict(brain, args.resolve, act)
+            if as_json:
+                say(json.dumps(res, ensure_ascii=False, indent=2))
+                return
+            if not res.get("ok"):
+                sys.exit(f"cal conflicts: {res.get('error')}")
+            hk.render_calendar_html(hk.load_index(), start_server=False)
+            say(f"Resolved conflict {args.resolve} via '{act}'.")
+            return
+        confs = cal_sync.list_conflicts(brain)
+        if as_json:
+            say(json.dumps(confs, ensure_ascii=False, indent=2))
+            return
+        if not confs:
+            say("cal conflicts: no open calendar sync conflicts.")
+            return
+        for c in confs:
+            say(f"  [{c['id']}] ({c['kind']}, score={c['score']:.2f}) {c['date_iso']} {c['layer_file']}: {c['summary']}")
+        say("Resolve with: `atlas.py cal conflicts --resolve <id> --action link|keep-both|use-atlas|use-google|dismiss`")
+        return
+
+    sys.exit(f"cal: unknown action '{action}'.")
+
+
 def cmd_todo(args):
     _root, brain = paths(args)
     hk = hook_module(brain)
@@ -1699,6 +2040,7 @@ def cmd_todo(args):
         res = cal_engine.add_todo_in_brain(
             brain, text, target_date_spec=args.to, prio=args.prio or "med",
             kind=getattr(args, "kind", None) or "todo", time_spec=getattr(args, "time", None),
+            layer_file=getattr(args, "cal_layer", None),
         )
         if not res.get("ok"):
             sys.exit(f"todo add failed: {res.get('error')}")
@@ -6072,9 +6414,59 @@ def main():
     p.add_argument("--init", action="store_true", help="harvest existing dates, birthdays and open to-dos into calendar/README.md")
     p.add_argument("--open", action="store_true", help="open the zero-token visual HTML calendar in the browser")
     p.add_argument("--ics", help="export calendar timeline to an .ics file")
+    p.add_argument("--sync", action="store_true", help="run bidirectional Google Calendar sync before rendering")
     p.add_argument("--sync-ics", action="store_true", help="merge upcoming events from settings.md calendar_ics or --ics-source")
     p.add_argument("--ics-source", help="URL or file path of an .ics feed")
     p.add_argument("--execute", action="store_true")
+
+    p = sub.add_parser("cal", help="multi-account Google Calendar sync, FreeBusy, Meet/invites & RSVP")
+    p.add_argument(
+        "action",
+        nargs="?",
+        default="status",
+        choices=("auth", "discover", "sync", "status", "list", "show", "freebusy", "create", "rsvp", "conflicts"),
+        help="calendar sync action (default: status)",
+    )
+    p.add_argument("target", nargs="*", help="query, event uid, or title text")
+    p.add_argument("--account", "-a", help="account id (e.g. personal, work)")
+    p.add_argument("--client-json", help="path to Google Cloud OAuth Desktop-App client_secret_*.json")
+    p.add_argument("--client-id", help="Google OAuth client ID")
+    p.add_argument("--client-secret", help="Google OAuth client secret")
+    p.add_argument("--broker-url", help="optional OAuth token broker URL")
+    p.add_argument("--login-hint", help="optional Google account email hint for OAuth consent")
+    p.add_argument("--code", help="OAuth authorization code (internal loopback callback)")
+    p.add_argument("--redirect-uri", help="OAuth redirect URI (internal loopback callback)")
+    p.add_argument("--verifier", help="PKCE code_verifier (internal loopback callback)")
+    p.add_argument("--no-browser", action="store_true", help="print auth URL without launching browser")
+    p.add_argument("--dry-run", action="store_true", help="preview sync actions without writing")
+    p.add_argument("--execute", action="store_true", help="apply changes")
+    p.add_argument("--yes", action="store_true", help="explicitly confirm safety-gated invite/Meet/RSVP actions")
+    p.add_argument("--pull-only", action="store_true", help="only pull remote deltas into Atlas")
+    p.add_argument("--push-only", action="store_true", help="only push local Atlas changes to Google")
+    p.add_argument("--allow-bulk-delete", action="store_true", help="override bulk-delete circuit breaker (>3 deletes)")
+    p.add_argument("--quiet", action="store_true", help="suppress output on sync")
+    p.add_argument("--layer", help="filter or target calendar layer id/file")
+    p.add_argument("--calendar-id", help="explicit Google calendarId override for `create`")
+    p.add_argument("--query", "-q", help="search filter for `list`/`show`/`rsvp`")
+    p.add_argument("--days", type=int, default=30, help="horizon in days (default: 30; 7 for freebusy)")
+    p.add_argument("--past", type=int, default=0, help="include past N days in `list`")
+    p.add_argument("--include-done", action="store_true", help="include `[x]`/`[-]` items in `list`")
+    p.add_argument("--date", help="date (`YYYY-MM-DD`, `tomorrow`, `+Nd`) for `create` or `freebusy` start")
+    p.add_argument("--time", help="time (`HH:MM` or `HH:MM-HH:MM`) for `create`")
+    p.add_argument("--title", help="event title for `create`")
+    p.add_argument("--location", help="event location for `create`")
+    p.add_argument("--description", help="event description for `create`")
+    p.add_argument("--attendees", help="comma-separated attendee emails for `create` (triggers Safety-Gate)")
+    p.add_argument("--meet", action="store_true", help="generate Google Meet link for `create` (triggers Safety-Gate)")
+    p.add_argument("--kind", default="event", help="Atlas kind for `create` (default: event)")
+    p.add_argument("--status", choices=("accepted", "declined", "tentative"), help="RSVP response status")
+    p.add_argument("--start-hour", type=int, default=8, help="freebusy day window start hour (default: 8)")
+    p.add_argument("--end-hour", type=int, default=20, help="freebusy day window end hour (default: 20)")
+    p.add_argument("--min-min", type=int, default=30, help="minimum free slot duration in minutes (default: 30)")
+    p.add_argument("--local-only", action="store_true", help="compute freebusy strictly from local Brain layers without remote API call")
+    p.add_argument("--resolve", help="conflict ID to resolve")
+    p.add_argument("--action", dest="resolve_action", choices=("link", "keep-both", "use-atlas", "use-google", "dismiss"), help="conflict resolution action")
+    p.add_argument("--json", action="store_true", help="machine-readable JSON output")
 
     p = sub.add_parser("todo", help="quick task triage: list, done, skip, reopen, move, add")
     p.add_argument("action", nargs="?", default="list",
@@ -6084,6 +6476,7 @@ def main():
     p.add_argument("--to", "--date", dest="to", help="target date (`YYYY-MM-DD`, `+3d`, `+1w`, `today`, `tomorrow`) for `move` or `add`")
     p.add_argument("--time", help="optional time (`HH:MM` or `HH:MM-HH:MM`) for dated `add`")
     p.add_argument("--kind", default="todo", help="timeline kind (`todo`, `event`, `deadline`, `blocked`, `goal`) for dated `add` (default: todo)")
+    p.add_argument("--cal", "--layer", dest="cal_layer", help="optional target calendar layer file under `brain/calendar/` (e.g. `work`) for `add`")
     p.add_argument("--prio", choices=("high", "med", "low"), default="med", help="priority for undated `add` (default: med)")
     p.add_argument("--file", help="brain-relative `.md` path (optional when matching by `#number` or text)")
     p.add_argument("--line", type=int, help="1-based line number (`0` for frontmatter `due:`)")
@@ -6250,7 +6643,7 @@ def main():
                 "conflicts": cmd_conflicts,
                 "mark": cmd_mark, "adopt": cmd_adopt, "code-sync": cmd_code_sync,
                 "core-accept": cmd_core_accept, "dev-check": cmd_dev_check, "dev-setup": cmd_dev_setup,
-                "check": cmd_check, "deadlines": cmd_deadlines, "calendar": cmd_calendar, "todo": cmd_todo,
+                "check": cmd_check, "deadlines": cmd_deadlines, "calendar": cmd_calendar, "cal": cmd_cal, "todo": cmd_todo,
                 "coach": cmd_coach, "ext": cmd_ext, "run": cmd_run,
                 "inventory": cmd_inventory, "move": cmd_move, "verify": cmd_verify, "undo": cmd_undo,
                 "core-diff": cmd_core_diff, "state": cmd_state}

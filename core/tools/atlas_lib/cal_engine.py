@@ -2,7 +2,7 @@
 
 Loads `templates/calendar.html`, compiles the zero-token JSON payload (Calendar + Adaptive Coach +
 SQLite Knowledge Graph + CSRF token), safely toggles Markdown checkboxes inside `<BRAIN>/`, and
-manages the loopback `127.0.0.1` HTTP server (`atlas-cal-v6`).
+manages the loopback `127.0.0.1` HTTP server (`atlas-cal-v7`).
 """
 import contextlib
 import datetime as dt
@@ -23,7 +23,7 @@ sys.dont_write_bytecode = True
 
 from atlas_lib import graph_engine
 
-CAL_SERVER_HEALTH_TOKEN = b"atlas-cal-v6"
+CAL_SERVER_HEALTH_TOKEN = b"atlas-cal-v7"
 
 _THREAD_WRITE_LOCK = threading.RLock()
 _CHECKBOX_LINE_RX = re.compile(r"^(\s*(?:[-*+]|\d+\.)?\s*)\[([ xX-])\](\s+.*)$")
@@ -138,6 +138,8 @@ def _node_domain(rel):
 def _norm_todo_compare(text):
     """Normalize Markdown task text for resilient matching when line numbers shift."""
     s = str(text or "")
+    s = re.sub(r"\s*<!--\s*g:[A-Za-z0-9_-]{4,24}\s*-->\s*$", "", s)
+    s = re.sub(r"(?:^|\s)#(?:local|sync)(?=\s|$)", " ", s, flags=re.I)
     s = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", s)
     s = s.replace("**", "").replace("`", "").strip()
     s = re.sub(r"^\d{4}-\d{2}-\d{2}(?:\.\.\d{4}-\d{2}-\d{2})?\s+", "", s)
@@ -643,15 +645,16 @@ def _reschedule_task_in_brain_unlocked(brain, rel, target_date_spec, line_no=Non
     return {"ok": False, "error": "matching task not found", "code": 404}
 
 
-def add_todo_in_brain(brain, text, target_date_spec=None, prio="med", kind="todo", time_spec=None, today=None):
-    """Add a dated `[kind]` item under `## Timeline` or an undated `[prio]` task under `## Open To-Dos` in `calendar/README.md`."""
+def add_todo_in_brain(brain, text, target_date_spec=None, prio="med", kind="todo", time_spec=None, today=None, layer_file=None):
+    """Add a dated `[kind]` item under `## Timeline` or an undated `[prio]` task under `## Open To-Dos` in `calendar/<layer_file>`."""
     with brain_write_lock(brain):
         return _add_todo_in_brain_unlocked(
-            brain, text, target_date_spec=target_date_spec, prio=prio, kind=kind, time_spec=time_spec, today=today
+            brain, text, target_date_spec=target_date_spec, prio=prio, kind=kind,
+            time_spec=time_spec, today=today, layer_file=layer_file,
         )
 
 
-def _add_todo_in_brain_unlocked(brain, text, target_date_spec=None, prio="med", kind="todo", time_spec=None, today=None):
+def _add_todo_in_brain_unlocked(brain, text, target_date_spec=None, prio="med", kind="todo", time_spec=None, today=None, layer_file=None):
     clean = str(text or "").strip()
     if len(clean) < 2:
         return {"ok": False, "error": "task text is empty", "code": 400}
@@ -664,7 +667,26 @@ def _add_todo_in_brain_unlocked(brain, text, target_date_spec=None, prio="med", 
         if not re.match(r"^\d{1,2}:\d{2}(?:-\d{1,2}:\d{2})?$", ts):
             return {"ok": False, "error": f"invalid --time {time_spec!r} (expected HH:MM or HH:MM-HH:MM)", "code": 400}
         t_str = f" {ts}"
-    cal_path, lines, had_nl = _ensure_calendar_readme_lines(brain)
+    target_rel = "calendar/README.md"
+    if layer_file and str(layer_file).strip():
+        lf = os.path.basename(str(layer_file).strip())
+        if not lf.lower().endswith(".md"):
+            lf += ".md"
+        target_rel = f"calendar/{lf}"
+    if target_rel == "calendar/README.md":
+        cal_path, lines, had_nl = _ensure_calendar_readme_lines(brain)
+    else:
+        cal_dir = os.path.join(brain, "calendar")
+        os.makedirs(cal_dir, exist_ok=True)
+        cal_path = os.path.join(cal_dir, os.path.basename(target_rel))
+        if not os.path.isfile(cal_path):
+            lbl = os.path.splitext(os.path.basename(target_rel))[0]
+            base = f"---\nsummary: Calendar layer {lbl}\ntags: [atlas, calendar]\ncal_layer: {lbl}\n---\n# Calendar: {lbl}\n\n## Timeline\n"
+            _atomic_write_text(cal_path, base)
+        with open(cal_path, encoding="utf-8", errors="replace") as fh:
+            raw_c = fh.read()
+        had_nl = raw_c.endswith("\n") or not raw_c
+        lines = raw_c.splitlines()
     if target_date_spec:
         try:
             target_iso = parse_target_date(target_date_spec, today=today)
@@ -675,7 +697,7 @@ def _add_todo_in_brain_unlocked(brain, text, target_date_spec=None, prio="med", 
         w_err = _atomic_write_text(cal_path, "\n".join(lines) + ("\n" if had_nl else "\n"))
         if w_err:
             return {"ok": False, "error": w_err, "code": 500}
-        return {"ok": True, "rel": "calendar/README.md", "line": ln, "date": target_iso, "entry": entry}
+        return {"ok": True, "rel": target_rel, "line": ln, "date": target_iso, "entry": entry}
 
     eff_prio = prio.lower() if str(prio or "").lower() in ("high", "med", "low") else "med"
     entry = f"- [ ] [{eff_prio}] {clean}"
@@ -929,7 +951,7 @@ def build_brain_graph_payload(brain, idx=None, db_path=None, today=None):
     }
 
 
-CAL_SERVER_SCRIPT = """import functools, hmac, http.server, importlib.util, json, os, subprocess, sys, threading, urllib.parse
+CAL_SERVER_SCRIPT = """import functools, hmac, http.server, importlib.util, json, os, subprocess, sys, threading, time, urllib.parse
 sys.dont_write_bytecode = True
 try:
     sys.stdout = sys.stderr = open(os.devnull, "w")
@@ -949,28 +971,102 @@ if TOOLS_DIR not in sys.path:
 
 _TOGGLE_LOCK = threading.Lock()
 _GIT_SYNC_LOCK = threading.Lock()
+_CAL_SYNC_LOCK = threading.Lock()
 
-def _commit_toggle_async(rel_path):
-    if not rel_path or not os.path.isdir(os.path.join(BRAIN_DIR, ".git")):
+def _push_cal_sync_async():
+    if os.environ.get("ATLAS_NO_CAL_SYNC_POLL"):
+        return
+    if not os.path.isfile(os.path.join(BRAIN_DIR, "calendar", "sync.yaml")):
         return
     def _worker():
-        with _GIT_SYNC_LOCK:
+        if not _CAL_SYNC_LOCK.acquire(blocking=False):
+            return
+        try:
+            if os.path.isfile(ATLAS_PY):
+                subprocess.run(
+                    [sys.executable, "-I", "-B", ATLAS_PY, "--root", os.path.dirname(BRAIN_DIR),
+                     "cal", "sync", "--push-only", "--execute", "--quiet"],
+                    capture_output=True, text=True, timeout=25,
+                )
+        except Exception:
+            pass
+        finally:
+            _CAL_SYNC_LOCK.release()
+    threading.Thread(target=_worker, daemon=True).start()
+
+def _start_cal_sync_poller():
+    if os.environ.get("ATLAS_NO_CAL_SYNC_POLL"):
+        return
+    def _loop():
+        while True:
+            poll_min = 10
             try:
-                kw = dict(cwd=BRAIN_DIR, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10)
-                subprocess.run(["git", "add", "--", rel_path], **kw)
-                diff = subprocess.run(["git", "diff", "--cached", "--quiet", "--", rel_path], **kw)
-                if diff.returncode == 0:
-                    return
-                subprocess.run(["git", "commit", "-q", "-m", "atlas: calendar toggle", "--", rel_path], **kw)
-                if os.environ.get("ATLAS_NO_GIT_PUSH"):
-                    return
-                rem = subprocess.run(["git", "remote"], **kw)
-                if rem.returncode == 0 and (rem.stdout or "").strip():
-                    br = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], **kw)
-                    branch = (br.stdout or "").strip() or "main"
-                    subprocess.run(["git", "push", "-q", "-u", "origin", branch], **kw)
+                from atlas_lib import cal_sync as _cs
+                cfg = _cs.load_sync_config(BRAIN_DIR)
+                if cfg and cfg.get("enabled", True):
+                    poll_min = max(2, int((cfg.get("auto_sync") or {}).get("server_poll_minutes") or 10))
+                else:
+                    time.sleep(60)
+                    continue
+            except Exception:
+                time.sleep(60)
+                continue
+            time.sleep(poll_min * 60)
+            if not _CAL_SYNC_LOCK.acquire(blocking=False):
+                continue
+            try:
+                if os.path.isfile(ATLAS_PY) and os.path.isfile(os.path.join(BRAIN_DIR, "calendar", "sync.yaml")):
+                    res = subprocess.run(
+                        [sys.executable, "-I", "-B", ATLAS_PY, "--root", os.path.dirname(BRAIN_DIR),
+                         "cal", "sync", "--execute", "--quiet"],
+                        capture_output=True, text=True, timeout=45,
+                    )
+                    if res.returncode == 0:
+                        _rerender_calendar()
             except Exception:
                 pass
+            finally:
+                _CAL_SYNC_LOCK.release()
+    threading.Thread(target=_loop, daemon=True).start()
+
+_PENDING_GIT_RELS = set()
+_GIT_QUEUE_LOCK = threading.Lock()
+_GIT_WORKER_ACTIVE = False
+
+def _commit_toggle_async(rel_path):
+    global _GIT_WORKER_ACTIVE
+    if not rel_path or not os.path.isdir(os.path.join(BRAIN_DIR, ".git")):
+        return
+    with _GIT_QUEUE_LOCK:
+        _PENDING_GIT_RELS.add(rel_path)
+        if _GIT_WORKER_ACTIVE:
+            return
+        _GIT_WORKER_ACTIVE = True
+    def _worker():
+        global _GIT_WORKER_ACTIVE
+        while True:
+            time.sleep(0.05)
+            with _GIT_QUEUE_LOCK:
+                batch = sorted(_PENDING_GIT_RELS)
+                _PENDING_GIT_RELS.clear()
+                if not batch:
+                    _GIT_WORKER_ACTIVE = False
+                    return
+            with _GIT_SYNC_LOCK:
+                try:
+                    kw = dict(cwd=BRAIN_DIR, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10)
+                    subprocess.run(["git", "add", "--"] + batch, **kw)
+                    diff = subprocess.run(["git", "diff", "--cached", "--quiet", "--"] + batch, **kw)
+                    if diff.returncode != 0:
+                        subprocess.run(["git", "commit", "-q", "-m", "atlas: calendar toggle", "--"] + batch, **kw)
+                        if not os.environ.get("ATLAS_NO_GIT_PUSH"):
+                            rem = subprocess.run(["git", "remote"], **kw)
+                            if rem.returncode == 0 and (rem.stdout or "").strip():
+                                br = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], **kw)
+                                branch = (br.stdout or "").strip() or "main"
+                                subprocess.run(["git", "push", "-q", "-u", "origin", branch], **kw)
+                except Exception:
+                    pass
     threading.Thread(target=_worker, daemon=True).start()
 
 def _get_cid():
@@ -1041,7 +1137,7 @@ class _QuietHandler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/healthz":
-            body = b"atlas-cal-v6"
+            body = b"atlas-cal-v7"
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -1217,6 +1313,89 @@ class _QuietHandler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+        if parsed.path == "/gcal-connect":
+            qs = urllib.parse.parse_qs(parsed.query)
+            acct = (qs.get("account") or ["personal"])[0].strip() or "personal"
+            srv_port = self.server.server_address[1]
+            from atlas_lib import gcal_provider as _gp
+            local_cb = f"http://127.0.0.1:{srv_port}/gcal-callback"
+            cfg = _gp.gcal_oauth_config(BRAIN_DIR, account_id=acct, local_redirect_uri=local_cb)
+            if not cfg.get("configured"):
+                body = (
+                    "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Atlas · Google Calendar Setup</title></head>"
+                    "<body style='font-family:Inter,sans-serif;background:#070a0f;color:#e2e8f0;display:flex;align-items:center;"
+                    "justify-content:center;height:100vh;margin:0'><div style='background:#0d121b;border:1px solid rgba(255,255,255,0.1);"
+                    "padding:32px 40px;border-radius:14px;max-width:560px'><h2 style='margin:0 0 12px;color:#38bdf8'>Google Calendar Sync Setup</h2>"
+                    "<p style='color:#94a3b8;font-size:14px;line-height:1.5'>Import your Google Cloud OAuth Desktop-App JSON once via CLI:<br>"
+                    "<code style='color:#38bdf8'>atlas.py cal auth --account personal --client-json ~/Downloads/client_secret_*.json</code></p>"
+                    "<a href='/calendar.html' style='color:#38bdf8;font-weight:600;text-decoration:none'>&larr; Zurück zum Atlas Kalender</a>"
+                    "</div></body></html>"
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            state, _ver, challenge = _gp.mint_gcal_oauth_state(BRAIN_DIR, account_id=acct, port=srv_port)
+            url = _gp.build_gcal_authorize_url(
+                cfg["client_id"], cfg["redirect_uri"], state=state, code_challenge=challenge, login_hint=cfg.get("login_hint", "")
+            )
+            self.send_response(302)
+            self.send_header("Location", url)
+            self.end_headers()
+            return
+        if parsed.path == "/gcal-callback":
+            qs = urllib.parse.parse_qs(parsed.query)
+            code = (qs.get("code") or [None])[0]
+            state = (qs.get("state") or [None])[0]
+            srv_port = self.server.server_address[1]
+            local_cb = f"http://127.0.0.1:{srv_port}/gcal-callback"
+            from atlas_lib import gcal_provider as _gp
+            state_ok, acct_id, verifier = _gp.consume_gcal_oauth_state(BRAIN_DIR, state)
+            ok = False
+            if code and state_ok and os.path.isfile(ATLAS_PY):
+                cmd_gc = [
+                    sys.executable, "-I", "-B", ATLAS_PY, "--root", os.path.dirname(BRAIN_DIR),
+                    "cal", "auth", "--account", acct_id or "personal", "--code", code,
+                    "--redirect-uri", local_cb, "--execute",
+                ]
+                if verifier:
+                    cmd_gc += ["--verifier", verifier]
+                res = subprocess.run(cmd_gc, capture_output=True, text=True, timeout=60)
+                ok = res.returncode == 0
+                if ok:
+                    _rerender_calendar()
+            msg = f"&#10003; Google Calendar ({acct_id}) erfolgreich verbunden!" if ok else "Google-Calendar-Verbindung fehlgeschlagen oder abgebrochen."
+            col = "#34d399" if ok else "#f43f5e"
+            body = (
+                f"<!DOCTYPE html><html><head><meta charset='utf-8'><title>Atlas · Google Calendar Connect</title></head>"
+                f"<body style='font-family:Inter,sans-serif;background:#070a0f;color:{col};display:flex;align-items:center;"
+                f"justify-content:center;height:100vh;margin:0'><div style='background:#0d121b;border:1px solid rgba(255,255,255,0.1);"
+                f"padding:32px 40px;border-radius:14px;text-align:center;max-width:480px'><h2 style='margin:0 0 12px'>{msg}</h2>"
+                f"<p style='color:#94a3b8;font-size:14px;margin:0 0 18px'>Du kannst diesen Tab schließen und zurück in den Chat wechseln.</p>"
+                f"<a href='/calendar.html' style='color:#38bdf8;font-weight:600;text-decoration:none'>Zum Atlas Kalender &rarr;</a>"
+                f"</div></body></html>"
+            ).encode("utf-8")
+            self.send_response(200 if ok else 400)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if parsed.path == "/cal-sync":
+            if os.path.isfile(ATLAS_PY):
+                with _CAL_SYNC_LOCK:
+                    subprocess.run(
+                        [sys.executable, "-I", "-B", ATLAS_PY, "--root", os.path.dirname(BRAIN_DIR),
+                         "cal", "sync", "--execute", "--quiet"],
+                        capture_output=True, text=True, timeout=60,
+                    )
+                    _rerender_calendar()
+            self.send_response(302)
+            self.send_header("Location", "/calendar.html")
+            self.end_headers()
+            return
         return super().do_GET()
 
     def do_POST(self):
@@ -1278,6 +1457,7 @@ class _QuietHandler(http.server.SimpleHTTPRequestHandler):
                 return
             _rerender_calendar()
         _commit_toggle_async(res.get("rel"))
+        _push_cal_sync_async()
         self._send_json(200, {k: v for k, v in res.items() if k != "code"})
 
 handler = functools.partial(_QuietHandler, directory=CACHE_DIR)
@@ -1288,12 +1468,13 @@ try:
         _pf.write(str(srv.server_address[1]))
 except OSError:
     pass
+_start_cal_sync_poller()
 srv.serve_forever()
 """
 
 
 def cal_http_ok(port):
-    """Verify the calendar server returns HTTP 200 on `/healthz` with `atlas-cal-v6`."""
+    """Verify the calendar server returns HTTP 200 on `/healthz` with `atlas-cal-v7`."""
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=0.25) as resp:
             return resp.status == 200 and CAL_SERVER_HEALTH_TOKEN in resp.read()

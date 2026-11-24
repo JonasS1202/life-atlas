@@ -1067,6 +1067,7 @@ from test_coach_physics import (  # noqa: E402,F401
     TestBlock5RunningBridgeRedsAndReadinessOverrides,
 )
 from test_ui_cal import UiCalUnit  # noqa: E402,F401
+from test_cal_sync import CalSyncUnit  # noqa: E402,F401
 
 
 class WikiGraph(AtlasCase):

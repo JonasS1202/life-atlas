@@ -181,6 +181,21 @@ body{background-image:radial-gradient(ellipse 80% 35% at 50% -10%,rgba(56,189,24
 .pill.todo-done{border-left-color:#10b981;background:rgba(16,185,129,0.09);color:#94a3b8;text-decoration:line-through}
 .pill.birthday{border-left-color:var(--bday);background:var(--bday-bg);color:var(--bday-tx)}
 
+/* Sync & Multi-Layer Bar */
+.sync-bar{display:none;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px;padding:7px 12px;background:rgba(13,18,27,0.75);border:1px solid var(--border);border-radius:10px;font-size:.73rem}
+.sync-bar.show{display:flex}
+.layer-chips{display:flex;flex-wrap:wrap;align-items:center;gap:6px}
+.layer-chip{display:inline-flex;align-items:center;gap:6px;padding:3px 9px;border-radius:99px;background:var(--surface-2);border:1px solid var(--border);color:var(--text-dim);font-size:.71rem;font-weight:600;cursor:pointer;transition:all .12s ease}
+.layer-chip.active{background:rgba(56,189,248,0.12);border-color:var(--border-hi);color:var(--text)}
+.layer-chip.dim{opacity:.42}
+.layer-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.layer-ro{font-size:.58rem;padding:0 4px;border-radius:3px;background:rgba(148,163,184,0.18);color:var(--muted-hi)}
+.sync-meta-grp{display:flex;flex-wrap:wrap;align-items:center;gap:7px}
+.sync-btn{display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:7px;background:rgba(56,189,248,0.14);border:1px solid rgba(56,189,248,0.35);color:var(--accent);font-size:.71rem;font-weight:700;text-decoration:none;cursor:pointer}
+.sync-btn:hover{filter:brightness(1.15)}
+.meet-btn{display:inline-flex;align-items:center;gap:6px;padding:6px 11px;border-radius:7px;background:rgba(16,185,129,0.16);border:1px solid rgba(16,185,129,0.42);color:#6ee7b7;font-size:.78rem;font-weight:700;text-decoration:none}
+.meet-btn:hover{filter:brightness(1.15)}
+
 /* Week View */
 .week-list{display:flex;flex-direction:column}
 .wday-row{display:grid;grid-template-columns:130px minmax(0,1fr);border-bottom:1px solid var(--border);min-height:76px;transition:background .12s}
@@ -288,6 +303,8 @@ body{background-image:radial-gradient(ellipse 80% 35% at 50% -10%,rgba(56,189,24
     </div>
   </header>
 
+  <section id="layer-bar" class="sync-bar"></section>
+
   <section id="coach-ribbon" class="coach-ribbon"></section>
 
   <section class="kpi-strip" id="kpi-strip"></section>
@@ -339,6 +356,7 @@ if(!["all","coach","todo","graph"].includes(filter)) filter = "all";
 let layout = sessionStorage.getItem("atlas_cal_layout") || "month";
 let query = "";
 let pcurveTab = "epochs"; // 'epochs' | 'durability'
+let hiddenLayers = new Set();
 
 // Brain Graph state
 let graphDomainFilter = "all"; // 'all'|'people'|'areas'|'projects'|'howto'|'isolated'|'stale'
@@ -399,12 +417,56 @@ function isTodoItem(it){
 function keepItem(it){
   if(filter==='coach' && !isCoachItem(it)) return false;
   if(filter==='todo' && !isTodoItem(it)) return false;
+  if(hiddenLayers.size && it.layer && hiddenLayers.has(it.layer)) return false;
   if(query){
     const q = query.toLowerCase();
-    const hay = `${it.what} ${it.kind} ${it.subkind||''} ${it.rel||''} ${it.start}`.toLowerCase();
+    const hay = `${it.what} ${it.kind} ${it.subkind||''} ${it.rel||''} ${it.layer_label||''} ${it.location||''} ${it.start}`.toLowerCase();
     if(!hay.includes(q)) return false;
   }
   return true;
+}
+function toggleLayerFilter(lid){
+  if(lid === '__all__'){ hiddenLayers.clear(); }
+  else if(hiddenLayers.has(lid)){ hiddenLayers.delete(lid); }
+  else { hiddenLayers.add(lid); }
+  render();
+}
+function renderLayerBar(){
+  const el = document.getElementById('layer-bar');
+  if(!el) return;
+  const cs = DATA.cal_sync || {};
+  const layersMap = new Map();
+  for(const ly of (cs.layers || [])){
+    layersMap.set(ly.id, {id: ly.id, label: ly.label || ly.id, color: ly.color || '#38bdf8', mode: ly.mode || 'bidirectional'});
+  }
+  for(const it of (DATA.items || [])){
+    if(it.layer && !layersMap.has(it.layer)){
+      layersMap.set(it.layer, {id: it.layer, label: it.layer_label || it.layer, color: it.layer_color || '#38bdf8', mode: it.layer_mode || 'bidirectional'});
+    }
+  }
+  const layers = Array.from(layersMap.values());
+  if(!cs.enabled && layers.length <= 1){
+    el.className = 'sync-bar';
+    el.innerHTML = '';
+    return;
+  }
+  const chips = layers.map(ly => {
+    const active = !hiddenLayers.has(ly.id);
+    const roBit = ly.mode === 'read-only' ? `<span class="layer-ro">RO</span>` : '';
+    return `<button class="layer-chip ${active?'active':'dim'}" onclick="toggleLayerFilter('${esc(ly.id)}')" title="Layer ein-/ausblenden"><span class="layer-dot" style="background:${esc(ly.color)}"></span>${esc(ly.label)}${roBit}</button>`;
+  }).join('');
+  const allChip = hiddenLayers.size ? `<button class="layer-chip" onclick="toggleLayerFilter('__all__')">Alle einblenden</button>` : '';
+  let syncHtml = '';
+  if(cs.enabled){
+    const lastTxt = cs.last_pull_iso ? `Sync: ${esc(cs.last_pull_iso)}` : 'Sync aktiv';
+    const confBit = cs.open_conflicts ? `<span class="tag med" title="Offene Duplikat-/Konflikt-Kandidaten (atlas.py cal conflicts)">⚠ ${cs.open_conflicts} Konflikt(e)</span>` : '';
+    const authBit = (cs.auth_warnings && cs.auth_warnings.length)
+      ? `<a class="tag overdue" href="/gcal-connect?account=${encodeURIComponent(cs.auth_warnings[0])}" style="text-decoration:none">🔑 Re-Auth (${esc(cs.auth_warnings.join(', '))})</a>`
+      : '';
+    syncHtml = `<div class="sync-meta-grp"><span class="tag ok">☁ ${lastTxt}</span>${confBit}${authBit}<a href="/cal-sync" class="sync-btn" title="Jetzt bidirektional mit Google Calendar synchronisieren">🔄 Sync</a></div>`;
+  }
+  el.className = 'sync-bar show';
+  el.innerHTML = `<div class="layer-chips"><span style="color:var(--muted-hi);font-weight:700;font-size:.68rem;text-transform:uppercase;letter-spacing:.04em">Layer:</span>${chips}${allChip}</div>${syncHtml}`;
 }
 function pillClass(it){
   if(it.kind==='workout') return 'pill workout-' + it.status;
@@ -587,6 +649,9 @@ function showItemModal(idx){
     <span class="tag">${esc(fmtDateDE(it.start))}${it.end!==it.start?' – '+esc(fmtDateDE(it.end)):''} · KW ${kw}</span>
     ${it.time?`<span class="tag">🕒 ${esc(it.time)}</span>`:''}
     <span class="tag ${it.delta<0 && it.status!=='done'?'overdue':'ok'}">${esc(deltaLabel(it.delta))} (${(it.delta/7).toFixed(1)}w)</span>
+    ${it.layer_label?`<span class="tag" style="border-left:3px solid ${esc(it.layer_color||'#38bdf8')}">${esc(it.layer_label)}${it.layer_mode==='read-only'?' · RO':''}</span>`:''}
+    ${it.local_only?`<span class="tag">🔒 Nur lokal (#local)</span>`:(it.synced?`<span class="tag ok">☁ Google Sync${it.account_id?' ('+esc(it.account_id)+')':''}</span>`:'')}
+    ${it.self_rsvp?`<span class="tag">RSVP: ${esc(it.self_rsvp)}</span>`:''}
     ${mode!=='simple' && it.np_w?`<span class="tag ok">⚡ NP ${it.np_w} W</span>`:''}
     ${mode!=='simple' && it.avg_hr?`<span class="tag">❤️ ${it.avg_hr} bpm</span>`:''}
     ${mode!=='simple' && it.tss?`<span class="tag low">📈 TSS ${Math.round(it.tss)}</span>`:''}
@@ -595,6 +660,19 @@ function showItemModal(idx){
     ${mode!=='simple' && it.cho_burn_g?`<span class="tag">🍌 ${Math.round(it.cho_burn_g)}g CHO</span>`:''}
   `;
   let extra = '';
+  if(it.location){
+    extra += `<div><strong>📍 Ort:</strong> ${esc(it.location)}</div>`;
+  }
+  if(it.meet_link){
+    extra += `<div style="margin-top:4px"><a class="meet-btn" href="${esc(it.meet_link)}" target="_blank" rel="noopener">🎥 Google Meet beitreten</a></div>`;
+  }
+  if(it.attendees && it.attendees.length){
+    const atts = it.attendees.slice(0, 12).map(a => `<span class="tag">${esc(a.name||a.email)} (${esc(a.status||'')})</span>`).join(' ');
+    extra += `<div><strong>👥 Teilnehmer (${it.attendees.length}):</strong><div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:4px">${atts}</div></div>`;
+  }
+  if(it.description && it.description.trim() !== String(it.what||'').trim()){
+    extra += `<div><strong>📝 Google-Details:</strong><div class="ctx-snip" style="white-space:pre-wrap;max-height:180px;overflow-y:auto">${esc(it.description)}</div></div>`;
+  }
   if(mode!=='simple' && it.visual_blocks && it.visual_blocks.length){
     extra += `<div><strong>Intervall-Struktur (${it.total_min||0} min):</strong>${renderWkoBars(it, true)}</div>`;
   }
@@ -850,6 +928,7 @@ function renderKPIs(){
   document.getElementById('brand-ico').textContent = filter==='graph' ? '🕸️' : (filter==='coach' ? '🚴' : '📅');
 
   const coach = DATA.coach || {metrics:[], macro_goals:[], schedule:''};
+  renderLayerBar();
   renderCoachRibbon(coach);
 
   const kpiEl = document.getElementById('kpi-strip');
@@ -1710,12 +1789,14 @@ function renderMain(){
         const cbInline = (it.can_toggle && it.kind==='todo')
           ? `<button class="cb-btn ${it.status==='done'?'done':''}" style="width:14px;height:14px;font-size:.58rem" onclick="toggleDatedItem(${idx}, event)" title="To-Do abhaken">${it.status==='done'?'✓':''}</button>`
           : `<span class="pill-ico">${icon(it)}</span>`;
-        html += `<div class="${pillClass(it)}" onclick="event.stopPropagation();showItemModal(${idx})" title="${esc(it.what)} (${esc(it.rel)})">
+        const layerStyle = (it.layer_color && it.rel && it.rel !== 'calendar/README.md') ? ` style="border-left-color:${esc(it.layer_color)}"` : '';
+        const localBit = it.local_only ? `<span title="Nur lokal (#local)" style="font-size:.6rem;opacity:.8">🔒</span>` : '';
+        html += `<div class="${pillClass(it)}"${layerStyle} onclick="event.stopPropagation();showItemModal(${idx})" title="${esc(it.what)} (${esc(it.rel)})">
           <div class="pill-top">
             ${cbInline}
             ${it.time?`<span class="pill-time">${esc(it.time)}</span>`:''}
             <span class="pill-txt">${esc(c.main)}${esc(spanInfo)}</span>
-            ${fbBadge}
+            ${localBit}${fbBadge}
           </div>
           ${rideMeta?`<div class="pill-meta">${esc(rideMeta)}</div>`:''}
           ${it.kind==='workout' ? renderWkoBars(it, false) : ''}

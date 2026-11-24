@@ -39,7 +39,7 @@ sys.dont_write_bytecode = True
 _TOOLS_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools"))
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
-from atlas_lib import cal_engine, coach_connectors, coach_engine, graph_engine, health_engine
+from atlas_lib import cal_engine, cal_sync, coach_connectors, coach_engine, graph_engine, health_engine
 
 BRAIN = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 PROBE = bool(os.environ.get("ATLAS_PROBE"))  # set by `atlas.py probe`: run, but change nothing
@@ -419,7 +419,8 @@ def _next_yearly(month, day, today):
 
 
 def _parse_cal_line(raw, rel, today, default_kind="deadline"):
-    m = DATE_ITEM.match(raw)
+    no_id, sync_id = cal_sync.strip_sync_comment(raw)
+    m = DATE_ITEM.match(no_id)
     if not m:
         return None
     box = (m.group(1) or "").strip().lower()
@@ -444,7 +445,13 @@ def _parse_cal_line(raw, rel, today, default_kind="deadline"):
         kind, subkind = "birthday", "anniversary"
     elif d2_str and re.search(r"\b(urlaub|dienstreise|trainingslager|reise|blocked)\b", rest, re.I):
         kind = "blocked"
-    yearly = bool(re.match(r"^\s*(?:-\s*)?(?:\[[ xX-]\]\s*)?(?:yearly\s+|--)", raw, re.I)) or len(d1_str) == 5 or kind == "birthday"
+    is_local = bool(cal_sync.LOCAL_FLAG_RX.search(rest))
+    force_sync = bool(cal_sync.FORCE_SYNC_FLAG_RX.search(rest))
+    if is_local or force_sync:
+        rest = cal_sync.LOCAL_FLAG_RX.sub(" ", rest)
+        rest = cal_sync.FORCE_SYNC_FLAG_RX.sub(" ", rest)
+        rest = re.sub(r"\s+", " ", rest).strip()
+    yearly = bool(re.match(r"^\s*(?:-\s*)?(?:\[[ xX-]\]\s*)?(?:yearly\s+|--)", no_id, re.I)) or len(d1_str) == 5 or kind == "birthday"
     try:
         if len(d1_str) == 5:
             mm, dd = map(int, d1_str.split("-"))
@@ -464,7 +471,8 @@ def _parse_cal_line(raw, rel, today, default_kind="deadline"):
         end = start
     delta = 0 if start <= today <= end else ((start - today).days if start > today else (end - today).days)
     return {"start": start, "end": end, "delta": delta, "status": status, "time": t_str,
-            "kind": kind, "subkind": subkind, "what": rest, "rel": rel, "yearly": yearly}
+            "kind": kind, "subkind": subkind, "what": rest, "rel": rel, "yearly": yearly,
+            "sync_id": sync_id, "local_only": is_local, "force_sync": force_sync}
 
 
 def _is_dup_cal_item(candidate, existing_items):
@@ -522,13 +530,30 @@ def calendar_items(idx, days=30, past_days=3650, include_done=False):
                 continue
             in_fm = False
             in_fence = False
+            fm_layer = os.path.splitext(fn)[0].lower()
+            fm_label = "Personal" if fn.lower() == "readme.md" else os.path.splitext(fn)[0]
+            fm_color = ""
+            fm_mode = "bidirectional"
             for i, line in enumerate(lines):
                 if i == 0 and line.strip() == "---":
                     in_fm = True
                     continue
                 if in_fm:
-                    if line.strip() in ("---", "..."):
+                    st_l = line.strip()
+                    if st_l in ("---", "..."):
                         in_fm = False
+                    elif ":" in st_l:
+                        fk, fv = st_l.split(":", 1)
+                        fk = fk.strip().lower()
+                        fv = fv.strip().strip("\"'")
+                        if fk == "cal_layer" and fv:
+                            fm_layer = fv.lower()
+                        elif fk == "cal_label" and fv:
+                            fm_label = fv
+                        elif fk == "cal_color" and fv:
+                            fm_color = fv
+                        elif fk == "cal_mode" and fv:
+                            fm_mode = fv.lower()
                     continue
                 if re.match(r"^\s*(`{3,}|~{3,})", line):
                     in_fence = not in_fence
@@ -539,7 +564,12 @@ def calendar_items(idx, days=30, past_days=3650, include_done=False):
                 if not item:
                     continue
                 item["line"] = i + 1
-                item["can_toggle"] = bool(re.match(r"^\s*(?:[-*+]|\d+\.)?\s*\[[ xX-]\]\s+", line))
+                item["layer"] = fm_layer
+                item["layer_label"] = fm_label
+                if fm_color:
+                    item["layer_color"] = fm_color
+                item["layer_mode"] = fm_mode
+                item["can_toggle"] = (fm_mode != "read-only") and bool(re.match(r"^\s*(?:[-*+]|\d+\.)?\s*\[[ xX-]\]\s+", line))
                 if not include_done and item["status"] != "open":
                     continue
                 if -past_days <= item["delta"] <= days and not _is_dup_cal_item(item, items):
@@ -1676,7 +1706,7 @@ CAL_SERVER_SCRIPT = cal_engine.CAL_SERVER_SCRIPT
 
 
 def _cal_http_ok(port):
-    """Verify the calendar server returns HTTP 200 on `/healthz` (`atlas-cal-v6`)."""
+    """Verify the calendar server returns HTTP 200 on `/healthz` (`atlas-cal-v7`)."""
     return cal_engine.cal_http_ok(port)
 
 
@@ -1760,6 +1790,29 @@ def render_calendar_html(idx=None, start_server=False):
     except Exception:
         graph_data = {"nodes": [], "edges": [], "stats": {"nodes": 0, "edges": 0}}
 
+    try:
+        sync_meta_map = cal_sync.load_event_metadata_map(BRAIN)
+        cal_sync_summary = cal_sync.get_sync_ui_summary(BRAIN)
+    except Exception:
+        sync_meta_map = {}
+        cal_sync_summary = {"configured": False, "enabled": False, "accounts": [], "layers": [], "open_conflicts": 0, "auth_warnings": []}
+
+    layer_cfg_by_file = {ly["file"]: ly for ly in (cal_sync_summary.get("layers") or []) if ly.get("file")}
+    for it in serial:
+        ly_cfg = layer_cfg_by_file.get(it.get("rel", ""))
+        if ly_cfg:
+            it["layer"] = ly_cfg["id"]
+            it["layer_label"] = ly_cfg["label"]
+            it["layer_color"] = ly_cfg["color"]
+            it["layer_mode"] = ly_cfg["mode"]
+        uid = it.get("sync_id") or ""
+        meta = sync_meta_map.get(uid) if uid else None
+        if meta:
+            it["synced"] = True
+            for mk in ("location", "meet_link", "description", "attendees", "self_rsvp", "organizer", "account_id", "html_link"):
+                if meta.get(mk):
+                    it[mk] = meta[mk]
+
     payload = {
         "today": dt.date.today().isoformat(),
         "csrf_token": csrf_tok,
@@ -1767,6 +1820,7 @@ def render_calendar_html(idx=None, start_server=False):
         "todos": todos,
         "coach": coach,
         "graph": graph_data,
+        "cal_sync": cal_sync_summary,
     }
     atlas_dir = os.path.join(BRAIN, "_atlas")
     tpl = cal_engine.load_calendar_template(atlas_dir=atlas_dir)
@@ -2488,9 +2542,42 @@ def prompt_text(prompt, cwd, session):
                 f"Atlas mail -> Run `{py} -I {tools_py} mail accounts|list|search|read ...` and follow {mail_proc}{overlay_bit}."
             )
         if not c_mode and TODO_RX.search(prompt):
+            sync_extra = ""
+            try:
+                if cal_sync.get_sync_ui_summary(BRAIN).get("enabled"):
+                    sync_extra = f" | Google Sync/FreeBusy/Invites: `{py} -I {tools_py} cal status|freebusy|show|create|rsvp|conflicts|sync`."
+            except Exception:
+                pass
             lines.append(
-                f"Atlas tasks/calendar -> Use `{py} -I {tools_py} todo` (`list|done|move|skip|add \"<text>\" [--to YYYY-MM-DD] [--time HH:MM] [--kind event|todo|deadline|blocked|goal]`) or `{py} -I {tools_py} calendar`."
+                f"Atlas tasks/calendar -> Use `{py} -I {tools_py} todo` (`list|done|move|skip|add \"<text>\" [--to YYYY-MM-DD] [--time HH:MM] [--kind event|todo|deadline|blocked|goal]`) or `{py} -I {tools_py} calendar`.{sync_extra}"
             )
+        # Zero-token incremental Google Calendar auto-pull (TTL 60s on calendar/coach/briefing intent, else 15m; 2s fail-open)
+        if not PROBE:
+            try:
+                is_cal_urgent = bool(
+                    c_mode
+                    or TODO_RX.search(prompt)
+                    or re.search(r"(?i)\b(kalender|calendar|termin|meeting|frei|freebusy|slot|woche|morgen|heute|briefing|sync|einlad|rsvp|google\s*meet)\b", prompt)
+                )
+                pull_res = cal_sync.maybe_auto_pull(BRAIN, urgent=is_cal_urgent, timeout=2.0)
+                if pull_res:
+                    bits = []
+                    if pull_res.get("pulled_new"):
+                        bits.append(f"+{pull_res['pulled_new']} new")
+                    if pull_res.get("pulled_updated"):
+                        bits.append(f"~{pull_res['pulled_updated']} updated")
+                    if pull_res.get("pulled_cancelled"):
+                        bits.append(f"-{pull_res['pulled_cancelled']} cancelled")
+                    if pull_res.get("open_conflicts"):
+                        bits.append(f"{pull_res['open_conflicts']} open conflict(s) (`{py} -I {tools_py} cal conflicts`)")
+                    if pull_res.get("auth_warnings"):
+                        bits.append(f"auth renew needed: {', '.join(pull_res['auth_warnings'])}")
+                    if bits:
+                        lines.append(f"Atlas cal-sync -> {', '.join(bits)}.")
+                        if pull_res.get("files_changed"):
+                            render_calendar_html(idx, start_server=False)
+            except Exception as exc:
+                _log_hook_error("prompt.cal_sync", exc)
         for ext_name, ext_rel, ext_cmd in _detect_user_extensions(prompt)[:2]:
             cli_bit = f"; CLI: `{py} -I {tools_py} {ext_cmd} ...`" if ext_cmd else ""
             lines.append(f"Atlas user extension -> skill '{ext_name}' ({_show(ext_rel, cwd)}){cli_bit}.")
@@ -2950,8 +3037,15 @@ def stop(agent, data):
         deleted_cal_tasks = _detect_deleted_open_calendar_tasks()
     except Exception as exc:
         _log_hook_error("stop.calendar_guard", exc)
+    cal_pushed_files = []
     try:
-        if _calendar_needs_render():
+        push_res = cal_sync.auto_push_on_stop(BRAIN, timeout=4.0)
+        if push_res and push_res.get("files_changed"):
+            cal_pushed_files = push_res["files_changed"]
+    except Exception as exc:
+        _log_hook_error("stop.cal_sync_push", exc)
+    try:
+        if cal_pushed_files or _calendar_needs_render():
             render_calendar_html()
     except Exception as exc:
         _log_hook_error("stop.render_calendar", exc)

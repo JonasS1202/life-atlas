@@ -1,0 +1,5 @@
+{
+  "notes": [
+    "Atlas `1.6.0` adds optional, zero-token multi-account bidirectional Google Calendar 3-way sync (`atlas.py cal auth|discover|sync|status|list|show|freebusy|create|rsvp|conflicts`), layered calendar files under `brain/calendar/*.md` with `read-only` mirror protection, 3-stage deduplication & conflict queue, Bulk-Delete Circuit Breaker, `#local`/`#sync` per-line overrides, Smart-Formatter for workouts & decentralized `due:` items, automatic 0-token PreInvocation/Stop/background sync (`atlas-cal-v7`), and interactive layer filters + Google Meet/location/attendees modal in `calendar.html`. Completely opt-in: nothing activates until `atlas.py cal auth` and `atlas.py cal discover --execute` are run."
+  ]
+}
