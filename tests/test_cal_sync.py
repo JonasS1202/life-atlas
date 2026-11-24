@@ -632,14 +632,13 @@ class CalSyncUnit(unittest.TestCase):
         busy_slots = fb["days"][0]["busy"]
         self.assertTrue(any(b["start"] == "14:00" and b["end"] == "15:00" for b in busy_slots))
 
-        # Hook parsing + calendar.html enrichment strips `<!-- g:uid -->` and embeds Meet link & layer info
+        # Hook parsing strips `<!-- g:uid -->` and SQLite metadata cache stores Meet link & layer info
         spec = importlib.util.spec_from_file_location("_test_cal_sync_hook", HOOK_PATH)
         hk = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(hk)
         hk.BRAIN = self.brain
         hk.STATE = os.path.join(self.brain, "_atlas", "state.json")
         hk.CACHE = os.path.join(self.brain, "_atlas", "cache", "index.sqlite")
-        hk.CAL_HTML = os.path.join(self.brain, "_atlas", "cache", "calendar.html")
         hk.ERR_LOG = os.path.join(self.brain, "_atlas", "cache", "hook_errors.log")
         hk.CONFLICTS_FILE = os.path.join(self.brain, "_atlas", "conflicts.json")
 
@@ -648,12 +647,11 @@ class CalSyncUnit(unittest.TestCase):
         self.assertNotIn("<!-- g:", demo_it["what"])
         self.assertEqual(demo_it["sync_id"], created["atlas_uid"])
 
-        hk.render_calendar_html(idx={}, start_server=False)
-        with open(hk.CAL_HTML, encoding="utf-8") as fh:
-            html = fh.read()
-        self.assertIn("https://meet.google.com/", html)
-        self.assertIn('"cal_sync"', html)
-        self.assertNotIn(f"<!-- g:{created['atlas_uid']} -->", html)
+        meta_map = cal_sync.load_event_metadata_map(self.brain)
+        self.assertIn(created["atlas_uid"], meta_map)
+        self.assertTrue(meta_map[created["atlas_uid"]].get("meet_link", "").startswith("https://meet.google.com/"))
+        ui_sum = cal_sync.get_sync_ui_summary(self.brain)
+        self.assertTrue(ui_sum.get("enabled"))
 
         # Toggle checkbox via `cal_engine.toggle_todo_in_brain` works cleanly on synced lines with `<!-- g:uid -->`
         tgl = cal_engine.toggle_todo_in_brain(self.brain, "calendar/work.md", line_no=demo_it["line"], what=demo_it["what"], target_done=True)

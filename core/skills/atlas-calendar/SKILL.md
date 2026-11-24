@@ -1,6 +1,6 @@
 ---
 name: atlas-calendar
-description: "Native Atlas calendar, multi-account Google sync (`atlas.py cal`), FreeBusy, to-dos & Brain Graph (`--view graph|coach|todo`, `atlas.py todo`). Use for 'öffne meinen Kalender', 'Google Kalender', 'freie Slots', 'Termine', 'To-dos'."
+description: "Chat-first Atlas calendar (`brain/calendar/`), smart to-do triage (`atlas.py todo`), optional multi-account Google Calendar sync (`atlas.py cal`) & FreeBusy. Use for 'Kalender', 'Termine', 'To-dos', 'Aufgaben', 'freie Slots', 'Google Kalender'."
 ---
 
 Read `{{BRAIN}}/_atlas/procedures/calendar.md` completely and follow it.

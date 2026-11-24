@@ -27,7 +27,7 @@ Commands
   check       verify the charter: sizes, links, reachability, duplicates, secrets, Git, backup, hooks, registry
   deadlines   list `due:` items; `--ics FILE` writes a calendar file
   cal         multi-account Google Calendar bidirectional 3-way sync, FreeBusy, Meet/invites & RSVP (`auth`, `discover`, `sync`, `status`, `list`, `show`, `freebusy`, `create`, `rsvp`, `conflicts`)
-  todo        quick task triage (`list`, `done`, `skip`, `reopen`, `move --to <date|+Nd>`, `add`)
+  todo        quick task triage (`list`, `done`, `skip`, `reopen`, `move --to <date|+Nd>`, `unschedule`, `add`)
   ext         inspect update-safe user extensions (`skills/`, `howto/scripts/`, `_secrets/`); `run <cmd>` executes one
   mail        multi-account IMAP mail engine (`accounts`, `folders`, `list`, `read`, `search`, `audit`, plus
               safety-gated `move` to `target_folder`, `copy`, `trash`, `delete`, `flags`, `labels`, `mkdir`)
@@ -268,7 +268,6 @@ def hook_module(brain):
     mod.BRAIN = brain
     mod.STATE = state_path(brain)
     mod.CACHE = os.path.join(brain, "_atlas", "cache", "index.sqlite")
-    mod.CAL_HTML = os.path.join(brain, "_atlas", "cache", "calendar.html")
     mod.ERR_LOG = os.path.join(brain, "_atlas", "cache", "hook_errors.log")
     mod.CONFLICTS_FILE = os.path.join(brain, "_atlas", "conflicts.json")
     return mod
@@ -1205,7 +1204,8 @@ def cmd_check(args):
             warns.append(f"session hook last ran {age} days ago: are the hooks still firing? (/atlas-update heals)")
     sset = hk.settings()
     allowed = {"briefing": {"daily", "weekly", "off"}, "questions": {"per-briefing", "evening-3", "weekly-session", "off"},
-               "reminder": {"signals", "every-turn", "rare"}, "daily_log": {"on", "off"}}
+               "reminder": {"signals", "every-turn", "rare"}, "daily_log": {"on", "off"},
+               "overdue_todo_policy": {"brief_propose", "manual", "rollover_today"}}
     bad = [f"{k}={sset.get(k)}" for k, ok in allowed.items() if sset.get(k) not in ok]
     md = hk._int(sset.get("maintenance_days"), -1)
     if not 7 <= md <= 30:
@@ -1525,33 +1525,24 @@ def _calendar_init(root, brain, hk, execute):
         f"{len(harvest_timeline)} timeline item(s) and {len(harvest_todos)} open to-do(s) harvested from brain.")
 
 
-def _open_visual_calendar(hk, idx, open_now=False, view=None):
-    cal_url = hk.render_calendar_html(idx, start_server=True)
-    if view and view in ("coach", "todo", "graph"):
-        sep = "&" if "?" in cal_url else "?"
-        cal_url = f"{cal_url}{sep}view={view}"
-    say(f"Visual calendar: [📅 Atlas Kalender öffnen]({cal_url})")
-    if open_now:
-        try:
-            if os.name == "nt":
-                os.startfile(cal_url)
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", cal_url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            else:
-                import webbrowser
-                webbrowser.open(cal_url)
-        except Exception:
-            pass
-    return cal_url
+def _print_calendar_sync_footer(brain):
+    """Print a 1-line external calendar sync summary in chat-first CLI output."""
+    try:
+        cs = cal_sync.get_sync_ui_summary(brain)
+        if cs.get("enabled"):
+            n_layers = len(cs.get("layers") or [])
+            confs = int(cs.get("open_conflicts") or 0)
+            c_bit = f", {confs} open conflict(s)" if confs else ""
+            say(f"Sync: external calendar sync active ({n_layers} layer(s){c_bit}) — `atlas.py cal status|freebusy|sync`.")
+    except Exception:
+        pass
 
 
 def cmd_calendar(args):
     root, brain = paths(args)
     hk = hook_module(brain)
-    req_view = getattr(args, "view", None)
     if args.init:
         _calendar_init(root, brain, hk, args.execute)
-        _open_visual_calendar(hk, hk.load_index(), getattr(args, "open", False), view=req_view)
         return
     today = dt.date.today()
     if args.sync_ics:
@@ -1578,7 +1569,6 @@ def cmd_calendar(args):
                 cur = cur.rstrip() + "\n\n## Timeline\n\n" + "\n".join(added) + "\n"
             write(cal_readme, cur)
             say("Applied to brain/calendar/README.md.")
-        _open_visual_calendar(hk, hk.load_index(), getattr(args, "open", False), view=req_view)
         return
     if getattr(args, "sync", False):
         sres = cal_sync.run_sync(brain, execute=True)
@@ -1624,7 +1614,6 @@ def cmd_calendar(args):
             say(f"  {box_map.get(w['status'], '[ ]')} {w['start'].isoformat()} [{k}] {w['what']}")
         if not workouts:
             say("  (none)")
-        _open_visual_calendar(hk, idx, getattr(args, "open", False), view=req_view or "coach")
         return
     horizon = 10 ** 6 if args.all else args.days
     items = hk.calendar_items(idx, days=horizon, past_days=365 if args.include_done else 3650,
@@ -1649,7 +1638,7 @@ def cmd_calendar(args):
         say("calendar: no upcoming items or open to-dos")
     if args.ics:
         _write_ics(args.ics, _deadlines(brain, None if args.all else args.days))
-    _open_visual_calendar(hk, idx, getattr(args, "open", False), view=req_view)
+    _print_calendar_sync_footer(brain)
 
 
 def _resolve_todo_target(hk, idx, query, file_rel=None, line_no=None):
@@ -1723,8 +1712,7 @@ def cmd_cal(args):
                 sys.exit(f"cal auth failed: {msg}")
             say(f"Google Calendar account '{acct}' connected: {msg}")
             return
-        cal_url = hk.render_calendar_html(hk.load_index(), start_server=True)
-        base_url = cal_url.rsplit("/", 1)[0]
+        base_url = hk.ensure_oauth_server(start_server=True)
         port_s = base_url.rsplit(":", 1)[-1]
         port_n = int(port_s) if port_s.isdigit() else 8765
         local_cb = f"http://127.0.0.1:{port_n}/gcal-callback"
@@ -1769,7 +1757,7 @@ def cmd_cal(args):
         if not res["applied"]:
             say("Re-run with `--execute` to write `brain/calendar/sync.yaml` and create layer files + subcalendars.")
         else:
-            hk.render_calendar_html(hk.load_index(), start_server=False)
+            hk.load_index()
         return
 
     if action == "sync":
@@ -1783,7 +1771,7 @@ def cmd_cal(args):
             allow_bulk_delete=bool(getattr(args, "allow_bulk_delete", False)),
         )
         if execute and res.get("ok"):
-            hk.render_calendar_html(hk.load_index(), start_server=False)
+            hk.load_index()
         if getattr(args, "quiet", False) and not as_json:
             return
         if as_json:
@@ -1952,7 +1940,7 @@ def cmd_cal(args):
             if p["location"]:
                 say(f"  Location: {p['location']}")
             return
-        hk.render_calendar_html(hk.load_index(), start_server=False)
+        hk.load_index()
         say(f"Created event [{res['atlas_uid']}] in {res['layer_file']}: {res['line']}")
         if res.get("meet_link"):
             say(f"  Google Meet: {res['meet_link']}")
@@ -1979,7 +1967,7 @@ def cmd_cal(args):
             say(f"  Account: {p['account']} | Organizer: {p['organizer']}")
             say(f"  RSVP: {p['current_rsvp']} -> {p['new_rsvp']}")
             return
-        hk.render_calendar_html(hk.load_index(), start_server=False)
+        hk.load_index()
         say(f"RSVP updated to '{res['rsvp']}' for {res['title']} [{res['atlas_uid']}].")
         return
 
@@ -1994,7 +1982,7 @@ def cmd_cal(args):
                 return
             if not res.get("ok"):
                 sys.exit(f"cal conflicts: {res.get('error')}")
-            hk.render_calendar_html(hk.load_index(), start_server=False)
+            hk.load_index()
             say(f"Resolved conflict {args.resolve} via '{act}'.")
             return
         confs = cal_sync.list_conflicts(brain)
@@ -2029,8 +2017,14 @@ def cmd_todo(args):
                 loc = f"{t['rel']}:{t['line']}" if t["line"] else t["rel"]
                 k_tag = "[deadline] " if t["kind"] == "deadline" else ""
                 say(f"{t['num']:2d}. [{t['badge']}] {k_tag}{t['what']}  [{loc}]")
-        if getattr(args, "open", False):
-            _open_visual_calendar(hk, idx, open_now=True, view="todo")
+            if any(t["kind"] == "todo" and t.get("overdue_days", 0) > 0 for t in tasks):
+                free_days = cal_engine.suggest_free_days(
+                    hk.calendar_items(idx, days=10, past_days=0, include_done=False),
+                    horizon_days=7,
+                    count=2,
+                )
+                if free_days:
+                    say("Suggested light/free days: " + ", ".join(f"{d['date']} ({d['weekday']})" for d in free_days))
         return
 
     if action == "add":
@@ -2044,11 +2038,7 @@ def cmd_todo(args):
         )
         if not res.get("ok"):
             sys.exit(f"todo add failed: {res.get('error')}")
-        idx = hk.load_index()
-        if getattr(args, "open", False):
-            _open_visual_calendar(hk, idx, open_now=True, view="todo")
-        else:
-            hk.render_calendar_html(idx, start_server=False)
+        hk.load_index()
         say(f"added: {res['entry']}  [{res['rel']}:{res['line']}]")
         return
 
@@ -2058,11 +2048,7 @@ def cmd_todo(args):
         res = cal_engine.toggle_todo_in_brain(brain, rel, line_no=ln, what=what, target_status=st_map[action])
         if not res.get("ok"):
             sys.exit(f"todo {action} failed: {res.get('error')}")
-        idx = hk.load_index()
-        if getattr(args, "open", False):
-            _open_visual_calendar(hk, idx, open_now=True, view="todo")
-        else:
-            hk.render_calendar_html(idx, start_server=False)
+        hk.load_index()
         say(f"{res['status']}: {what or rel}  [{res['rel']}:{res['line']}]")
         return
 
@@ -2072,13 +2058,17 @@ def cmd_todo(args):
         res = cal_engine.reschedule_task_in_brain(brain, rel, args.to, line_no=ln, what=what)
         if not res.get("ok"):
             sys.exit(f"todo move failed: {res.get('error')}")
-        idx = hk.load_index()
-        if getattr(args, "open", False):
-            _open_visual_calendar(hk, idx, open_now=True, view="todo")
-        else:
-            hk.render_calendar_html(idx, start_server=False)
+        hk.load_index()
         kind_lbl = "scheduled" if res.get("promoted") else "rescheduled"
         say(f"{kind_lbl} -> {res['date']}: {what or rel}  [{res['rel']}:{res['line']}]")
+        return
+
+    if action == "unschedule":
+        res = cal_engine.unschedule_todo_in_brain(brain, rel, line_no=ln, what=what, prio=args.prio or "med")
+        if not res.get("ok"):
+            sys.exit(f"todo unschedule failed: {res.get('error')}")
+        hk.load_index()
+        say(f"unscheduled -> Open To-Dos: {res['text']}  [{res['rel']}:{res['line']}]")
         return
 
 
@@ -3278,7 +3268,6 @@ def _coach_sync(
             state_updates["last_health_sync"] = now_iso()
         set_state(brain, **state_updates)
         hk.load_index()
-        hk.render_calendar_html(hk.load_index(), start_server=False)
     else:
         matched = 0
     if not quiet:
@@ -3443,7 +3432,6 @@ def _coach_note(
 
     _rebuild_coach_markdown_files(brain, acts, ftp_watts=ftp_w, weight_kg=weight_kg)
     hk.load_index()
-    hk.render_calendar_html(hk.load_index(), start_server=False)
     summary_label = note_str or ", ".join(
         s for s in (
             f"RHR {rhr} bpm" if rhr is not None else "",
@@ -3481,7 +3469,6 @@ def _coach_zwo(root, brain, hk, date_str=None, days=14):
         fpath = os.path.join(out_dir, fname)
         write(fpath, xml_str)
         written.append(fpath)
-    hk.render_calendar_html(idx, start_server=False)
     if written:
         say(f"coach zwo: generated {len(written)} .zwo file(s) (FTP={ftp_w}W):")
         for p in written:
@@ -3519,8 +3506,7 @@ def _coach_auth_strava(root, brain, args):
 
     code = getattr(args, "code", None)
     if not code:
-        cal_url = hk.render_calendar_html(hk.load_index(), start_server=True)
-        base_url = cal_url.rsplit("/", 1)[0]
+        base_url = hk.ensure_oauth_server(start_server=True)
         redirect_uri = f"{base_url}/strava-callback"
         connect_url = f"{base_url}/strava-connect"
         auth_url = (
@@ -3537,7 +3523,6 @@ def _coach_auth_strava(root, brain, args):
         say("=== Strava 1-Click Connect (Ready) ===")
         say(f"Click this link to connect Strava with 1 click (no API keys needed):\n  [🧡 Jetzt mit Strava verbinden (1-Klick)]({connect_url})")
         say(f"Direct Strava OAuth URL:\n  {auth_url}")
-        say(f"Visual Coach Dashboard:\n  [📅 Atlas Coach Dashboard]({cal_url}?view=coach)")
         return
 
     data = urllib.parse.urlencode({
@@ -3628,8 +3613,6 @@ def _coach_context(
             activities=c_state.get("activities", []),
             cal_items=all_cal,
         ))
-        if open_cal:
-            _open_visual_calendar(hk, idx, open_now=True)
         return
 
     # STANDARD & PRO TIERS
@@ -3643,9 +3626,13 @@ def _coach_context(
     if macro["stale"] and eff_mode in ("plan-14d", "macro"):
         say("  [!] STALE MACRO PLAN DETECTED: You MUST update `brain/coach/macro-plan.md` (with current `updated:` and "
             f"`goals_hash: {macro['current_goals_hash']}`) BEFORE writing 14-day workouts in `brain/calendar/README.md`!")
-    cal_url_ctx = hk.render_calendar_html(idx, start_server=True)
-    base_url_ctx = cal_url_ctx.rsplit("/", 1)[0]
-    say(f"  Dashboard URL: [📅 Coach Dashboard öffnen]({cal_url_ctx}?view=coach)")
+    needs_oauth_srv = (
+        not c_state["strava_connected"]
+        or not conn["hammerhead_connected"]
+        or bool(conn.get("google_health_needs_renew"))
+        or (bool(conn.get("google_health_configured")) and not bool(conn.get("google_health_connected")))
+    )
+    base_url_ctx = hk.ensure_oauth_server(start_server=needs_oauth_srv)
     if c_state["strava_connected"]:
         say(f"  Strava: connected ({len(c_state['activities'])} cached activities)")
     else:
@@ -3788,12 +3775,9 @@ def _coach_context(
         else:
             say(f"  (no activity found on {deep_dive})")
 
-    if open_cal:
-        _open_visual_calendar(hk, idx, open_now=True)
-
 
 def _coach_auth_hammerhead(root, brain, hk, args):
-    """Zero-friction 1-Click OAuth flow (via background calendar server on 127.0.0.1:8765 or --code exchange) for Hammerhead Karoo."""
+    """Zero-friction 1-Click OAuth flow (via headless loopback OAuth helper on 127.0.0.1:8765 or --code exchange) for Hammerhead Karoo."""
     env = coach_connectors.load_secret_env(brain, "hammerhead")
     if getattr(args, "client_id", None):
         env["HAMMERHEAD_CLIENT_ID"] = args.client_id.strip()
@@ -3810,8 +3794,7 @@ def _coach_auth_hammerhead(root, brain, hk, args):
         say(f"hammerhead auth: saved credentials to {fwd(coach_connectors.secret_env_path(brain, 'hammerhead'))}.")
         return
 
-    cal_url = hk.render_calendar_html(hk.load_index(), start_server=True)
-    base_url = cal_url.rsplit("/", 1)[0]
+    base_url = hk.ensure_oauth_server(start_server=True)
     local_cb = f"{base_url}/hammerhead-callback"
     connect_url = f"{base_url}/hammerhead-connect"
     srv_port = 8765
@@ -3834,7 +3817,6 @@ def _coach_auth_hammerhead(root, brain, hk, args):
         say("=== Hammerhead Karoo 1-Click Connect (Ready) ===")
         say(f"Click this link to connect Hammerhead Karoo with 1 click (no API keys or developer app needed):\n  [💛 Jetzt mit Hammerhead Karoo verbinden (1-Klick)]({connect_url})")
         say(f"Direct Hammerhead OAuth URL:\n  {auth_url}")
-        say(f"Visual Coach Dashboard:\n  [📅 Atlas Coach Dashboard]({cal_url}?view=coach)")
         return
 
     ok, msg = coach_connectors.hammerhead_exchange_code(
@@ -3883,8 +3865,7 @@ def _coach_auth_google_health(root, brain, hk, args):
         say(f"google-health auth: saved tokens -> {fwd(coach_connectors.secret_env_path(brain, 'google_health'))}")
         return
 
-    cal_url = hk.render_calendar_html(hk.load_index(), start_server=True)
-    base_url = cal_url.rsplit("/", 1)[0]
+    base_url = hk.ensure_oauth_server(start_server=True)
     local_cb = getattr(args, "redirect_uri", None) or f"{base_url}/google-health-callback"
     connect_url = f"{base_url}/google-health-connect"
     srv_port = 8765
@@ -4015,8 +3996,6 @@ def _coach_push(root, brain, hk, days=14, execute=True, mock_dir=None, force_rec
         base_tau_w_mult=eff_tau_push,
         force_recreate=force_recreate,
     )
-    if execute:
-        hk.render_calendar_html(idx, start_server=False)
     sup_n = len(res.get("superseded_archived") or [])
     sup_s = f", {sup_n} superseded archived" if sup_n else ""
     say(f"coach push ({'applied' if execute else 'dry-run'}): {len(res['zwo_files'])} .zwo file(s), "
@@ -5519,7 +5498,7 @@ def _apply_upgrade(brain, src, values, data, dry):
 
 HARD_CORE_PREFIXES = (
     "tools/", "hooks/", "skills/", "agents/", "upgrades/",
-    "templates/calendar.html", "VERSION", "charter.md", "adapters.md",
+    "VERSION", "charter.md", "adapters.md",
 )
 
 
@@ -5741,8 +5720,14 @@ def _core_apply(args, root, brain, src, plan, ups, values):
             if acts_list:
                 ftp_w_u, w_kg_u = _extract_profile_numbers(brain, hk_new)
                 _rebuild_coach_markdown_files(brain, acts_list, ftp_watts=ftp_w_u, weight_kg=w_kg_u)
-        if os.path.isfile(os.path.join(atlas_dir, "cache", "calendar.html")):
-            hk_new.render_calendar_html(hk_new.load_index(), start_server=False)
+        # Clean up legacy pre-v1.7.0 HTML dashboard cache files on upgrade
+        for legacy_cache in ("calendar.html", "cal_csrf.txt", "_cal_server.py"):
+            lp = os.path.join(atlas_dir, "cache", legacy_cache)
+            if os.path.isfile(lp):
+                try:
+                    os.remove(lp)
+                except OSError:
+                    pass
     except Exception:
         pass
     # The new base is the upstream we just considered; unresolved conflicts keep their old base until accepted.
@@ -6409,12 +6394,9 @@ def main():
     p.add_argument("--all", action="store_true")
     p.add_argument("--include-done", action="store_true")
     p.add_argument("--for", dest="for_role", choices=("coach",), help="filtered view for a specific role (e.g. coach)")
-    p.add_argument("--view", choices=("all", "coach", "todo", "graph"),
-                   help="initial dashboard tab (`all`, `coach`, `todo`, or `graph`)")
     p.add_argument("--init", action="store_true", help="harvest existing dates, birthdays and open to-dos into calendar/README.md")
-    p.add_argument("--open", action="store_true", help="open the zero-token visual HTML calendar in the browser")
     p.add_argument("--ics", help="export calendar timeline to an .ics file")
-    p.add_argument("--sync", action="store_true", help="run bidirectional Google Calendar sync before rendering")
+    p.add_argument("--sync", action="store_true", help="run bidirectional Google Calendar sync before listing")
     p.add_argument("--sync-ics", action="store_true", help="merge upcoming events from settings.md calendar_ics or --ics-source")
     p.add_argument("--ics-source", help="URL or file path of an .ics feed")
     p.add_argument("--execute", action="store_true")
@@ -6468,22 +6450,21 @@ def main():
     p.add_argument("--action", dest="resolve_action", choices=("link", "keep-both", "use-atlas", "use-google", "dismiss"), help="conflict resolution action")
     p.add_argument("--json", action="store_true", help="machine-readable JSON output")
 
-    p = sub.add_parser("todo", help="quick task triage: list, done, skip, reopen, move, add")
+    p = sub.add_parser("todo", help="quick task triage: list, done, skip, reopen, move, unschedule, add")
     p.add_argument("action", nargs="?", default="list",
-                   choices=("list", "done", "skip", "reopen", "move", "add"),
+                   choices=("list", "done", "skip", "reopen", "move", "unschedule", "add"),
                    help="task action (default: list)")
     p.add_argument("target", nargs="*", help="task `#number` from briefing/list, task substring, or text for `add`")
     p.add_argument("--to", "--date", dest="to", help="target date (`YYYY-MM-DD`, `+3d`, `+1w`, `today`, `tomorrow`) for `move` or `add`")
     p.add_argument("--time", help="optional time (`HH:MM` or `HH:MM-HH:MM`) for dated `add`")
     p.add_argument("--kind", default="todo", help="timeline kind (`todo`, `event`, `deadline`, `blocked`, `goal`) for dated `add` (default: todo)")
     p.add_argument("--cal", "--layer", dest="cal_layer", help="optional target calendar layer file under `brain/calendar/` (e.g. `work`) for `add`")
-    p.add_argument("--prio", choices=("high", "med", "low"), default="med", help="priority for undated `add` (default: med)")
+    p.add_argument("--prio", choices=("high", "med", "low"), default="med", help="priority for undated `add`/`unschedule` (default: med)")
     p.add_argument("--file", help="brain-relative `.md` path (optional when matching by `#number` or text)")
     p.add_argument("--line", type=int, help="1-based line number (`0` for frontmatter `due:`)")
     p.add_argument("--text", help="optional task text alias for `add`")
     p.add_argument("--days", type=int, default=365, help="upcoming horizon in days when `--all` is passed to `list`")
     p.add_argument("--all", action="store_true", help="include upcoming scheduled tasks in `list`")
-    p.add_argument("--open", action="store_true", help="open visual calendar in To-Do view")
     p.add_argument("--execute", action="store_true", help="accepted for CLI consistency")
 
     p = sub.add_parser("coach")

@@ -45,7 +45,6 @@ BRAIN = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__))
 PROBE = bool(os.environ.get("ATLAS_PROBE"))  # set by `atlas.py probe`: run, but change nothing
 STATE = os.path.join(BRAIN, "_atlas", "state.json")
 CACHE = os.path.join(BRAIN, "_atlas", "cache", "index.sqlite")
-CAL_HTML = os.path.join(BRAIN, "_atlas", "cache", "calendar.html")
 ERR_LOG = os.path.join(BRAIN, "_atlas", "cache", "hook_errors.log")
 CONFLICTS_FILE = os.path.join(BRAIN, "_atlas", "conflicts.json")
 MAX_ERR_LOG_BYTES = 50_000
@@ -64,7 +63,8 @@ NAG_MINUTES = 15
 LEARN_SUGGEST_TURNS = 20
 MAINT_CHANGES = 50
 DEFAULTS = {"briefing": "daily", "questions": "per-briefing", "maintenance_days": "7", "reminder": "signals",
-            "deadline_days": "30", "daily_log": "on", "inbox_cloud": "", "calendar_ics": "", "evening_hour": "18"}
+            "deadline_days": "30", "overdue_todo_policy": "brief_propose", "daily_log": "on",
+            "inbox_cloud": "", "calendar_ics": "", "evening_hour": "18"}
 MARKER = re.compile(r"(?mi)^[\s>*_`-]*atlas\s*\**\s*:")
 MARKER_LINE = re.compile(r"(?mi)^[\s>*_`-]*atlas\s*\**\s*:\s*(.+?)\s*$")
 AUTOMATED = re.compile(r"<task-notification>|\[SYSTEM NOTIFICATION|Subagent hand-back|<side-sessions-event>")
@@ -110,10 +110,17 @@ MAIL_RX = re.compile(
     r"e?-?mails?(?!-?adresse\w*))\b"
 )
 TODO_RX = re.compile(
-    r"(?i)(?:^|\s)/atlas-(?:calendar|brief)\b|\b(?:offene[n]?\s+(?:aufgaben|to-?dos?|tasks?|punkte)|"
-    r"meine\s+(?:aufgaben|to-?dos?|termine)|[oö]ffne\s+(?:meinen\s+)?kalender|in\s+den\s+kalender|"
-    r"\b(?:to-?dos?|termine?|appointments?)\b|"
-    r"(?:aufgabe|to-?do|task|termin)\w*\s+(?:abhaken|verschieben|erledigt|anlegen|eintragen|speichern))\b"
+    r"(?i)(?:^|\s)/atlas-(?:calendar|brief)\b"
+    r"|\b(?:offene[n]?\s+(?:aufgaben|to-?dos?|tasks?|punkte)"
+    r"|meine\s+(?:aufgaben|to-?dos?|termine|fristen|kalender)"
+    r"|(?:[oö]ffne|zeig\w*|was\s+steht|schau\w*|check\w*)\s+(?:mir\s+)?(?:in\s+)?(?:meinen?\s+|im\s+)?kalender"
+    r"|in\s+den\s+kalender"
+    r"|(?:to-?dos?|termine?|appointments?|deadlines?|fristen?)"
+    r"|erinner(?:e|st|t)?\s+mich\b|remind\s+me\b"
+    r"|(?:ich\s+muss\s+noch|muss\s+ich\s+noch|vergiss\s+nicht|don'?t\s+forget\s+to)\b"
+    r"|auf\s+(?:meine|die)\s+(?:to-?do-?)?liste\b"
+    r"|(?:leg|trag|stell|pack|setz|schreib|schieb|verschieb|add|create|schedule|move|reschedule|unschedule|park)\w*\b[^.!?\n]{0,45}\b(?:aufgabe\w*|to-?do\w*|task\w*|termin\w*|frist\w*|deadline\w*|backlog)"
+    r"|(?:aufgabe\w*|to-?do\w*|task\w*|termin\w*|frist\w*|deadline\w*)\b[^.!?\n]{0,45}\b(?:abhaken|verschieben|schieben|erledigt|anlegen|eintragen|speichern|entparken|streichen|backlog|done|skip|move|unschedule|reschedule))\b"
 )
 
 
@@ -1643,8 +1650,15 @@ def actionable_tasks(idx=None, include_upcoming_days=0):
         if it["kind"] not in ("todo", "deadline"):
             continue
         delta = it["delta"]
+        overdue_d = -delta if delta < 0 else 0
+        is_stale = bool(overdue_d >= 7 and it["kind"] == "todo")
         if delta < 0:
-            prio, badge = "overdue", f"OVERDUE {-delta} d · {it['start'].isoformat()}"
+            if it["kind"] == "deadline":
+                prio, badge = "overdue", f"DEADLINE OVERDUE +{overdue_d} d · {it['start'].isoformat()}"
+            elif is_stale:
+                prio, badge = "overdue", f"STALE +{overdue_d} d · {it['start'].isoformat()}"
+            else:
+                prio, badge = "overdue", f"OVERDUE +{overdue_d} d · {it['start'].isoformat()}"
         elif delta == 0:
             prio, badge = "today", f"DUE TODAY · {it['start'].isoformat()}"
         else:
@@ -1657,6 +1671,8 @@ def actionable_tasks(idx=None, include_upcoming_days=0):
             "badge": badge,
             "date": it["start"].isoformat(),
             "delta": delta,
+            "overdue_days": overdue_d,
+            "stale": is_stale,
             "what": what_clean,
             "rel": it["rel"],
             "line": int(it.get("line") or 0),
@@ -1701,136 +1717,15 @@ def actionable_tasks(idx=None, include_upcoming_days=0):
     return out
 
 
-CAL_TEMPLATE = cal_engine.load_calendar_template()
-CAL_SERVER_SCRIPT = cal_engine.CAL_SERVER_SCRIPT
-
-
-def _cal_http_ok(port):
-    """Verify the calendar server returns HTTP 200 on `/healthz` (`atlas-cal-v7`)."""
-    return cal_engine.cal_http_ok(port)
-
-
-def _ensure_calendar_server(cache_dir, start_server=False):
-    """Ensure a loopback HTTP server serves `cache_dir` (`127.0.0.1:<port>/calendar.html`)."""
-    return cal_engine.ensure_calendar_server(
+def ensure_oauth_server(start_server=False):
+    """Ensure the headless loopback OAuth callback helper runs on `http://127.0.0.1:<port>` and return its base URL."""
+    cache_dir = os.path.dirname(CACHE)
+    return cal_engine.ensure_oauth_server(
         cache_dir,
         start_server=start_server,
         probe=PROBE,
         tools_dir=_TOOLS_DIR,
-        hook_py=os.path.abspath(__file__),
     )
-
-
-def render_calendar_html(idx=None, start_server=False):
-    """Generate `brain/_atlas/cache/calendar.html` (0 LLM tokens) and return its rendered `http://127.0.0.1` URL."""
-    if idx is None:
-        idx = load_index(budget=INDEX_BUDGET_S)
-    all_items = calendar_items(idx, days=3650, past_days=3650, include_done=True)
-    # Always keep ALL open items (even >90d overdue or >365d future deadlines); cap completed history to [-90d, +365d]
-    raw_items = [it for it in all_items if it["status"] == "open" or (-90 <= it["delta"] <= 365)]
-    serial = [{k: (v.isoformat() if isinstance(v, dt.date) else v) for k, v in it.items()} for it in raw_items]
-    todos = [
-        {
-            "status": t["status"],
-            "prio": t["prio"],
-            "what": t["what"],
-            "rel": t["rel"],
-            "line": t.get("line", 0),
-            "can_toggle": bool(t.get("can_toggle", False)),
-        }
-        for t in open_todos(include_done=False)
-    ]
-    try:
-        coach = _extract_coach_context(idx, cal_items=raw_items)
-        c_state = load_coach_state()
-    except Exception:
-        coach = {"depth": "standard", "metrics": [], "ftp_watts": 275, "macro_goals": [], "schedule": ""}
-        c_state = {"activities": []}
-    ftp_w = coach.get("ftp_watts", 275) or 275
-    acts_by_date = {}
-    for a in c_state.get("activities", []):
-        if isinstance(a, dict) and a.get("date"):
-            acts_by_date.setdefault(a["date"], []).append(a)
-    for it in serial:
-        if it.get("kind") != "workout":
-            continue
-        sport = it.get("subkind") or "cycling"
-        spec = parse_workout_spec(it.get("what", ""), ftp_watts=ftp_w, sport=sport)
-        it["visual_blocks"] = spec.get("visual_blocks", [])
-        it["total_min"] = spec.get("total_min", 0)
-        if sport == "cycling" and spec.get("has_intervals"):
-            it["zwo_xml"] = compile_zwo_xml(spec, date_str=it["start"], ftp_watts=ftp_w)
-            slug = re.sub(r"[^a-z0-9]+", "-", spec.get("title", "workout").lower()).strip("-") or "workout"
-            it["zwo_filename"] = f"{it['start']}_{slug}.zwo"
-        m_fb = re.search(r"\[feedback:\s*([^\]]+)\]", it.get("what", ""), re.I)
-        if m_fb:
-            fb_val = m_fb.group(1).strip()
-            if fb_val.lower() == "pending":
-                it["feedback_pending"] = True
-            else:
-                it["feedback"] = fb_val
-        day_acts = acts_by_date.get(it["start"], [])
-        if day_acts:
-            act = day_acts[0]
-            it["strava_id"] = act.get("id")
-            for k_act in ("np_w", "avg_hr", "tss", "w_bal_min_pct", "matches_burned", "cho_burn_g", "execution"):
-                if act.get(k_act) is not None:
-                    it[k_act] = act[k_act]
-            if act.get("feedback") and str(act["feedback"]).lower() != "pending":
-                it["feedback"] = str(act["feedback"]).strip()
-                it["feedback_pending"] = False
-            elif it.get("status") == "done" and not it.get("feedback"):
-                it["feedback_pending"] = True
-
-    cache_dir = os.path.dirname(CAL_HTML)
-    os.makedirs(cache_dir, exist_ok=True)
-    csrf_tok = cal_engine.get_or_create_csrf_token(cache_dir)
-    try:
-        graph_data = cal_engine.build_brain_graph_payload(BRAIN, idx=idx, db_path=CACHE)
-    except Exception:
-        graph_data = {"nodes": [], "edges": [], "stats": {"nodes": 0, "edges": 0}}
-
-    try:
-        sync_meta_map = cal_sync.load_event_metadata_map(BRAIN)
-        cal_sync_summary = cal_sync.get_sync_ui_summary(BRAIN)
-    except Exception:
-        sync_meta_map = {}
-        cal_sync_summary = {"configured": False, "enabled": False, "accounts": [], "layers": [], "open_conflicts": 0, "auth_warnings": []}
-
-    layer_cfg_by_file = {ly["file"]: ly for ly in (cal_sync_summary.get("layers") or []) if ly.get("file")}
-    for it in serial:
-        ly_cfg = layer_cfg_by_file.get(it.get("rel", ""))
-        if ly_cfg:
-            it["layer"] = ly_cfg["id"]
-            it["layer_label"] = ly_cfg["label"]
-            it["layer_color"] = ly_cfg["color"]
-            it["layer_mode"] = ly_cfg["mode"]
-        uid = it.get("sync_id") or ""
-        meta = sync_meta_map.get(uid) if uid else None
-        if meta:
-            it["synced"] = True
-            for mk in ("location", "meet_link", "description", "attendees", "self_rsvp", "organizer", "account_id", "html_link"):
-                if meta.get(mk):
-                    it[mk] = meta[mk]
-
-    payload = {
-        "today": dt.date.today().isoformat(),
-        "csrf_token": csrf_tok,
-        "items": serial,
-        "todos": todos,
-        "coach": coach,
-        "graph": graph_data,
-        "cal_sync": cal_sync_summary,
-    }
-    atlas_dir = os.path.join(BRAIN, "_atlas")
-    tpl = cal_engine.load_calendar_template(atlas_dir=atlas_dir)
-    html = tpl.replace("__DATA_JSON__", cal_engine.safe_json_for_script(payload))
-    try:
-        with open(CAL_HTML, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write(html)
-    except OSError:
-        pass
-    return _ensure_calendar_server(cache_dir, start_server=start_server)
 
 
 def last_mark(kind):
@@ -1932,15 +1827,8 @@ def foreign_items(root, user_home=None):
             and not (i["global"] and os.path.normcase(i["path"]) in snapshot)]
 
 
-def ensure_calendar_ready(idx=None, start_server=False):
-    """Render `CAL_HTML` only when stale/missing or on day rollover; always ensure loopback server when requested."""
-    if _calendar_needs_render():
-        return render_calendar_html(idx=idx, start_server=start_server)
-    return _ensure_calendar_server(os.path.dirname(CAL_HTML), start_server=start_server)
-
-
 def session_warmup(cwd, session):
-    """Warm up git remote, SQLite index & loopback calendar server on Antigravity `SessionStart` without burning daily state."""
+    """Warm up git remote & SQLite index on Antigravity `SessionStart` without burning daily state."""
     st = _state()
     try:
         msg = pull()
@@ -1950,7 +1838,7 @@ def session_warmup(cwd, session):
     if msg:
         prev = st.get("pending_pull_msg", "")
         st["pending_pull_msg"] = (prev + "\n" + msg).strip() if prev and msg not in prev else (msg or prev)
-    idx = load_index(budget=INDEX_BUDGET_S)
+    load_index(budget=INDEX_BUDGET_S)
     try:
         conn_w = coach_connectors.connector_status_summary(BRAIN)
         if conn_w.get("strava_connected") or conn_w.get("garmin_connected") or conn_w.get("google_health_connected"):
@@ -1965,10 +1853,6 @@ def session_warmup(cwd, session):
                 st = _state()
     except Exception as exc:
         _log_hook_error("warmup.coach_sync", exc)
-    try:
-        ensure_calendar_ready(idx, start_server=True)
-    except Exception as exc:
-        _log_hook_error("warmup.render_calendar", exc)
     if session:
         _session(st, session)["warmed_at"] = _now_iso()
     st["last_hook_run"] = _now_iso()
@@ -2013,6 +1897,19 @@ def session_text(cwd, session, skip_pull=False):
     if brief:
         st["last_briefing"] = today
         parts = []
+        todo_policy = str(s.get("overdue_todo_policy", "brief_propose") or "brief_propose").strip().lower()
+        if todo_policy == "rollover_today" and not PROBE:
+            try:
+                rr = cal_engine.rollover_overdue_todos_in_brain(BRAIN)
+                if rr.get("moved"):
+                    idx = load_index(budget=INDEX_BUDGET_S)
+                    due = deadlines(idx, days=horizon_days)
+                    parts.append(
+                        f"Overdue rollover (policy=rollover_today): moved {len(rr['moved'])} open [todo](s) to {today} "
+                        "(original dates kept as `(orig YYYY-MM-DD)`; hard [deadline]s untouched)."
+                    )
+            except Exception as exc:
+                _log_hook_error("session.rollover_todos", exc)
         tasks = actionable_tasks(idx, include_upcoming_days=0)
         shown_task_keys = set()
         if tasks:
@@ -2026,12 +1923,45 @@ def session_text(cwd, session, skip_pull=False):
             extra_note = f" (+{len(tasks) - len(top_tasks)} more open)" if len(tasks) > len(top_tasks) else ""
             tools_py = _show("_atlas/tools/atlas.py", cwd)
             py = _py_cmd()
-            parts.append(
-                f"Task check-in{extra_note} (once today — list numbered in the user's language and offer quick triage: "
-                f"check off [abhaken/done], reschedule [verschieben/move], or tackle now [jetzt angehen]; "
-                f"apply replies via `{py} -I {tools_py} todo done|move|skip ...`):\n"
-                + "\n".join(t_lines)
-            )
+            has_overdue_todo = any(t["kind"] == "todo" and t.get("overdue_days", 0) > 0 for t in top_tasks)
+            has_stale = any(t.get("stale") for t in top_tasks)
+            has_overdue_dead = any(t["kind"] == "deadline" and t.get("overdue_days", 0) > 0 for t in top_tasks)
+            if todo_policy == "manual":
+                triage_hint = (
+                    f"once today — list numbered in the user's language (policy=manual; apply replies via "
+                    f"`{py} -I {tools_py} todo done|move|unschedule|skip ...`)"
+                )
+            else:
+                free_hint = ""
+                if has_overdue_todo:
+                    try:
+                        free_days = cal_engine.suggest_free_days(
+                            calendar_items(idx, days=10, past_days=0, include_done=False),
+                            horizon_days=7,
+                            count=2,
+                        )
+                        if free_days:
+                            free_hint = " Suggested light/free days: " + ", ".join(
+                                f"{d['date']} ({d['weekday']})" for d in free_days
+                            ) + "."
+                    except Exception:
+                        pass
+                stale_bit = (
+                    " For STALE (>=7d) [todo] items, proactively offer 4 options: done, move to a suggested free day, "
+                    "`unschedule` (park in undated backlog & clear calendar clutter), or skip."
+                    if has_stale else ""
+                )
+                dead_bit = (
+                    " Never auto-reschedule hard [deadline] items — ask if done or if a new official deadline applies."
+                    if has_overdue_dead else ""
+                )
+                triage_hint = (
+                    f"once today — list numbered in the user's language; propose concrete reschedule dates for overdue [todo]s "
+                    f"without moving silently, and offer quick triage: check off [abhaken/done], reschedule [verschieben/move], "
+                    f"park in backlog [unschedule], or tackle now [jetzt angehen].{free_hint}{stale_bit}{dead_bit} "
+                    f"Apply replies via `{py} -I {tools_py} todo done|move|unschedule|skip ...`"
+                )
+            parts.append(f"Task check-in{extra_note} ({triage_hint}):\n" + "\n".join(t_lines))
         cal_upcoming = []
         for when, delta, what, rel in due:
             if delta < 0:
@@ -2045,12 +1975,18 @@ def session_text(cwd, session, skip_pull=False):
                 break
         if cal_upcoming:
             parts.append("Calendar & deadlines:\n" + "\n".join(cal_upcoming))
-        if not PROBE:
-            try:
-                cal_uri = ensure_calendar_ready(idx, start_server=True)
-                parts.append(f"Visual calendar: [📅 Kalender öffnen]({cal_uri}) (include this clickable link in the briefing)")
-            except Exception as exc:
-                _log_hook_error("session.render_calendar", exc)
+        try:
+            cs_ui = cal_sync.get_sync_ui_summary(BRAIN)
+            if cs_ui.get("enabled"):
+                cs_bits = []
+                if cs_ui.get("open_conflicts"):
+                    cs_bits.append(f"{cs_ui['open_conflicts']} open conflict(s) (`atlas.py cal conflicts`)")
+                if cs_ui.get("auth_warnings"):
+                    cs_bits.append(f"auth renew needed: {', '.join(cs_ui['auth_warnings'])} (`atlas.py cal auth`)")
+                if cs_bits:
+                    parts.append("Calendar sync notice: " + " | ".join(cs_bits))
+        except Exception as exc:
+            _log_hook_error("session.cal_sync_status", exc)
         try:
             if "coach" in st.get("modules", []) or os.path.isdir(os.path.join(BRAIN, "coach")):
                 c_state = load_coach_state()
@@ -2119,11 +2055,6 @@ def session_text(cwd, session, skip_pull=False):
                      "if tasks are open), then handle the user's request right away."
                      + ("\n" + "\n".join(parts) if parts else "\nNothing pending; say so in one line."))
     else:
-        if not PROBE:
-            try:
-                ensure_calendar_ready(idx, start_server=True)
-            except Exception as exc:
-                _log_hook_error("session.render_calendar", exc)
         urgent = [d for d in due if d[1] <= 0]
         if urgent:
             more_u = f" (+{len(urgent) - 5} more — run `atlas.py todo`)" if len(urgent) > 5 else ""
@@ -2549,7 +2480,7 @@ def prompt_text(prompt, cwd, session):
             except Exception:
                 pass
             lines.append(
-                f"Atlas tasks/calendar -> Use `{py} -I {tools_py} todo` (`list|done|move|skip|add \"<text>\" [--to YYYY-MM-DD] [--time HH:MM] [--kind event|todo|deadline|blocked|goal]`) or `{py} -I {tools_py} calendar`.{sync_extra}"
+                f"Atlas tasks/calendar -> Use `{py} -I {tools_py} todo` (`list|done|move|unschedule|skip|add \"<text>\" [--to YYYY-MM-DD] [--time HH:MM] [--kind event|todo|deadline|blocked|goal]`) or `{py} -I {tools_py} calendar`.{sync_extra}"
             )
         # Zero-token incremental Google Calendar auto-pull (TTL 60s on calendar/coach/briefing intent, else 15m; 2s fail-open)
         if not PROBE:
@@ -2574,8 +2505,6 @@ def prompt_text(prompt, cwd, session):
                         bits.append(f"auth renew needed: {', '.join(pull_res['auth_warnings'])}")
                     if bits:
                         lines.append(f"Atlas cal-sync -> {', '.join(bits)}.")
-                        if pull_res.get("files_changed"):
-                            render_calendar_html(idx, start_server=False)
             except Exception as exc:
                 _log_hook_error("prompt.cal_sync", exc)
         for ext_name, ext_rel, ext_cmd in _detect_user_extensions(prompt)[:2]:
@@ -2800,39 +2729,6 @@ def _auto_heal_dirty_brain_pages():
     return graph_engine.auto_heal_pages(BRAIN, dirty, tag_vocab_map=tag_vocab(), db_path=CACHE)
 
 
-def _calendar_needs_render():
-    """Return True only when `CAL_HTML` is missing, from a prior day, or relevant calendar/coach/due sources are newer."""
-    try:
-        if not os.path.isfile(CAL_HTML):
-            return True
-        cal_mtime = os.path.getmtime(CAL_HTML)
-        if dt.date.fromtimestamp(cal_mtime) != dt.date.today():
-            return True
-    except OSError:
-        return True
-    for single in (os.path.join(BRAIN, "settings.md"), os.path.join(BRAIN, "_secrets", "strava.env")):
-        try:
-            if os.path.isfile(single) and os.path.getmtime(single) > cal_mtime:
-                return True
-        except OSError:
-            pass
-    for sub in ("calendar", "coach", "areas", "projects", "people", "self"):
-        base = os.path.join(BRAIN, sub)
-        if not os.path.isdir(base):
-            continue
-        for dp, dns, fns in os.walk(base):
-            dns[:] = [d for d in dns if not d.startswith(".")]
-            for fn in fns:
-                if not fn.lower().endswith((".md", ".json")):
-                    continue
-                try:
-                    if os.path.getmtime(os.path.join(dp, fn)) > cal_mtime:
-                        return True
-                except OSError:
-                    continue
-    return False
-
-
 READONLY_AG_TOOLS = {
     "read_file", "view_file", "view_file_outline", "view_code_item", "grep_search", "find_by_name",
     "list_dir", "list_resources", "read_resource", "read_url", "read_url_content", "search_web",
@@ -3037,18 +2933,10 @@ def stop(agent, data):
         deleted_cal_tasks = _detect_deleted_open_calendar_tasks()
     except Exception as exc:
         _log_hook_error("stop.calendar_guard", exc)
-    cal_pushed_files = []
     try:
-        push_res = cal_sync.auto_push_on_stop(BRAIN, timeout=4.0)
-        if push_res and push_res.get("files_changed"):
-            cal_pushed_files = push_res["files_changed"]
+        cal_sync.auto_push_on_stop(BRAIN, timeout=4.0)
     except Exception as exc:
         _log_hook_error("stop.cal_sync_push", exc)
-    try:
-        if cal_pushed_files or _calendar_needs_render():
-            render_calendar_html()
-    except Exception as exc:
-        _log_hook_error("stop.render_calendar", exc)
     try:
         autocommit_and_push()
     except Exception as exc:

@@ -1,0 +1,11 @@
+{
+  "skeleton_add": [
+    "calendar/README.md"
+  ],
+  "settings_add": {
+    "overdue_todo_policy": "brief_propose  # brief_propose | manual | rollover_today"
+  },
+  "notes": [
+    "Atlas `1.7.0` commits cleanly to the Chat-First architecture: `calendar.html` (Calendar UI, Coach View, Brain Graph) has been removed from the core and replaced by a minimal headless loopback OAuth helper (`atlas-oauth-v8`) for 1-click connectors. Your native Markdown calendar (`brain/calendar/README.md`) remains the Source of Truth — standalone in chat or optionally synced per layer via `atlas.py cal` (Google Calendar). New in `1.7.0`: Smart Overdue Triage (`overdue_todo_policy: brief_propose` with `+Nd` age badges, `STALE >=7d` 4-option triage, free-day suggestions, and `atlas.py todo unschedule` for parking dated tasks back into the undated backlog without losing them), plus hardened German/English natural-language task triggers in hooks. If external calendar sync is not connected yet, optionally offer `atlas.py cal auth`."
+  ]
+}

@@ -21,14 +21,18 @@ agent memories, scattered documents and code repositories included), and ends wi
 
 ## What it feels like
 
-- **Open `C:\Atlas`, start a chat, talk.** The first chat of the day starts with a 3–6 line briefing: what is due,
-  what waits in the inbox, one question about something Atlas is missing. Later chats stay quiet unless something is
-  due today.
-- **"Continue in the shop app."** Atlas routes into that repository once and from then on codes like a normal agent.
+- **Open `C:\Atlas`, start a chat, talk — 100 % Chat-First.** The first chat of the day starts with a 3–6 line briefing
+  and a numbered smart task check-in (showing overdue age, concrete free-day suggestions, and backlog parking for stale
+  items — never shifting dates silently). Later chats stay quiet unless something is due today.
+- **"Remind me on Friday to call the dentist" / "Continue in the shop app."** Tasks and appointments go straight into
+  your native Atlas Markdown calendar (`brain/calendar/README.md`) — works standalone with zero connectors, or syncs
+  automatically per layer (bidirectional / read-only / `#local`) with your real external calendar app on desktop, phone,
+  and watch (Google Calendar built in; CalDAV/Apple Calendar next). Project prompts route straight into that repository.
 - **"Remember: the car insurance can be cancelled until 30 November."** Filed on the right page with a deadline; you
   are reminded in time.
 - **"No, that's wrong."** A correction becomes a lesson Atlas keeps.
-- **On the phone** the Claude or Antigravity app connected to your computer works the same way.
+- **On the phone** the Claude or Antigravity app connected to your computer works the same way — no broken `localhost`
+  HTML dashboards needed.
 - **Once a week** Atlas tidies itself after your first request and tells you in three lines what it did.
 
 ## What you get
@@ -93,9 +97,9 @@ to file what was learned (always after a learning signal, otherwise throttled).
 
 | In chat | What it does |
 |---|---|
-| `/atlas-brief` | what is due, in 3–6 lines |
-| `/atlas-calendar` | open and manage the native Atlas-First visual calendar, 1-click to-do hub & interactive `🕸️ Brain Graph` (`--view graph`) |
-| `/atlas-coach` | adaptive Simple-to-Pro Cycling, Running & Strength coach: macro periodization, 14d workouts, `.zwo` export, `CP/W'`, `W'bal`, `CTL/ATL/TSB`, Strava sync |
+| `/atlas-brief` | what is due, smart overdue task check-in & free-day suggestions, in 3–6 lines |
+| `/atlas-calendar` | chat-first native Markdown calendar (`brain/calendar/`), atomic to-do triage (`atlas.py todo`), optional multi-account Google Calendar 3-way sync & FreeBusy (`atlas.py cal`) |
+| `/atlas-coach` | adaptive Simple-to-Pro Cycling, Running & Strength coach: macro periodization, 14d workouts, `.zwo`/`.fit` export, `CP/W'`, `W'bal`, `CTL/ATL/TSB`, Strava / Hammerhead / Google Health / Garmin connectors |
 | `/atlas-mail` | multi-account IMAP mail client, header-fast search/audit, `mail ingest` bridge, and safety-gated `move`, `trash`, `flags` & `labels` |
 | `/atlas-sort` | file the inbox (and the cloud inbox), or bring a messy folder into Atlas |
 | `/atlas-learn` | review this chat: file facts, propose rules and skills |
@@ -106,7 +110,7 @@ to file what was learned (always after a learning signal, otherwise throttled).
 | `/atlas-update` | agent changes, core updates, self-healing |
 | `/atlas-adopt-repo` | (developer module) bring a repository under Atlas |
 
-The engine: `python -I brain/_atlas/tools/atlas.py <init|wire|unwire|routes|projects|index|find|graph|context|link|conflicts|probe|check|deadlines|calendar|coach|mail|inventory|move|verify|undo|mark|adopt|code-sync|core-diff|core-apply|state>`.
+The engine: `python -I brain/_atlas/tools/atlas.py <init|wire|unwire|routes|projects|index|find|where|graph|context|link|conflicts|probe|check|deadlines|calendar|cal|todo|coach|mail|inventory|move|verify|undo|mark|adopt|code-sync|core-diff|core-apply|state>`.
 
 ## Updates and development
 
@@ -131,5 +135,7 @@ test suite (`python -I tests/run.py`) and a separate test Atlas (`python -I dev/
 
 ## Status
 
-Version 1.1.0. Built from a setup in daily professional use, generalised for every part of life. The Antigravity and
-Claude Code wiring follows the official docs as of 2026-11-13; open checks are listed in [`core/adapters.md`](core/adapters.md).
+Version 1.7.0. Built from a setup in daily professional use, generalised for every part of life. Chat-first by design
+(native Markdown calendar & to-do hub with optional external calendar sync; zero local HTML dashboards). The
+Antigravity and Claude Code wiring follows the official docs as of 2026-11-25; open checks are listed in
+[`core/adapters.md`](core/adapters.md).

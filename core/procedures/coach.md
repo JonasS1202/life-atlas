@@ -111,7 +111,7 @@ All credentials stay local in `brain/_secrets/*.env` (`chmod 600`):
    - **`ILLNESS_ALERT` (`ROT`), `GELB-B` & `ROT` Overrides:** Whenever `>= 2` objective wearable markers spike simultaneously (`Skin Temp >= +0.5°C`, `Resp >= +1.5/min`, `RHR >= +5 bpm`, `HRV < 28d-SWC`, `SpO2 < 94%`) or `3d sleep debt >= 5h`, Stage 1 triggers **`ROT`** (`ILLNESS_ALERT` -> immediate rest/deload, never push through an onset infection!). If autonomic `HRV`/`RHR` is green, yet local leg pain is high ("Beine wie Beton"), running leg-spring stiffness `k_leg` dropped `>=15%`, or yesterday's `Q_Strain` spiked -> **`GELB-B`** (postpone HIIT 24–48 h). If peak `HRmax` is blunted (`>=10 bpm` below `HRmax` on hard/RPE>=8 efforts) -> **`ROT`** (immediate 3–5d deload)!
    - **Body Fat (`KFA`) Protection Guard:** Wearable/scale `weight_kg` updates `mass_kg_7d` automatically, while noisy BIA `body_fat_pct` NEVER silently overwrites a calibrated `profile.md` KFA — surface `[KFA-Guard]` advisories in chat for explicit confirmation first.
    - When anchors are missing/stale, schedule standardized tests via `atlas.py coach field-test --unit 1|1-std|reconst|2|2a|2b|preload|lsct --date YYYY-MM-DD --execute`.
-   - Always include the exact Dashboard URL printed by `atlas.py coach context` (fallback: `[📅 Coach Dashboard öffnen](http://127.0.0.1:8765/calendar.html?view=coach)`) when plans, workouts, or telemetry are discussed.
+   - Present coaching telemetry, plans, and readiness cleanly right in chat (Chat-First — no local HTML dashboards; workouts sync automatically to external calendars if `atlas.py cal` is configured, and `.zwo`/`.fit` files push to head units).
 
 ---
 

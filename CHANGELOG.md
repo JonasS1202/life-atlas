@@ -2,6 +2,21 @@
 
 Written for users: `/atlas-update` shows the sections between the installed and the new version.
 
+## [1.7.0] - 2026-11-25
+
+- **Chat-First Architecture — Removal of `calendar.html` & Headless OAuth Helper (`cal_engine.py`, `atlas_hook.py`, `atlas.py`, `router.md`, `calendar.md`, `brief.md`, `coach.md`):**
+  - Removed `core/templates/calendar.html` (Calendar UI, To-Do UI, Coach View, Brain Graph) and all local HTML dashboard rendering/links so Atlas commits cleanly to a **Chat-only entry point** (works identically on desktop and mobile apps without broken `localhost` UIs).
+  - Kept `brain/calendar/` (native Markdown calendar & to-do hub) as the first-class Source of Truth — works 100 % standalone in chat with zero connectors OR synced per layer (`bidirectional`, `read-only`, `#local`) with your external calendar app via `atlas.py cal`.
+  - Replaced the legacy `_cal_server.py` static web server with a minimal headless OAuth loopback helper (`atlas-oauth-v8`, zero static file serving, started on demand only when connecting Google Calendar, Strava, Hammerhead Karoo, or Google Health); `/atlas-update` cleans up legacy `calendar.html`/`cal_csrf.txt`/`_cal_server.py` cache files automatically.
+- **Smart Overdue To-Do Triage & Backlog Parking (`cal_engine.py`, `atlas_hook.py`, `atlas.py`, `skeleton/settings.md`):**
+  - Added `overdue_todo_policy: brief_propose` (default; alternatives: `manual`, opt-in `rollover_today`) to `settings.md`.
+  - Strict separation of hard `[deadline]` items (never auto-moved) vs. flexible `[todo]` items: daily briefings show `+Nd` age badges, zero-token suggested light/free days (`suggest_free_days`), and proactive 4-option triage for `STALE >=7d` to-dos (`done`, `move`, `unschedule`, `skip`).
+  - Added `atlas.py todo unschedule <target>` to park dated `[todo]` items back into undated `## Open To-Dos` (clearing calendar/Google clutter without losing the task, while refusing hard `[deadline]` / frontmatter `due:` entries).
+- **Onboarding, Natural-Language Triggers & Release Consistency (`atlas_hook.py`, `INSTALL.md`, `README.md`, `CONTRIBUTING.md`, `tests/run.py`):**
+  - Hardened `TODO_RX` for natural German and English task phrasing (*"leg mir mal die Aufgabe an"*, *"erinnere mich morgen…"*, *"ich muss noch…"*, *"remind me on Friday…"*, *"add a task…"*).
+  - Updated `INSTALL.md` (Phase 12 handover & optional calendar connector offer), `README.md` (`v1.7.0`, Chat-First vision & current skills), and added a clear 5-step Google Cloud OAuth setup guide in `core/procedures/calendar.md`.
+  - Enforced permanent release consistency (`README.md`, `INSTALL.md`, `CHANGELOG.md`, `core/VERSION`, zero stale `calendar.html` refs) via `CONTRIBUTING.md` and automated unit tests.
+
 ## [1.6.1] - 2026-11-24
 
 - **Calendar Sync Patch (`cal_sync.py`):**

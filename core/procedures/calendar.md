@@ -1,84 +1,105 @@
-# Procedure: Atlas-First Calendar & To-Dos (`/atlas-calendar`)
+# Procedure: Chat-First Atlas Calendar & To-Dos (`/atlas-calendar`)
 
-Used when the user says "öffne meinen Kalender", "zeig mir meinen Kalender", "was steht im Kalender", asks about
-appointments/to-dos, or invokes `/atlas-calendar`.
+Used when the user asks about their calendar, schedule, free slots, appointments, deadlines, or to-dos, wants to connect
+an external calendar, or invokes `/atlas-calendar`.
 
-## 1. Strict Atlas-First Rule
+## 1. Chat-First & Atlas-Owned Source of Truth
 
-- **"My calendar" is ALWAYS the native Atlas calendar** (`brain/calendar/*.md` rendered via `atlas.py calendar`).
-- **NEVER open or link to `calendar.google.com`, Apple Calendar, or Outlook** when the user asks to open or view their
-  calendar. External calendars sync cleanly into `brain/calendar/*.md` via `atlas.py cal` (or passive `.ics` feeds via `calendar_ics`).
-- **NEVER link to `file:///.../calendar.html` in chat**, because IDEs like Antigravity and VS Code open `file://` links
-  as raw HTML source code in the text editor. Always use the `http://127.0.0.1:<port>/calendar.html` link printed by
-  `atlas.py calendar`!
+- **Chat is ALWAYS the entry point.** Atlas does not maintain a local HTML dashboard (`calendar.html`). Show agendas,
+  tasks, free slots, and event details cleanly right in chat.
+- **`brain/calendar/` is ALWAYS the Source of Truth.** `brain/calendar/README.md` (plus optional layered files
+  `brain/calendar/<layer>.md`) works **100 % standalone with zero connectors**, OR synced individually per layer
+  (`bidirectional`, `read-only`, or `#local` per-line overrides) with the external calendar app the user prefers on
+  desktop, phone, and watch (currently Google Calendar via `atlas.py cal`; passive `.ics` import/export via
+  `atlas.py calendar --ics` / `--sync-ics`).
 
-## 2. Opening & showing the calendar
+## 2. Viewing the calendar & agenda in chat
 
 Run:
 
 ```bash
-python -I <ROOT>/brain/_atlas/tools/atlas.py calendar --open
-# Or open directly in Brain Graph / Coach / To-Do tab:
-python -I <ROOT>/brain/_atlas/tools/atlas.py calendar --view graph --open
+python -I <ROOT>/brain/_atlas/tools/atlas.py calendar --days 14
+# Include undated tasks / all future items / sync Google Calendar first:
+python -I <ROOT>/brain/_atlas/tools/atlas.py calendar --sync --days 30
+python -I <ROOT>/brain/_atlas/tools/atlas.py calendar --all
 ```
 
-(On Windows use `python -I` — never `python3`, which triggers the Microsoft Store stub; on Linux/macOS without `python` use `python3 -I`, matching the `Tool:` line in `ROUTER.md`.)
+(On Windows use `python -I` — never `python3`, which triggers the Microsoft Store stub; on Linux/macOS without `python`
+use `python3 -I`, matching the `Tool:` line in `ROUTER.md`.)
 
 What this does automatically (0 LLM tokens):
-1. Merges `brain/calendar/README.md` (`## Timeline` and `## Open To-Dos`) with all decentralized `due:` items across
-   the brain, plus the SQLite knowledge graph (`index.sqlite`) and adaptive Coach state.
-2. Regenerates the visual dashboard (`brain/_atlas/cache/calendar.html`) with 4 views (`Alle`, `🚴 Coach View`,
-   `☑️ To-Dos & Fristen`, and `🕸️ Brain Graph`).
-3. Starts the loopback server (`atlas-cal-v7`) on `http://127.0.0.1:<port>/calendar.html` (with CSRF-protected
-   1-click To-Do/Workout checkbox toggling via `POST /toggle-todo`, OAuth loopback routes, and optional background calendar sync) and opens the rendered dashboard in the browser.
+- Merges `brain/calendar/README.md` (`## Timeline` and `## Open To-Dos`) with all layered `brain/calendar/*.md` files
+  and decentralized `due:` frontmatter items across the brain.
+- Prints a concise chronological agenda + undated open to-dos for your reply. Summarize the next upcoming items and top
+  open to-dos cleanly in chat.
 
-In your reply:
-- Give the user the clickable `http://127.0.0.1:<port>/calendar.html` link printed by the command (`[📅 Atlas Kalender öffnen](http://127.0.0.1:.../calendar.html)`).
-- Summarize the next upcoming items and top open to-dos in a few crisp lines.
+## 3. Atomic task & event triage (`atlas.py todo`)
 
-## 3. Quick task triage (`atlas.py todo`) & manual calendar edits
-
-Use `atlas.py todo` for atomic, zero-token task operations (automatically syncs `index.sqlite` and refreshes `calendar.html`):
+Use `atlas.py todo` for atomic, zero-token task & event operations (automatically creates `brain/calendar/README.md` if
+missing and syncs `index.sqlite`; if external calendar sync is enabled, the Stop hook pushes changes automatically):
 
 ```bash
-# List numbered actionable tasks (overdue, due today, and open to-dos; add --all for future dates):
+# List numbered actionable tasks (overdue with age/+Nd & STALE >=7d badges, due today, undated backlog, + free-day hints):
 python -I <ROOT>/brain/_atlas/tools/atlas.py todo
+python -I <ROOT>/brain/_atlas/tools/atlas.py todo list --all
 
-# Check off (`[x]`) or skip (`[-]`) by briefing #number, task text, or --file/--line:
+# Check off (`[x]`), skip (`[-]`), or reopen by briefing #number, task text, or --file/--line:
 python -I <ROOT>/brain/_atlas/tools/atlas.py todo done 1
 python -I <ROOT>/brain/_atlas/tools/atlas.py todo done "Tax return"
 python -I <ROOT>/brain/_atlas/tools/atlas.py todo skip 2
 
-# Reschedule a dated task/due: item OR schedule an undated Open To-Do onto a date:
-python -I <ROOT>/brain/_atlas/tools/atlas.py todo move 2 --to 2026-11-20
+# Reschedule a dated task/due: item OR schedule an undated Open To-Do onto a concrete date:
+python -I <ROOT>/brain/_atlas/tools/atlas.py todo move 2 --to 2026-11-28
 python -I <ROOT>/brain/_atlas/tools/atlas.py todo move "Tax return" --to +3d
 
-# Add a new dated `[todo]`, `[event]`, `[deadline]`, `[blocked]`, or `[goal]` (with optional `--time`) or undated Open To-Do:
+# Park an overdue/stale dated `[todo]` back into the undated `## Open To-Dos` backlog (clears calendar clutter; refuses hard `[deadline]`s):
+python -I <ROOT>/brain/_atlas/tools/atlas.py todo unschedule 1
+
+# Add a new dated `[todo]`, `[event]`, `[deadline]`, `[blocked]`, or `[goal]` (with optional `--time` & `--cal <layer>`) or undated Open To-Do:
 python -I <ROOT>/brain/_atlas/tools/atlas.py todo add "Call dentist" --to tomorrow
 python -I <ROOT>/brain/_atlas/tools/atlas.py todo add "Dentist appointment" --to 2026-11-25 --time 10:15 --kind event
+python -I <ROOT>/brain/_atlas/tools/atlas.py todo add "Client sync" --to 2026-12-03 --time 10:00-11:00 --kind event --cal work
 python -I <ROOT>/brain/_atlas/tools/atlas.py todo add "Review backup disk" --prio high
 ```
 
-For multi-line edits or events/workouts/goals/blockers in `brain/calendar/README.md`:
+### Overdue Task Policy (`overdue_todo_policy` in `brain/settings.md`)
+- **`brief_propose` (default):** Never silently shift dates. Surface age (`+Nd`) + suggested free days in the daily
+  briefing; for stale `[todo]` items (`≥ 7d`), proactively offer `done` / `move` / `unschedule` (backlog) / `skip`.
+  Hard `[deadline]` entries are never auto-moved.
+- **`manual`:** Show overdue items in the briefing without proactive reschedule suggestions.
+- **`rollover_today` (opt-in):** Automatically rolls open overdue `[todo]` entries (never `[deadline]`) onto today on
+  the first chat of the day, appending `(orig YYYY-MM-DD)` so the real age stays transparent.
+
+For multi-line manual edits in `brain/calendar/README.md`:
 - **Dated items** go under `## Timeline`:
   `- [ ] YYYY-MM-DD [kind] What` (or `YYYY-MM-DD..YYYY-MM-DD`, optional `HH:MM` or `HH:MM-HH:MM`).
   Kinds: `[event]`, `[blocked]`, `[goal:A]`, `[workout:cycling]`, `[workout:running]`, `[todo]`, `[birthday]`, `[deadline]`.
 - **Undated tasks** go under `## Open To-Dos`:
   `- [ ] [high|med|low] Task description` (moving to a date via `atlas.py todo move` promotes it to `## Timeline`).
-- After manual edits to `brain/calendar/*.md`, run `atlas.py calendar` (or `--open` if requested) so `calendar.html` updates immediately.
 
-## 4. Bidirectional Google Calendar Sync, FreeBusy, Invites & RSVP (`atlas.py cal`)
+## 4. Optional Bidirectional Google Calendar Sync (`atlas.py cal`)
 
-Optional, zero-token bidirectional multi-account sync powered by Google Calendar REST API v3 (`brain/_secrets/gcal.env`, `chmod 600`; config in `brain/calendar/sync.yaml`; 3-way state & metadata cache in `brain/_atlas/cache/cal_sync.sqlite`).
+Completely opt-in, zero-token multi-account 3-way sync via Google Calendar REST API v3 (`brain/_secrets/gcal.env`,
+`chmod 600`; layer config in `brain/calendar/sync.yaml`; 3-way state & metadata cache in
+`brain/_atlas/cache/cal_sync.sqlite`).
 
-### Setup (once per account)
+### 5-Step Google Cloud Setup (once, 0 EUR, no 7-day token expiry)
+
+1. Open [Google Cloud Console](https://console.cloud.google.com/) and create a **dedicated Calendar project** (tip: do
+   **not** mix restricted Google Health scopes into the same project so you can publish cleanly without 7-day token
+   expiry).
+2. Enable **Google Calendar API** under *APIs & Services → Library*.
+3. Open *Google Auth Platform → Audience* (OAuth Consent Screen): choose **External**, add your email(s) under *Test
+   users* (or fill Branding + click **Publish App / In Production** for permanent refresh tokens).
+4. Open *Clients → + Create client* → Application type **Desktop app** → **Download JSON** (`client_secret_*.json`).
+5. Run in Atlas (starts the minimal headless loopback OAuth callback on `127.0.0.1:8765` automatically):
 
 ```bash
-# 1. Import Google Cloud Desktop-App OAuth JSON (set Consent Screen to "In Production" so refresh tokens do not expire after 7 days):
+# 1. Import OAuth Desktop-App JSON & authorize first account:
 python -I <ROOT>/brain/_atlas/tools/atlas.py cal auth --account personal --client-json ~/Downloads/client_secret_*.json
-# 2. Authorize additional accounts (e.g. work / company workspace) via 1-click loopback callback:
+# 2. Optional: authorize additional accounts (e.g. work / company workspace):
 python -I <ROOT>/brain/_atlas/tools/atlas.py cal auth --account work
-# 3. Discover layered calendars across all accounts, deduplicate shared calendarIds, and write `brain/calendar/sync.yaml`:
+# 3. Discover calendars across all accounts, deduplicate shared calendarIds, and write `brain/calendar/sync.yaml`:
 python -I <ROOT>/brain/_atlas/tools/atlas.py cal discover
 python -I <ROOT>/brain/_atlas/tools/atlas.py cal discover --execute
 # 4. Run initial 3-stage deduplication dry-run, inspect, then apply:
@@ -96,7 +117,7 @@ python -I <ROOT>/brain/_atlas/tools/atlas.py cal sync --execute
 - **Own events without external attendees:**
   - Edit `brain/calendar/<layer>.md` or run `atlas.py todo add "<text>" --to <date> --time <HH:MM> --kind event [--cal <layer>]`.
   - The Stop hook automatically pushes changes to Google (0 LLM tokens); PreInvocation pulls incremental `syncToken` deltas automatically.
-  - Per-line overrides: add `#local` to keep a specific entry strictly in Atlas (never pushed to Google), or `#sync` to force-sync a local-only kind (e.g. a single `[birthday]`).
+  - Individual per-layer modes (`bidirectional` or `read-only` in `sync.yaml`) plus per-line overrides: add `#local` to keep a specific entry strictly in Atlas (never pushed), or `#sync` to force-sync a local-only kind (e.g. a single `[birthday]`).
 - **External invites, Google Meet creation & RSVP (Strict Safety-Gate):**
   - **NEVER pass `--yes` without first showing the preview and getting explicit user confirmation** (Google sends real emails to third parties!).
   - Preview first:

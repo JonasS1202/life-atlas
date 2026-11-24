@@ -1,4 +1,4 @@
-"""Unit & loopback-HTTP tests for `cal_engine.py` and `core/templates/calendar.html` (`v1.1.1`)."""
+"""Unit & headless OAuth loopback tests for `cal_engine.py`, Smart Overdue Triage, and Chat-First hooks (`v1.7.0`)."""
 import concurrent.futures
 import datetime as dt
 import json
@@ -21,7 +21,7 @@ if TOOLS_DIR not in sys.path:
     sys.path.insert(0, TOOLS_DIR)
 
 import importlib.util  # noqa: E402
-from atlas_lib import cal_engine, graph_engine  # noqa: E402
+from atlas_lib import cal_engine  # noqa: E402
 
 
 def _load_hook_for_brain(brain):
@@ -31,7 +31,6 @@ def _load_hook_for_brain(brain):
     mod.BRAIN = brain
     mod.STATE = os.path.join(brain, "_atlas", "state.json")
     mod.CACHE = os.path.join(brain, "_atlas", "cache", "index.sqlite")
-    mod.CAL_HTML = os.path.join(brain, "_atlas", "cache", "calendar.html")
     mod.ERR_LOG = os.path.join(brain, "_atlas", "cache", "hook_errors.log")
     mod.CONFLICTS_FILE = os.path.join(brain, "_atlas", "conflicts.json")
     return mod
@@ -43,91 +42,86 @@ def _write_file(path, text):
         fh.write(text)
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 class UiCalUnit(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="atlas-uical-")
+        self.tmp = tempfile.mkdtemp(prefix="atlas-caleng-")
         self.brain = os.path.join(self.tmp, "Atlas", "brain")
         os.makedirs(os.path.join(self.brain, "_atlas", "cache"), exist_ok=True)
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_template_loading_and_script_escaping(self):
-        tpl = cal_engine.load_calendar_template()
-        self.assertIn("🕸️ Brain Graph", tpl)
-        self.assertIn("id=\"f-graph\"", tpl)
-        self.assertIn("minmax(0,1fr)", tpl)
-        self.assertIn("postToggleTodo", tpl)
-        self.assertIn("Simple Mode", tpl)
-        self.assertIn("renderPmcSparkline", tpl)
-        self.assertNotIn("http-equiv=\"refresh\"", tpl)
+    def test_headless_oauth_server_routes_and_no_static_files(self):
+        cache_dir = os.path.join(self.brain, "_atlas", "cache")
+        _write_file(os.path.join(cache_dir, "secret_probe.txt"), "do-not-expose\n")
+        srv_script = cal_engine.write_oauth_server_script(cache_dir)
+        port_file = os.path.join(cache_dir, "cal_port.txt")
+        if os.path.exists(port_file):
+            os.remove(port_file)
 
-        tricky = {
-            "note": "Danger </script><script>window.HACKED=1</script> & line\u2028sep\u2029ok",
-            "nested": ["</SCRIPT>", "normal"],
-        }
-        encoded = cal_engine.safe_json_for_script(tricky)
-        self.assertNotIn("</script>", encoded.lower())
-        self.assertNotIn("\u2028", encoded)
-        self.assertNotIn("\u2029", encoded)
-        # Must remain 100% valid JSON for `JSON.parse()` in 15s background sync
-        decoded = json.loads(encoded)
-        self.assertEqual(decoded, tricky)
+        proc = subprocess.Popen(
+            [sys.executable, "-I", "-B", srv_script, "0", cache_dir, TOOLS_DIR],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            bound_port = None
+            for _ in range(40):
+                if os.path.isfile(port_file):
+                    try:
+                        with open(port_file, encoding="utf-8") as pf:
+                            p_val = int(pf.read().strip())
+                        if p_val > 0 and cal_engine.oauth_http_ok(p_val):
+                            bound_port = p_val
+                            break
+                    except (OSError, ValueError):
+                        pass
+                time.sleep(0.05)
+            self.assertIsNotNone(bound_port, "Ephemeral _oauth_server.py failed to start and pass /healthz")
 
-    def test_brain_graph_payload_nodes_edges_warnings_and_mentions(self):
-        _write_file(
-            os.path.join(self.brain, "INDEX.md"),
-            "---\nsummary: Root index\ntags: [atlas]\n---\n# Index\n\n"
-            "- [People](people/README.md)\n- [Projects](projects/README.md)\n- [Areas](areas/README.md)\n",
-        )
-        _write_file(
-            os.path.join(self.brain, "people", "README.md"),
-            "---\nsummary: People hub\ntags: [person]\n---\n# People\n\n- [Anna](anna-beispiel.md)\n",
-        )
-        _write_file(
-            os.path.join(self.brain, "people", "anna-beispiel.md"),
-            "---\nsummary: Anna Beispiel — Projektpartnerin\ntags: [person]\nverified: 2024-01-10\n---\n"
-            "# Anna Beispiel\n\n## Kontakt\n\nTelefon & Mail.\n",
-        )
-        _write_file(
-            os.path.join(self.brain, "projects", "README.md"),
-            "---\nsummary: Projects hub\ntags: [project]\n---\n# Projects\n\n- [Alpha](alpha/README.md)\n",
-        )
-        _write_file(
-            os.path.join(self.brain, "projects", "alpha", "README.md"),
-            "---\nsummary: Alpha Launch\ntags: [project]\n---\n# Projekt Alpha\n\n"
-            "Abstimmung mit [Anna](../../people/anna-beispiel.md#kontakt) und [Fehlt](nicht-da.md).\n",
-        )
-        _write_file(
-            os.path.join(self.brain, "areas", "README.md"),
-            "---\nsummary: Areas hub\ntags: [atlas]\n---\n# Areas\n\n- [Notiz](notiz.md)\n",
-        )
-        _write_file(
-            os.path.join(self.brain, "areas", "notiz.md"),
-            "---\nsummary: Isolierte Fachnotiz\ntags: [work]\n---\n# Fachnotiz\n\n"
-            "Rücksprache mit Anna Beispiel nächste Woche einplanen.\n",
-        )
+            base_url = f"http://127.0.0.1:{bound_port}"
+            opener = urllib.request.build_opener(_NoRedirect)
 
-        idx = graph_engine.sync_index(self.brain)
-        gp = cal_engine.build_brain_graph_payload(self.brain, idx=idx, today=dt.date(2026, 11, 13))
-        by_rel = {n["rel"]: n for n in gp["nodes"]}
+            # 1. /healthz -> 200 atlas-oauth-v8
+            with urllib.request.urlopen(f"{base_url}/healthz", timeout=3) as resp:
+                self.assertEqual(resp.status, 200)
+                self.assertEqual(resp.read(), b"atlas-oauth-v8")
 
-        self.assertIn("people/anna-beispiel.md", by_rel)
-        anna = by_rel["people/anna-beispiel.md"]
-        self.assertEqual(anna["domain"], "people")
-        self.assertTrue(anna["stale_verified"])
-        self.assertTrue(any(b["src"] == "projects/alpha/README.md" and b["anchor"] == "kontakt" for b in anna["backlinks"]))
-        self.assertTrue(any(u["src"] == "areas/notiz.md" and "Anna Beispiel" in u["matched"] for u in anna["unlinked_mentions"]))
+            # 2. /strava-connect -> 302 redirect to Strava OAuth
+            try:
+                opener.open(f"{base_url}/strava-connect", timeout=3)
+                self.fail("Expected 302 redirect on /strava-connect")
+            except urllib.error.HTTPError as e:
+                with e:
+                    self.assertEqual(e.code, 302)
+                    loc = e.headers.get("Location", "")
+                    self.assertIn("strava.com/oauth/authorize", loc)
+                    self.assertIn(f"127.0.0.1%3A{bound_port}%2Fstrava-callback", loc)
 
-        alpha = by_rel["projects/alpha/README.md"]
-        self.assertTrue(len(alpha["broken_links"]) >= 1)
+            # 3. /gcal-connect without client JSON -> clean setup page with ZERO calendar.html links
+            with urllib.request.urlopen(f"{base_url}/gcal-connect?account=work", timeout=3) as resp:
+                self.assertEqual(resp.status, 200)
+                body = resp.read().decode("utf-8")
+                self.assertIn("Google Calendar Sync Setup", body)
+                self.assertNotIn("calendar.html", body)
 
-        notiz = by_rel["areas/notiz.md"]
-        self.assertTrue(notiz["isolated"])
-        self.assertGreaterEqual(gp["stats"]["horizontal_edges"], 1)
-        self.assertGreaterEqual(gp["stats"]["stale_verified"], 1)
-        self.assertGreaterEqual(gp["stats"]["broken_links"], 1)
-        self.assertGreaterEqual(gp["stats"]["unlinked_mentions"], 1)
+            # 4. No static file serving (calendar.html and cache files must return 404!)
+            for forbidden_path in ("/calendar.html", "/secret_probe.txt", "/cal_port.txt"):
+                try:
+                    urllib.request.urlopen(f"{base_url}{forbidden_path}", timeout=3)
+                    self.fail(f"Expected 404 for {forbidden_path}")
+                except urllib.error.HTTPError as e:
+                    with e:
+                        self.assertEqual(e.code, 404)
+        finally:
+            proc.terminate()
+            proc.wait(timeout=3)
 
     def test_toggle_todo_security_fences_and_idempotency(self):
         cal_md = os.path.join(self.brain, "calendar", "README.md")
@@ -183,119 +177,47 @@ class UiCalUnit(unittest.TestCase):
             esc_res = cal_engine.toggle_todo_in_brain(self.brain, "areas/escape.md", line_no=1)
             self.assertFalse(esc_res["ok"])
 
-    def test_live_cal_server_csrf_origin_and_rerender(self):
-        _write_file(
-            os.path.join(self.brain, "INDEX.md"),
-            "---\nsummary: Root\ntags: [atlas]\n---\n# Index\n- [Cal](calendar/README.md)\n",
-        )
+    def test_concurrent_brain_todo_mutations_lock(self):
+        today = dt.date.today().isoformat()
         cal_md = os.path.join(self.brain, "calendar", "README.md")
+        tasks = [f"Parallele Aufgabe {i}" for i in range(1, 7)]
         _write_file(
             cal_md,
-            "---\nsummary: Calendar\ntags: [calendar]\n---\n# Calendar\n\n"
-            "## Timeline\n\n- [ ] 2026-11-22 [todo] Zahnarzttermin bestätigen\n\n"
-            "## Open To-Dos\n\n- [ ] [high] Reisepass verlängern\n",
+            "---\nsummary: Calendar\ntags: [calendar]\n---\n# Calendar\n\n## Timeline\n\n"
+            + "\n".join(f"- [ ] {today} [todo] {t}" for t in tasks)
+            + "\n",
+        )
+        contract_md = os.path.join(self.brain, "areas", "work", "contract.md")
+        _write_file(
+            contract_md,
+            f"---\nsummary: Contract\ntags: [work]\ndue:\n  - {today} Kündigungsfrist prüfen\n---\n# Contract\n",
         )
 
-        hk = _load_hook_for_brain(self.brain)
-        hk.render_calendar_html(start_server=False)
-        cache_dir = os.path.join(self.brain, "_atlas", "cache")
-        csrf_tok = cal_engine.get_or_create_csrf_token(cache_dir)
-        self.assertTrue(len(csrf_tok) >= 32)
+        jobs = [
+            ("calendar/README.md", 9 + i, t) for i, t in enumerate(tasks)
+        ] + [("areas/work/contract.md", 0, "Kündigungsfrist prüfen")]
 
-        srv_script = cal_engine.write_server_script(cache_dir)
-        port_file = os.path.join(cache_dir, "cal_port.txt")
-        if os.path.exists(port_file):
-            os.remove(port_file)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+            results = list(pool.map(
+                lambda j: cal_engine.toggle_todo_in_brain(self.brain, j[0], line_no=j[1], what=j[2], target_done=True),
+                jobs,
+            ))
 
-        proc = subprocess.Popen(
-            [sys.executable, "-I", "-B", srv_script, "0", cache_dir, TOOLS_DIR, HOOK_PY],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        try:
-            bound_port = None
-            for _ in range(40):
-                if os.path.isfile(port_file):
-                    try:
-                        with open(port_file, encoding="utf-8") as pf:
-                            p_val = int(pf.read().strip())
-                        if p_val > 0 and cal_engine.cal_http_ok(p_val):
-                            bound_port = p_val
-                            break
-                    except (OSError, ValueError):
-                        pass
-                time.sleep(0.05)
-            self.assertIsNotNone(bound_port, "Ephemeral _cal_server.py failed to start and pass /healthz")
+        for res in results:
+            self.assertTrue(res["ok"])
+            self.assertTrue(res["done"])
 
-            base_url = f"http://127.0.0.1:{bound_port}"
+        with open(cal_md, encoding="utf-8") as fh:
+            cal_after = fh.read()
+        for t in tasks:
+            self.assertIn(f"- [x] {today} [todo] {t}", cal_after)
+        with open(contract_md, encoding="utf-8") as fh:
+            self.assertIn(f'"[x] {today} Kündigungsfrist prüfen"', fh.read())
 
-            def _post(body_dict, headers=None):
-                req_headers = {"Content-Type": "application/json"}
-                if headers:
-                    req_headers.update(headers)
-                req = urllib.request.Request(
-                    f"{base_url}/toggle-todo",
-                    data=json.dumps(body_dict).encode("utf-8"),
-                    headers=req_headers,
-                    method="POST",
-                )
-                try:
-                    with urllib.request.urlopen(req, timeout=3) as resp:
-                        return resp.status, json.loads(resp.read().decode("utf-8"))
-                except urllib.error.HTTPError as e:
-                    with e:
-                        return e.code, json.loads(e.read().decode("utf-8"))
+        leftovers = [f for f in os.listdir(os.path.dirname(cal_md)) if f.endswith(".tmp")]
+        self.assertEqual(leftovers, [])
 
-            # 1. Missing CSRF -> 403
-            code, _ = _post({"rel": "calendar/README.md", "line": 13, "what": "Reisepass verlängern"})
-            self.assertEqual(code, 403)
-
-            # 2. Wrong CSRF -> 403
-            code, _ = _post(
-                {"rel": "calendar/README.md", "line": 13, "what": "Reisepass verlängern"},
-                headers={"X-Atlas-CSRF": "0" * 48},
-            )
-            self.assertEqual(code, 403)
-
-            # 3. Cross-origin Origin header -> 403 even with valid CSRF
-            code, _ = _post(
-                {"rel": "calendar/README.md", "line": 13, "what": "Reisepass verlängern"},
-                headers={"X-Atlas-CSRF": csrf_tok, "Origin": "https://evil.example"},
-            )
-            self.assertEqual(code, 403)
-
-            # 4. Path traversal -> 400
-            code, _ = _post(
-                {"rel": "../outside.md", "line": 1},
-                headers={"X-Atlas-CSRF": csrf_tok, "Origin": base_url},
-            )
-            self.assertEqual(code, 400)
-
-            # 5. Valid loopback toggle -> 200, updates Markdown on disk AND re-renders calendar.html
-            code, body = _post(
-                {"rel": "calendar/README.md", "line": 9, "what": "Zahnarzttermin bestätigen"},
-                headers={"X-Atlas-CSRF": csrf_tok, "Origin": base_url},
-            )
-            self.assertEqual(code, 200)
-            self.assertTrue(body["ok"])
-            self.assertTrue(body["done"])
-
-            with open(cal_md, encoding="utf-8") as fh:
-                md_after = fh.read()
-            self.assertIn("- [x] 2026-11-22 [todo] Zahnarzttermin bestätigen", md_after)
-
-            with open(os.path.join(cache_dir, "calendar.html"), encoding="utf-8") as fh:
-                html_after = fh.read()
-            m_line = next(ln for ln in html_after.splitlines() if ln.startswith("let DATA = "))
-            rendered_data = json.loads(m_line[len("let DATA = "):-1])
-            z_item = next(i for i in rendered_data["items"] if "Zahnarzttermin" in i["what"])
-            self.assertEqual(z_item["status"], "done")
-        finally:
-            proc.terminate()
-            proc.wait(timeout=3)
-
-    def test_adaptive_coach_simple_vs_pro_payload(self):
+    def test_adaptive_coach_simple_vs_pro_telemetry(self):
         today = dt.date.today().isoformat()
         _write_file(
             os.path.join(self.brain, "INDEX.md"),
@@ -311,11 +233,8 @@ class UiCalUnit(unittest.TestCase):
             "---\nsummary: Profile\ntags: [self, sport]\ndepth: simple\n---\n# Profile\n",
         )
         hk = _load_hook_for_brain(self.brain)
-        hk.render_calendar_html(start_server=False)
-        with open(hk.CAL_HTML, encoding="utf-8") as fh:
-            html_simple = fh.read()
-        d_simple = json.loads(next(ln for ln in html_simple.splitlines() if ln.startswith("let DATA = "))[11:-1])
-        self.assertEqual(d_simple["coach"]["depth"], "simple")
+        c_simple = hk._extract_coach_context(hk.load_index())
+        self.assertEqual(c_simple["depth"], "simple")
 
         # Case B: Pro Mode with synced ride telemetry
         _write_file(
@@ -343,18 +262,12 @@ class UiCalUnit(unittest.TestCase):
                 }],
             }),
         )
-        hk.render_calendar_html(start_server=False)
-        with open(hk.CAL_HTML, encoding="utf-8") as fh:
-            html_pro = fh.read()
-        d_pro = json.loads(next(ln for ln in html_pro.splitlines() if ln.startswith("let DATA = "))[11:-1])
-        self.assertEqual(d_pro["coach"]["depth"], "pro")
-        self.assertTrue(d_pro["coach"]["telemetry"]["cp_model"]["valid"])
-        self.assertEqual(d_pro["coach"]["durability_tiers"]["15kj_kg"]["5m"]["90d"], 340)
-        wo_item = next(i for i in d_pro["items"] if i["kind"] == "workout")
-        self.assertAlmostEqual(wo_item["w_bal_min_pct"], 18.4, places=1)
-        self.assertEqual(wo_item["matches_burned"], 3)
+        c_pro = hk._extract_coach_context(hk.load_index())
+        self.assertEqual(c_pro["depth"], "pro")
+        self.assertTrue(c_pro["telemetry"]["cp_model"]["valid"])
+        self.assertEqual(c_pro["durability_tiers"]["15kj_kg"]["5m"]["90d"], 340)
 
-        # Case C (v1.1.1): Pure runner with wrist-watt Run + virtual-watt Ride + morning deadline + window overlap
+        # Case C: Pure runner with wrist-watt Run + virtual-watt Ride + morning deadline + window overlap
         _write_file(
             os.path.join(self.brain, "calendar", "README.md"),
             f"---\nsummary: Cal\ntags: [calendar]\n---\n# Cal\n\n## Timeline\n"
@@ -398,14 +311,10 @@ class UiCalUnit(unittest.TestCase):
                 ],
             }),
         )
-        hk.render_calendar_html(start_server=False)
-        with open(hk.CAL_HTML, encoding="utf-8") as fh:
-            html_runner = fh.read()
-        self.assertIn("let graphShowJournals = false;", html_runner)
-        self.assertIn("📓 Logs", html_runner)
-        d_runner = json.loads(next(ln for ln in html_runner.splitlines() if ln.startswith("let DATA = "))[11:-1])
-        self.assertEqual(d_runner["coach"]["depth"], "pro")
-        r_tel = d_runner["coach"]["telemetry"]
+        idx_r = hk.load_index()
+        c_runner = hk._extract_coach_context(idx_r, cal_items=hk.calendar_items(idx_r, days=365, past_days=21, include_done=True))
+        self.assertEqual(c_runner["depth"], "pro")
+        r_tel = c_runner["telemetry"]
         self.assertEqual(r_tel["readiness"]["status"], "GREEN")
         self.assertEqual(r_tel["readiness"]["reasons"], [])
         self.assertEqual(len(r_tel["readiness"]["schedule_conflicts"]), 1)
@@ -483,9 +392,134 @@ class UiCalUnit(unittest.TestCase):
         self.assertTrue(r_add_d["ok"])
         self.assertEqual(r_add_d["date"], "2026-11-17")
         cal_final = _rf(cal_md)
-        # Chronological ordering inside `## Timeline`: 2026-11-17 appears BEFORE 2026-11-20 and 2026-11-21
         self.assertLess(cal_final.index("2026-11-17"), cal_final.index("2026-11-20"))
         self.assertLess(cal_final.index("2026-11-20"), cal_final.index("2026-11-21"))
+
+    def test_todo_unschedule_backlog_and_deadline_guard(self):
+        cal_md = os.path.join(self.brain, "calendar", "README.md")
+        _write_file(
+            cal_md,
+            "---\nsummary: Calendar\ntags: [calendar]\n---\n# Calendar\n\n"
+            "## Timeline\n\n"
+            "- [ ] 2026-11-10 [todo] Anbieter anrufen <!-- g:abc12345 -->\n"
+            "- [ ] 2026-11-12 [deadline] Steuerfrist abgeben\n\n"
+            "## Open To-Dos\n\n"
+            "- [ ] [high] Bestehende Aufgabe\n",
+        )
+        subprocess.run(["git", "init", "-q"], cwd=self.brain, check=True)
+        subprocess.run(["git", "config", "user.name", "Test User"], cwd=self.brain, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=self.brain, check=True)
+        subprocess.run(["git", "add", "calendar/README.md"], cwd=self.brain, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "baseline"], cwd=self.brain, check=True)
+
+        # 1. Hard `[deadline]` and frontmatter `due:` (line_no=0) MUST be refused
+        r_dead = cal_engine.unschedule_todo_in_brain(self.brain, "calendar/README.md", what="Steuerfrist abgeben")
+        self.assertFalse(r_dead["ok"])
+        self.assertIn("deadline", r_dead["error"].lower())
+        r_fm = cal_engine.unschedule_todo_in_brain(self.brain, "calendar/README.md", line_no=0, what="x")
+        self.assertFalse(r_fm["ok"])
+
+        # 2. Dated `[todo]` moves cleanly into `## Open To-Dos`, strips `<!-- g:... -->`, zero stop-guard false positive
+        r_ok = cal_engine.unschedule_todo_in_brain(self.brain, "calendar/README.md", what="Anbieter anrufen", prio="low")
+        self.assertTrue(r_ok["ok"])
+        self.assertEqual(r_ok["entry"], "- [ ] [low] Anbieter anrufen")
+        with open(cal_md, encoding="utf-8") as fh:
+            txt = fh.read()
+        self.assertNotIn("2026-11-10 [todo] Anbieter anrufen", txt)
+        self.assertNotIn("<!-- g:abc12345 -->", txt)
+        self.assertIn("- [ ] [low] Anbieter anrufen", txt)
+
+        hk = _load_hook_for_brain(self.brain)
+        self.assertEqual(hk._detect_deleted_open_calendar_tasks(), [])
+
+    def test_smart_overdue_brief_propose_stale_free_days_and_rollover_today(self):
+        today = dt.date.today()
+        d_stale = (today - dt.timedelta(days=11)).isoformat()
+        d_fresh = (today - dt.timedelta(days=2)).isoformat()
+        d_dead = (today - dt.timedelta(days=1)).isoformat()
+        d_tmrw = (today + dt.timedelta(days=1)).isoformat()
+
+        _write_file(
+            os.path.join(self.brain, "INDEX.md"),
+            "---\nsummary: Root\ntags: [atlas]\n---\n# Index\n- [Cal](calendar/README.md)\n",
+        )
+        _write_file(
+            os.path.join(self.brain, "settings.md"),
+            "---\nsummary: Settings\ntags: [atlas]\nbriefing: daily\noverdue_todo_policy: brief_propose\n---\n",
+        )
+        cal_md = os.path.join(self.brain, "calendar", "README.md")
+        _write_file(
+            cal_md,
+            "---\nsummary: Calendar\ntags: [calendar]\n---\n# Calendar\n\n## Timeline\n\n"
+            f"- [ ] {d_stale} [todo] Alte Telefonliste aufräumen\n"
+            f"- [ ] {d_fresh} [todo] Versicherungsunterlagen sortieren\n"
+            f"- [ ] {d_dead} [deadline] Vertragskündigung absenden\n"
+            f"- [ ] {d_tmrw} [blocked] Dienstreise ganztags\n",
+        )
+
+        hk = _load_hook_for_brain(self.brain)
+        idx = hk.load_index()
+        free_days = cal_engine.suggest_free_days(
+            hk.calendar_items(idx, days=10, past_days=0, include_done=False),
+            today=today, horizon_days=7, count=2,
+        )
+        self.assertTrue(len(free_days) >= 1)
+        # Blocked tomorrow must NOT be suggested
+        self.assertNotIn(d_tmrw, [d["date"] for d in free_days])
+
+        # Default policy = `brief_propose`: age badges, STALE 4-option prompt, hard deadline guard, free-day suggestions, ZERO calendar.html
+        sess = hk.session_text(self.brain, "s-brief-1", skip_pull=True)
+        self.assertIn("STALE +11 d", sess)
+        self.assertIn("OVERDUE +2 d", sess)
+        self.assertIn("DEADLINE OVERDUE +1 d", sess)
+        self.assertIn("Suggested light/free days:", sess)
+        self.assertIn("unschedule", sess)
+        self.assertIn("Never auto-reschedule hard [deadline]", sess)
+        self.assertNotIn("calendar.html", sess)
+        self.assertFalse(os.path.exists(os.path.join(self.brain, "_atlas", "cache", "calendar.html")))
+
+        # Policy = `rollover_today`: moves overdue `[todo]` to today with `(orig YYYY-MM-DD)`, NEVER moves `[deadline]`
+        rr = cal_engine.rollover_overdue_todos_in_brain(self.brain, today=today)
+        self.assertTrue(rr["ok"])
+        self.assertEqual(len(rr["moved"]), 2)
+        with open(cal_md, encoding="utf-8") as fh:
+            after = fh.read()
+        self.assertIn(f"- [ ] {today.isoformat()} [todo] Alte Telefonliste aufräumen (orig {d_stale})", after)
+        self.assertIn(f"- [ ] {today.isoformat()} [todo] Versicherungsunterlagen sortieren (orig {d_fresh})", after)
+        self.assertIn(f"- [ ] {d_dead} [deadline] Vertragskündigung absenden", after)
+
+    def test_natural_language_todo_rx_and_autocreate_calendar(self):
+        hk = _load_hook_for_brain(self.brain)
+        positive_prompts = [
+            "leg mir mal die und die Aufgabe an",
+            "Erinnere mich morgen daran, die Versicherung anzurufen",
+            "Remind me on Friday to call Bob",
+            "Ich muss noch den Zahnarzt anrufen",
+            "Pack mal Reifenwechsel auf meine Liste",
+            "Schieb die Aufgabe auf Freitag",
+            "Zeig mir meinen Kalender für diese Woche",
+            "Add a task to review the backup disk",
+            "Trag bitte die Frist für den Vertrag ein",
+        ]
+        for p in positive_prompts:
+            self.assertIsNotNone(hk.TODO_RX.search(p), f"Expected TODO_RX match for: {p!r}")
+
+        negative_prompts = [
+            "Refactor the HTTP parser in src/server.py",
+            "Wie funktioniert ein binärer Suchbaum?",
+            "Explain Python dataclasses vs NamedTuple",
+        ]
+        for p in negative_prompts:
+            self.assertIsNone(hk.TODO_RX.search(p), f"Unexpected TODO_RX false positive for: {p!r}")
+
+        # `add_todo_in_brain` auto-creates `calendar/README.md` on fresh/legacy brains
+        cal_md = os.path.join(self.brain, "calendar", "README.md")
+        self.assertFalse(os.path.exists(cal_md))
+        res = cal_engine.add_todo_in_brain(self.brain, "Erste Aufgabe anlegen", target_date_spec="2026-12-01")
+        self.assertTrue(res["ok"])
+        self.assertTrue(os.path.isfile(cal_md))
+        with open(cal_md, encoding="utf-8") as fh:
+            self.assertIn("- [ ] 2026-12-01 [todo] Erste Aufgabe anlegen", fh.read())
 
     def test_todo_persistence_no_false_fuzzy_drops_and_unbounded_visibility(self):
         today = dt.date.today()
@@ -525,7 +559,6 @@ class UiCalUnit(unittest.TestCase):
         ])
         _write_file(os.path.join(self.brain, "calendar", "README.md"), "\n".join(cal_lines))
 
-        # Long checklist file (> 16 KB HEAD_BYTES) + cross-file mirror duplicate + frontmatter due (deadline + yearly)
         filler = ("Kontextzeile für eine ausführliche Projektdokumentation.\n") * 400
         _write_file(
             os.path.join(self.brain, "areas", "work", "checkliste.md"),
@@ -547,8 +580,11 @@ class UiCalUnit(unittest.TestCase):
         whats = [i["what"] for i in cal_all]
         self.assertIn("Projekt Alpha Deployment prüfen", whats)
         self.assertIn("Projekt Alpha Rechnung schreiben", whats)
+        self.assertIn("Überfällige Altaufgabe prüfen", whats)
+        self.assertIn("Langfristige Vertragsfrist 2029", whats)
+        self.assertNotIn("Historische erledigte Aufgabe", whats)
 
-        # 2. Both similar undated tasks in calendar/README.md survive; long-file task (>16KB) harvested; cross-file dup merged
+        # 2. Both similar undated tasks survive; long-file task (>16KB) harvested; cross-file dup merged
         ot = hk.open_todos(include_done=False)
         ot_whats = [t["what"] for t in ot]
         self.assertIn("Projekt Alpha Dokumentation fertigstellen", ot_whats)
@@ -566,149 +602,13 @@ class UiCalUnit(unittest.TestCase):
         self.assertEqual(act_fm["source"], "due_fm")
         self.assertTrue(act_fm["can_toggle"])
 
-        # 4. Calendar HTML includes >90d open overdue AND >365d open deadline, while filtering >90d done item
-        hk.render_calendar_html(idx, start_server=False)
-        with open(hk.CAL_HTML, encoding="utf-8") as fh:
-            html = fh.read()
-        data = json.loads(next(ln for ln in html.splitlines() if ln.startswith("let DATA = "))[11:-1])
-        ui_whats = [i["what"] for i in data["items"]]
-        self.assertIn("Überfällige Altaufgabe prüfen", ui_whats)
-        self.assertIn("Langfristige Vertragsfrist 2029", ui_whats)
-        self.assertNotIn("Historische erledigte Aufgabe", ui_whats)
-
-        # 5. Non-briefing session output appends overflow count when >5 urgent items exist
+        # 4. Non-briefing session output appends overflow count when >5 urgent items exist
         st = hk._state()
         st["last_briefing"] = d_today
         hk._save_state(st)
-        prev_no_srv = os.environ.get("ATLAS_NO_CAL_SERVER")
-        os.environ["ATLAS_NO_CAL_SERVER"] = "1"
-        try:
-            sess_out = hk.session_text(self.brain, "sess-overflow", skip_pull=True)
-        finally:
-            if prev_no_srv is None:
-                os.environ.pop("ATLAS_NO_CAL_SERVER", None)
-            else:
-                os.environ["ATLAS_NO_CAL_SERVER"] = prev_no_srv
+        sess_out = hk.session_text(self.brain, "sess-overflow", skip_pull=True)
         self.assertIn("Due today/overdue", sess_out)
         self.assertIn("more — run `atlas.py todo`)", sess_out)
-
-    def test_concurrent_loopback_toggles_and_background_git_commit(self):
-        today = dt.date.today().isoformat()
-        _write_file(
-            os.path.join(self.brain, "INDEX.md"),
-            "---\nsummary: Root\ntags: [atlas]\n---\n# Index\n- [Cal](calendar/README.md)\n",
-        )
-        cal_md = os.path.join(self.brain, "calendar", "README.md")
-        tasks = [f"Parallele Aufgabe {i}" for i in range(1, 7)]
-        _write_file(
-            cal_md,
-            "---\nsummary: Calendar\ntags: [calendar]\n---\n# Calendar\n\n## Timeline\n\n"
-            + "\n".join(f"- [ ] {today} [todo] {t}" for t in tasks)
-            + "\n",
-        )
-        contract_md = os.path.join(self.brain, "areas", "work", "contract.md")
-        _write_file(
-            contract_md,
-            f"---\nsummary: Contract\ntags: [work]\ndue:\n  - {today} Kündigungsfrist prüfen\n---\n# Contract\n",
-        )
-        notes_md = os.path.join(self.brain, "areas", "notes.md")
-        _write_file(notes_md, "---\nsummary: Notes\ntags: [work]\n---\n# Notes\nInitial.\n")
-
-        # Initialize git repo inside brain/ and commit baseline
-        subprocess.run(["git", "init", "-q"], cwd=self.brain, check=True)
-        subprocess.run(["git", "config", "user.name", "Test User"], cwd=self.brain, check=True)
-        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=self.brain, check=True)
-        subprocess.run(["git", "add", "INDEX.md", "calendar/README.md", "areas/work/contract.md", "areas/notes.md"], cwd=self.brain, check=True)
-        subprocess.run(["git", "commit", "-q", "-m", "baseline"], cwd=self.brain, check=True)
-        # Leave an unrelated dirty edit that browser toggles must NOT commit
-        _write_file(notes_md, "---\nsummary: Notes\ntags: [work]\n---\n# Notes\nUncommitted draft.\n")
-
-        hk = _load_hook_for_brain(self.brain)
-        hk.render_calendar_html(start_server=False)
-        cache_dir = os.path.join(self.brain, "_atlas", "cache")
-        csrf_tok = cal_engine.get_or_create_csrf_token(cache_dir)
-        srv_script = cal_engine.write_server_script(cache_dir)
-        port_file = os.path.join(cache_dir, "cal_port.txt")
-        if os.path.exists(port_file):
-            os.remove(port_file)
-
-        env = dict(os.environ)
-        env["ATLAS_NO_GIT_PUSH"] = "1"
-        proc = subprocess.Popen(
-            [sys.executable, "-I", "-B", srv_script, "0", cache_dir, TOOLS_DIR, HOOK_PY],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            env=env,
-        )
-        try:
-            bound_port = None
-            for _ in range(40):
-                if os.path.isfile(port_file):
-                    try:
-                        with open(port_file, encoding="utf-8") as pf:
-                            p_val = int(pf.read().strip())
-                        if p_val > 0 and cal_engine.cal_http_ok(p_val):
-                            bound_port = p_val
-                            break
-                    except (OSError, ValueError):
-                        pass
-                time.sleep(0.05)
-            self.assertIsNotNone(bound_port, "atlas-cal-v6 server failed /healthz")
-
-            base_url = f"http://127.0.0.1:{bound_port}"
-
-            def _post_one(payload):
-                req = urllib.request.Request(
-                    f"{base_url}/toggle-todo",
-                    data=json.dumps(payload).encode("utf-8"),
-                    headers={"Content-Type": "application/json", "X-Atlas-CSRF": csrf_tok, "Origin": base_url},
-                    method="POST",
-                )
-                with urllib.request.urlopen(req, timeout=5) as resp:
-                    return resp.status, json.loads(resp.read().decode("utf-8"))
-
-            payloads = [
-                {"rel": "calendar/README.md", "line": 9 + i, "what": t, "done": True}
-                for i, t in enumerate(tasks)
-            ] + [{"rel": "areas/work/contract.md", "line": 0, "what": "Kündigungsfrist prüfen", "done": True}]
-
-            with concurrent.futures.ThreadPoolExecutor(max_workers=len(payloads)) as pool:
-                results = list(pool.map(_post_one, payloads))
-
-            for status, body in results:
-                self.assertEqual(status, 200)
-                self.assertTrue(body["ok"])
-                self.assertTrue(body["done"])
-
-            with open(cal_md, encoding="utf-8") as fh:
-                cal_after = fh.read()
-            for t in tasks:
-                self.assertIn(f"- [x] {today} [todo] {t}", cal_after)
-
-            with open(contract_md, encoding="utf-8") as fh:
-                self.assertIn(f'"[x] {today} Kündigungsfrist prüfen"', fh.read())
-
-            # Zero leftover .tmp files in calendar/
-            leftovers = [f for f in os.listdir(os.path.dirname(cal_md)) if f.endswith(".tmp")]
-            self.assertEqual(leftovers, [])
-
-            # Background git commit lands for toggled files without committing unrelated dirty `areas/notes.md`
-            committed = False
-            for _ in range(40):
-                log = subprocess.run(["git", "log", "-n", "5", "--oneline"], cwd=self.brain, capture_output=True, text=True).stdout
-                if "atlas: calendar toggle" in log:
-                    st_cal = subprocess.run(["git", "status", "--porcelain", "--", "calendar/README.md", "areas/work/contract.md"], cwd=self.brain, capture_output=True, text=True).stdout.strip()
-                    if not st_cal:
-                        committed = True
-                        break
-                time.sleep(0.1)
-            self.assertTrue(committed, "Expected background git commit after /toggle-todo")
-            st_notes = subprocess.run(["git", "status", "--porcelain", "--", "areas/notes.md"], cwd=self.brain, capture_output=True, text=True).stdout.strip()
-            self.assertIn("areas/notes.md", st_notes)
-        finally:
-            proc.terminate()
-            proc.wait(timeout=3)
 
     def test_stop_hook_calendar_deletion_guard(self):
         cal_md = os.path.join(self.brain, "calendar", "README.md")
@@ -768,7 +668,6 @@ class UiCalUnit(unittest.TestCase):
         self.assertIn("Atlas safety guard", captured[0][1])
         self.assertIn("Zahnarzt anrufen", captured[0][1])
         self.assertIn("HEAD~1:calendar/README.md", captured[0][1])
-        # Pre-deletion content remains recoverable in git HEAD~1
         prev = subprocess.run(["git", "show", "HEAD~1:calendar/README.md"], cwd=self.brain, capture_output=True, text=True, check=True).stdout
         self.assertIn("Zahnarzt anrufen", prev)
 

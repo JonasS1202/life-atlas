@@ -462,7 +462,7 @@ def _set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
 
 
 def load_event_metadata_map(brain: str) -> dict[str, dict[str, Any]]:
-    """Fast read-only lookup of cached Google metadata keyed by `atlas_uid` for `calendar.html` and CLI."""
+    """Fast read-only lookup of cached Google metadata keyed by `atlas_uid` for CLI and hooks."""
     p = sync_db_path(brain)
     if not os.path.isfile(p):
         return {}
@@ -496,7 +496,7 @@ def load_event_metadata_map(brain: str) -> dict[str, dict[str, Any]]:
 
 
 def get_sync_ui_summary(brain: str) -> dict[str, Any]:
-    """Return lightweight sync status payload for `calendar.html` (0 network calls)."""
+    """Return lightweight sync status payload for CLI and session hooks (0 network calls)."""
     cfg = load_sync_config(brain)
     accounts = gcal_provider.list_configured_accounts(brain)
     if not cfg:

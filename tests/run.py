@@ -459,40 +459,34 @@ class Calendar(AtlasCase):
         self.assertIn("90m SweetSpot", out_coach)
         self.assertNotIn("Steuerbelege 2025 sortieren", out_coach)
         self.assertNotIn("Max", out_coach)
-        self.assertIn("Visual calendar: [📅 Atlas Kalender öffnen](http://127.0.0.1:", out_all)
-        html_path = os.path.join(self.brain, "_atlas", "cache", "calendar.html")
-        self.assertTrue(os.path.isfile(html_path))
-        html_content = self.read(html_path)
-        self.assertIn("Eschborn-Frankfurt", html_content)
-        self.assertIn("minmax(0,1fr)", html_content)
-        self.assertNotIn("http-equiv=\"refresh\"", html_content)
-        # Verify CAL_SERVER_SCRIPT serves HTTP 200 even when stdout/stderr are None (Windows pythonw.exe behavior)
+        self.assertNotIn("calendar.html", out_all)
+        self.assertFalse(os.path.exists(os.path.join(self.brain, "_atlas", "cache", "calendar.html")))
+        # Verify headless OAuth loopback script serves HTTP 200 on /healthz even when stdout/stderr are None (Windows pythonw.exe)
         import socket, urllib.request
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.bind(("127.0.0.1", 0))
             free_port = s.getsockname()[1]
-        srv_py = os.path.join(self.tmp, "_test_cal_srv.py")
+        from atlas_lib import cal_engine
+        srv_py = os.path.join(self.tmp, "_test_oauth_srv.py")
         with open(srv_py, "w", encoding="utf-8") as fh:
-            fh.write("import sys; sys.stdout = sys.stderr = None\n" +
-                     "import functools, http.server, os\n"
-                     "sys.stdout = sys.stderr = open(os.devnull, 'w')\n"
-                     "class _QuietHandler(http.server.SimpleHTTPRequestHandler):\n"
-                     "    def log_message(self, *args, **kwargs): pass\n"
-                     "handler = functools.partial(_QuietHandler, directory=sys.argv[2])\n"
-                     "http.server.ThreadingHTTPServer(('127.0.0.1', int(sys.argv[1])), handler).serve_forever()\n")
-        proc = subprocess.Popen([sys.executable, "-I", "-B", srv_py, str(free_port), os.path.dirname(html_path)],
-                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            fh.write("import sys; sys.stdout = sys.stderr = None\n" + cal_engine.OAUTH_SERVER_SCRIPT)
+        cache_dir = os.path.join(self.brain, "_atlas", "cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        proc = subprocess.Popen(
+            [sys.executable, "-I", "-B", srv_py, str(free_port), cache_dir, os.path.join(REPO, "core", "tools")],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
         try:
             ok = False
-            for _ in range(20):
+            for _ in range(25):
                 try:
-                    with urllib.request.urlopen(f"http://127.0.0.1:{free_port}/calendar.html", timeout=0.25) as r:
-                        if r.status == 200 and b"Eschborn-Frankfurt" in r.read():
+                    with urllib.request.urlopen(f"http://127.0.0.1:{free_port}/healthz", timeout=0.25) as r:
+                        if r.status == 200 and b"atlas-oauth-v8" in r.read():
                             ok = True
                             break
                 except Exception:
                     time.sleep(0.05)
-            self.assertTrue(ok, "CAL_SERVER_SCRIPT failed to serve HTTP 200 under pythonw.exe stdout/stderr=None")
+            self.assertTrue(ok, "OAUTH_SERVER_SCRIPT failed to serve /healthz under pythonw.exe stdout/stderr=None")
         finally:
             proc.terminate()
             proc.wait(timeout=2)
@@ -631,8 +625,7 @@ class Coach(AtlasCase):
         self.assertIn("ATHLETE PROFILE & THRESHOLDS", ctx_out)
         self.assertIn("3-EPOCH POWER & PACE CURVE", ctx_out)
         self.assertIn("/strava-connect", ctx_out)
-        cal_html = self.read(os.path.join(self.brain, "_atlas", "cache", "calendar.html"))
-        self.assertIn("/strava-connect", cal_html)
+        self.assertNotIn("calendar.html", ctx_out)
 
         # Add a new goal to trigger goals_hash staleness detection
         with open(cal_path, "a", encoding="utf-8") as fh:
@@ -1200,12 +1193,13 @@ class WikiGraph(AtlasCase):
 
 
 class HookUpgrades(AtlasCase):
-    def test_cal_html_conditional_stop_autolink_offline_pull_errlog_and_ag_subagents(self):
-        # 1. `hook_module(brain)` sets `CAL_HTML` inside the target brain, not the source repo
+    def test_chat_first_stop_autolink_offline_pull_errlog_and_ag_subagents(self):
+        # 1. `hook_module(brain)` binds STATE/CACHE/ERR_LOG inside the target brain, with zero CAL_HTML
         sys.path.insert(0, os.path.join(REPO, "core", "tools"))
         import atlas as atlas_cli
         hk = atlas_cli.hook_module(self.brain)
-        self.assertEqual(fwd(hk.CAL_HTML), fwd(os.path.join(self.brain, "_atlas", "cache", "calendar.html")))
+        self.assertEqual(fwd(hk.CACHE), fwd(os.path.join(self.brain, "_atlas", "cache", "index.sqlite")))
+        self.assertFalse(hasattr(hk, "CAL_HTML"))
 
         # 2. Antigravity subagent plugin wiring (project & user scope) + clean unwire
         self.wire_both()
@@ -1225,34 +1219,23 @@ class HookUpgrades(AtlasCase):
         self.atlas("unwire", "--agent", "antigravity", "--scope", "user", "--user-home", self.home, "--execute")
         self.assertFalse(os.path.exists(user_plugs))
 
-        # 3. `daily_log()` auto-links existing brain paths + conditional `render_calendar_html()` in `stop()`
+        # 3. `daily_log()` auto-links existing brain paths and never generates `calendar.html`
         self.page("howto/git-regeln.md", "---\nsummary: Git Regeln\ntags: [howto]\n---\n# Git Regeln\n")
-        # First session renders `calendar.html`
         self.hook("claude", "session", {"session_id": "h1", "cwd": fwd(self.root)})
-        cal_html = os.path.join(self.brain, "_atlas", "cache", "calendar.html")
-        self.assertTrue(os.path.isfile(cal_html))
-        mtime_before_stop = os.path.getmtime(cal_html)
-        time.sleep(0.05)
+        self.assertFalse(os.path.exists(os.path.join(self.brain, "_atlas", "cache", "calendar.html")))
 
-        # Stop turn touching only `howto/` mention in daily log -> `calendar.html` mtime must NOT change
         self.hook("claude", "stop", {
             "session_id": "h1",
             "stop_hook_active": True,
             "last_assistant_message": "Fertig.\n\nAtlas: Regel ergänzt in howto/git-regeln.md und howto/nicht-da.md",
         })
-        self.assertEqual(os.path.getmtime(cal_html), mtime_before_stop)
         logs = [os.path.join(dp, f) for dp, _d, fs in os.walk(os.path.join(self.brain, "journal"))
                 for f in fs if f[:4].isdigit()]
         log_txt = self.read(logs[0])
         self.assertIn("[howto/git-regeln.md](../../howto/git-regeln.md)", log_txt)
         self.assertIn("howto/nicht-da.md", log_txt)
         self.assertNotIn("[howto/nicht-da.md]", log_txt)
-
-        # Modifying `calendar/README.md` -> next `stop()` MUST re-render `calendar.html`
-        time.sleep(0.05)
-        self.page("calendar/README.md", "---\nsummary: Kalender\ntags: [calendar]\n---\n# Calendar\n\n## Timeline\n- [ ] 2026-12-24 [event] Heiligabend\n")
-        self.hook("claude", "stop", {"session_id": "h1", "stop_hook_active": True, "last_assistant_message": "ok"})
-        self.assertGreater(os.path.getmtime(cal_html), mtime_before_stop)
+        self.assertFalse(os.path.exists(os.path.join(self.brain, "_atlas", "cache", "calendar.html")))
 
         # 4. Offline remote in `pull()` fails silently (no false `Sync:` conflict warning)
         self.git(self.brain, "remote", "add", "origin", "http://127.0.0.1:1/offline-brain.git")
@@ -1273,50 +1256,70 @@ class HookUpgrades(AtlasCase):
 
 
 class UiReleaseV11(AtlasCase):
-    def test_v110_calendar_graph_view_and_core_apply_template_sync(self):
-        # 1. Installed `_atlas/templates/calendar.html` is present after `init`
+    def test_v170_chat_first_upgrade_unschedule_cli_and_release_consistency(self):
+        # 1. Installed `_atlas/templates/calendar.html` does NOT exist after `init` (Chat-First v1.7.0)
         inst_tpl = os.path.join(self.brain, "_atlas", "templates", "calendar.html")
-        self.assertTrue(os.path.isfile(inst_tpl))
-        self.assertIn("🕸️ Brain Graph", self.read(inst_tpl))
+        self.assertFalse(os.path.exists(inst_tpl))
 
-        # 2. `atlas.py calendar --view graph` prints `?view=graph` URL and compiles graph payload
-        self.page("people/erika-muster.md", "---\nsummary: Erika Muster\ntags: [person]\nverified: 2024-02-01\n---\n# Erika Muster\n")
-        self.atlas("index")
-        out_graph = self.atlas("calendar", "--view", "graph").stdout
-        self.assertIn("calendar.html?view=graph", out_graph)
-        cal_html = os.path.join(self.brain, "_atlas", "cache", "calendar.html")
-        html_txt = self.read(cal_html)
-        self.assertIn("erika-muster.md", html_txt)
-        self.assertIn("csrf_token", html_txt)
+        # 2. `atlas.py todo unschedule` CLI moves a dated `[todo]` into `## Open To-Dos` cleanly
+        import datetime as dt
+        d_old = (dt.date.today() - dt.timedelta(days=10)).isoformat()
+        self.atlas("todo", "add", "Alten Anbieter kündigen", "--to", d_old)
+        out_list = self.atlas("todo", "list").stdout
+        self.assertIn("STALE +10 d", out_list)
+        self.assertIn("Suggested light/free days:", out_list)
+        out_unsched = self.atlas("todo", "unschedule", "1", "--prio", "low").stdout
+        self.assertIn("unscheduled -> Open To-Dos", out_unsched)
+        cal_txt = self.read(os.path.join(self.brain, "calendar", "README.md"))
+        self.assertIn("- [ ] [low] Alten Anbieter kündigen", cal_txt)
+        self.assertNotIn(f"{d_old} [todo] Alten Anbieter kündigen", cal_txt)
 
-        # 3. `core-apply` deterministically updates `templates/calendar.html` (`HARD_CORE_PREFIXES`)
+        # 3. `core-apply` cleans legacy `cache/calendar.html` & updates `HARD_CORE_PREFIXES`
         #    while preserving user customizations in `templates/person.md` (`keep-local` 3-way merge)!
         person_tpl = os.path.join(self.brain, "_atlas", "templates", "person.md")
         with open(person_tpl, "a", encoding="utf-8", newline="\n") as fh:
             fh.write("\n## Custom Local Section\n")
-        with open(inst_tpl, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write("<!DOCTYPE html><html><body>outdated-v1.0-template</body></html>\n")
+        legacy_cache_html = os.path.join(self.brain, "_atlas", "cache", "calendar.html")
+        os.makedirs(os.path.dirname(legacy_cache_html), exist_ok=True)
+        with open(legacy_cache_html, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("<html>legacy</html>\n")
         with open(os.path.join(self.brain, "_atlas", "VERSION"), "w", encoding="utf-8", newline="\n") as fh:
-            fh.write("1.0.0\n")
+            fh.write("1.6.1\n")
         self.git(self.brain, "add", "-A")
         self.git(self.brain, "commit", "-q", "-m", "local template edits")
 
         expected_ver = self.read(os.path.join(REPO, "core", "VERSION")).strip()
         diff_out = self.atlas("core-diff", "--source", REPO).stdout
-        self.assertIn("update (upstream changed, yours untouched): _atlas/templates/calendar.html", diff_out)
         self.assertIn("kept: changed only in this Atlas: _atlas/templates/person.md", diff_out)
         self.assertIn(expected_ver, diff_out)
 
         self.atlas("core-apply", "--source", REPO, "--execute")
-        self.assertIn("🕸️ Brain Graph", self.read(inst_tpl))
+        self.assertFalse(os.path.exists(legacy_cache_html))
         self.assertIn("## Custom Local Section", self.read(person_tpl))
         self.assertEqual(self.read(os.path.join(self.brain, "_atlas", "VERSION")).strip(), expected_ver)
         self.assertIn("ok", self.atlas("check").stdout.lower())
 
-        # 4. v1.1.1 Coach Sync & Readiness Regression:
+        # 4. Permanent Release-Consistency Guard (README.md + INSTALL.md + CHANGELOG.md + VERSION + zero stale calendar.html)
+        readme_txt = self.read(os.path.join(REPO, "README.md"))
+        install_txt = self.read(os.path.join(REPO, "INSTALL.md"))
+        changelog_txt = self.read(os.path.join(REPO, "CHANGELOG.md"))
+        self.assertIn(f"Version {expected_ver}", readme_txt, "README.md must document current core/VERSION")
+        self.assertIn(f"## [{expected_ver}]", changelog_txt, "CHANGELOG.md must have entry for current core/VERSION")
+        core_skills = sorted(
+            d for d in os.listdir(os.path.join(REPO, "core", "skills"))
+            if os.path.isdir(os.path.join(REPO, "core", "skills", d))
+        )
+        for sk in core_skills:
+            self.assertIn(f"/{sk}", readme_txt, f"README.md missing core skill /{sk}")
+            self.assertIn(f"/{sk}", install_txt, f"INSTALL.md missing core skill /{sk}")
+        for doc_rel in ("README.md", "INSTALL.md", "core/templates/router.md", "core/procedures/brief.md",
+                        "core/procedures/coach.md", "core/skills/atlas-calendar/SKILL.md"):
+            self.assertNotIn("calendar.html", self.read(os.path.join(REPO, doc_rel)),
+                             f"Stale calendar.html reference in {doc_rel}")
+
+        # 5. Coach Sync & Readiness Regression:
         #    390W Garmin wrist-watt Run (`device_watts: true`) + virtual-watt Ride (`device_watts: false`)
         #    + morning Touran deadline MUST NOT pollute cycling power curve or turn Readiness AMBER!
-        import datetime as dt
         today_iso = dt.date.today().isoformat()
         self.page(
             "coach/profile.md",
@@ -1442,8 +1445,8 @@ class UiReleaseV11(AtlasCase):
         self.assertIn("abhaken/done", c1_text)
         self.assertIn("verschieben/move", c1_text)
         self.assertIn("jetzt angehen", c1_text)
-        self.assertIn(f"1. [OVERDUE 3 d · {d_over3}] Offerte prüfen", c1_text)
-        self.assertIn(f"2. [OVERDUE 1 d · {d_over1}] [deadline] Kündigungsfrist Stromvertrag", c1_text)
+        self.assertIn(f"1. [OVERDUE +3 d · {d_over3}] Offerte prüfen", c1_text)
+        self.assertIn(f"2. [DEADLINE OVERDUE +1 d · {d_over1}] [deadline] Kündigungsfrist Stromvertrag", c1_text)
         self.assertIn(f"3. [DUE TODAY · {d_today}] Steuerunterlagen einreichen", c1_text)
         self.assertIn("4. [OPEN · high] Backup-Konzept testen", c1_text)
         self.assertIn("Quartalsplanung", c1_text)
@@ -1559,7 +1562,7 @@ class UiReleaseV11(AtlasCase):
 
         # 6. `atlas.py todo` end-to-end triage: list -> done #1 -> move undated -> move due_fm -> skip -> done due_fm -> add
         todo_list = self.atlas("todo").stdout
-        self.assertIn("1. [OVERDUE 3 d", todo_list)
+        self.assertIn("1. [OVERDUE +3 d", todo_list)
         self.assertIn("4. [OPEN · high] Backup-Konzept testen", todo_list)
 
         self.assertIn("done:", self.atlas("todo", "done", "1").stdout)

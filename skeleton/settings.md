@@ -7,6 +7,7 @@ evening_hour: 18          # for questions: evening-3 (first chat after this hour
 maintenance_days: 7       # 7-30: Atlas tidies itself this often (never off)
 reminder: signals         # signals | every-turn | rare: when the stop hook asks to file what was learned
 deadline_days: 30         # how far ahead the briefing looks
+overdue_todo_policy: brief_propose  # brief_propose | manual | rollover_today
 daily_log: on             # on | off: `Atlas:` lines into journal/<year>/<date>.md
 inbox_cloud:              # optional: a cloud folder the phone saves into; Atlas empties it into inbox/
 calendar_ics:             # optional: private .ics URL or path (Google/Apple Calendar) merged by atlas.py calendar

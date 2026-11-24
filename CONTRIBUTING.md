@@ -35,16 +35,19 @@ From then on "continue in Atlas Dev" routes the chat into this repository like a
 
 ## Release
 
-1. `core/VERSION`: bump (`0.4.0` → `0.4.1` fixes, `0.5.0` features, `1.0.0` breaking).
+Every release MUST keep documentation, onboarding, and version metadata strictly in sync (enforced automatically by `tests/run.py`):
+
+1. `core/VERSION`: bump (`1.6.1` → `1.6.2` fixes, `1.7.0` features, `2.0.0` breaking).
 2. `CHANGELOG.md`: a `## [x.y.z] - YYYY-MM-DD` section, written for users (Atlas shows it during `/atlas-update`).
-3. `core/upgrades/<x.y.z>.json` if users' grown files need additions. Declarative and additive only:
+3. `README.md` & `INSTALL.md` (**mandatory on every release**): update the `Version x.y.z` line, feature/command tables, and Phase 12 onboarding handover so new users always receive the current workflow and skills.
+4. `core/upgrades/<x.y.z>.json` if users' grown files need additions. Declarative and additive only:
    - `"dirs": ["self"]` create folders;
    - `"skeleton_add": ["settings.md"]` copy a skeleton file only if the user has none;
    - `"settings_add": {"key": "default  # comment"}` add a switch to `settings.md` only if missing;
    - `"tags_add": [["tag", "meaning", "synonyms"]]` add a tag row only if missing;
    - `"notes": ["…"]` tasks for the agent that need judgment (e.g. merge a new INDEX section into the user's localised
      INDEX). Never ship instructions that overwrite user content.
-4. `python -I tests/run.py` green, then `git commit`, `git tag vX.Y.Z`, `git push --follow-tags`.
+5. `python -I tests/run.py` green + Privacy Audit grep clean (`0` personal/private hits), then `git commit`, `git tag vX.Y.Z`, and push explicitly (`git push origin main vX.Y.Z`).
 
 ## How an update reaches an Atlas
 
