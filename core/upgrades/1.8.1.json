@@ -1,0 +1,5 @@
+{
+  "notes": [
+    "Atlas `1.8.1` upgrades external calendar task formatting for instant open-vs-done visual clarity on mobile & desktop: open `[todo]` items now show an empty checkbox (`☐ <title>`) instead of `☑️`, and completed `[x]` tasks swap to a single green checkmark (`✅ <title>`) plus muted grey (`colorId: 8` / Graphite on Google Calendar; reopening restores the calendar's default color). If external calendar sync is enabled, run `atlas.py cal sync --reformat --execute` once to refresh existing synced tasks in place."
+  ]
+}

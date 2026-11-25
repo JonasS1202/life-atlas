@@ -215,6 +215,8 @@ class FakeGCalAPI:
                     for k, v in (req_json or {}).items():
                         if k == "extendedProperties" and isinstance(v, dict):
                             cur.setdefault("extendedProperties", {}).setdefault("private", {}).update(v.get("private") or {})
+                        elif v is None:
+                            cur.pop(k, None)
                         else:
                             cur[k] = v
                     self.next_id += 1
@@ -387,7 +389,7 @@ class CalSyncUnit(unittest.TestCase):
         task_evs = list(self.fake.events.get(("personal", tasks_cid), {}).values())
         self.assertEqual(len(task_evs), 2)
         summaries = {e["summary"] for e in task_evs}
-        self.assertIn("☑️ Cancel streaming subscription", summaries)
+        self.assertIn("☐ Cancel streaming subscription", summaries)
         self.assertIn("⏳ Renew insurance policy", summaries)
         for te in task_evs:
             self.assertEqual(te["transparency"], "transparent")
@@ -755,7 +757,7 @@ class CalSyncUnit(unittest.TestCase):
             "kind": "todo", "subkind": "", "status": "open",
             "what": "Order and install new desktop GPU: check case clearance >= 315 mm, use two separate PCIe power cables, run DDU and verify 4K swapchain settings",
         }, "u2", timezone="Europe/Berlin")
-        self.assertEqual(long_todo["summary"], "☑️ Order and install new desktop GPU")
+        self.assertEqual(long_todo["summary"], "☐ Order and install new desktop GPU")
         self.assertIn("check case clearance", long_todo["description"])
 
         # 5. Dedicated owner Birthday calendar discovered as bidirectional `default_kind=birthday` + RRULE:FREQ=YEARLY on push;
@@ -892,6 +894,95 @@ class CalSyncUnit(unittest.TestCase):
         self.assertTrue(c_rec["applied"])
         created_g = self.fake.events[("personal", "user@example.com")][c_rec["gcal_event_id"]]
         self.assertEqual(created_g.get("recurrence"), ["RRULE:FREQ=WEEKLY;BYDAY=MO"])
+
+    def test_todo_visual_clarity_open_done_reopen_and_reformat(self) -> None:
+        """Open `[todo]` uses empty `☐`, done `[x]` swaps to single `✅` + Graphite (`colorId=8`), reopen clears grey, and `--reformat` upgrades legacy `☑️`/`✓ ☑️` idempotently."""
+        cal_sync.discover_calendars(self.brain, provider=self.provider, execute=True)
+        cfg = cal_sync.load_sync_config(self.brain)
+        pers_ly = next(ly for ly in cfg["layers"] if ly["id"] == "personal")
+        tasks_cid = pers_ly["subcalendars"]["tasks"]
+        readme_p = os.path.join(self.brain, "calendar", "README.md")
+
+        _write(
+            readme_p,
+            "# Calendar\n\n## Timeline\n"
+            "- [ ] 2026-11-26 [todo] Renew passport\n"
+            "- [ ] 2026-11-27 [todo] File travel expense\n",
+        )
+        r1 = cal_sync.run_sync(self.brain, provider=self.provider, execute=True, today=self.today)
+        self.assertEqual(r1["pushed_new"], 2)
+        ev_pass = next(e for e in self.fake.events[("personal", tasks_cid)].values() if "Renew passport" in e["summary"])
+        self.assertEqual(ev_pass["summary"], "☐ Renew passport")
+        self.assertNotIn("colorId", ev_pass)
+
+        # 1. Check `[x]` in Atlas -> replaces `☐` with single `✅` + muted Graphite `colorId="8"`
+        with open(readme_p, encoding="utf-8") as fh:
+            txt = fh.read()
+        _write(readme_p, txt.replace("- [ ] 2026-11-26 [todo] Renew passport", "- [x] 2026-11-26 [todo] Renew passport"))
+        r2 = cal_sync.run_sync(self.brain, provider=self.provider, execute=True, today=self.today)
+        self.assertEqual(r2["pushed_updated"], 1)
+        ev_pass = self.fake.events[("personal", tasks_cid)][ev_pass["id"]]
+        self.assertEqual(ev_pass["summary"], "✅ Renew passport")
+        self.assertNotIn("☑️", ev_pass["summary"])
+        self.assertNotIn("☐", ev_pass["summary"])
+        self.assertEqual(ev_pass.get("colorId"), cal_sync.DONE_TODO_COLOR_ID)
+
+        # 2. Reopen `[ ]` in Atlas -> back to `☐ Renew passport` and Graphite `colorId` cleared!
+        with open(readme_p, encoding="utf-8") as fh:
+            txt = fh.read()
+        _write(readme_p, txt.replace("- [x] 2026-11-26 [todo] Renew passport", "- [ ] 2026-11-26 [todo] Renew passport"))
+        r3 = cal_sync.run_sync(self.brain, provider=self.provider, execute=True, today=self.today)
+        self.assertEqual(r3["pushed_updated"], 1)
+        ev_pass = self.fake.events[("personal", tasks_cid)][ev_pass["id"]]
+        self.assertEqual(ev_pass["summary"], "☐ Renew passport")
+        self.assertNotIn("colorId", ev_pass)
+
+        # 3. Remote manual check (`✅ ...`) and uncheck (`☐ ...`) sync status cleanly both ways!
+        ev_exp = next(e for e in self.fake.events[("personal", tasks_cid)].values() if "File travel expense" in e["summary"])
+        ev_exp["summary"] = "✅ File travel expense"
+        self.fake.seed_event("personal", tasks_cid, ev_exp, as_delta=True)
+        r4 = cal_sync.run_sync(self.brain, provider=self.provider, execute=True, today=self.today)
+        self.assertEqual(r4["pulled_updated"], 1)
+        with open(readme_p, encoding="utf-8") as fh:
+            self.assertIn("- [x] 2026-11-27 [todo] File travel expense", fh.read())
+
+        ev_exp["summary"] = "☐ File travel expense"
+        ev_exp.setdefault("extendedProperties", {}).setdefault("private", {})["atlas_status"] = "done"
+        self.fake.seed_event("personal", tasks_cid, ev_exp, as_delta=True)
+        r5 = cal_sync.run_sync(self.brain, provider=self.provider, execute=True, today=self.today)
+        self.assertEqual(r5["pulled_updated"], 1)
+        with open(readme_p, encoding="utf-8") as fh:
+            self.assertIn("- [ ] 2026-11-27 [todo] File travel expense", fh.read())
+
+        # 4. Simulate legacy pre-1.8.1 remote summaries (`☑️ ...` / `✓ ☑️ ...`) -> `--reformat` upgrades once & is idempotent!
+        ev_pass["summary"] = "☑️ Renew passport"
+        ev_exp["summary"] = "✓ ☑️ File travel expense"
+        with open(readme_p, encoding="utf-8") as fh:
+            txt = fh.read()
+        _write(readme_p, txt.replace("- [ ] 2026-11-27 [todo] File travel expense", "- [x] 2026-11-27 [todo] File travel expense"))
+        # Mark `File travel expense` done first, then simulate stale cached metadata from pre-1.8.1 DB
+        cal_sync.run_sync(self.brain, provider=self.provider, execute=True, today=self.today)
+        ev_pass["summary"] = "☑️ Renew passport"
+        ev_exp["summary"] = "✓ ☑️ File travel expense"
+        ev_exp.pop("colorId", None)
+        conn = cal_sync._open_db(self.brain)
+        for row in conn.execute("SELECT atlas_uid, meta_json FROM event_links").fetchall():
+            m = json.loads(row["meta_json"] or "{}")
+            m.pop("raw_summary", None)
+            m["color_id"] = ""
+            conn.execute("UPDATE event_links SET meta_json=? WHERE atlas_uid=?", (json.dumps(m), row["atlas_uid"]))
+        conn.commit()
+        conn.close()
+
+        r_ref = cal_sync.run_sync(self.brain, provider=self.provider, execute=True, reformat=True, today=self.today)
+        self.assertEqual(r_ref["pushed_updated"], 2)
+        self.assertEqual(self.fake.events[("personal", tasks_cid)][ev_pass["id"]]["summary"], "☐ Renew passport")
+        self.assertEqual(self.fake.events[("personal", tasks_cid)][ev_exp["id"]]["summary"], "✅ File travel expense")
+        self.assertEqual(self.fake.events[("personal", tasks_cid)][ev_exp["id"]].get("colorId"), cal_sync.DONE_TODO_COLOR_ID)
+
+        # Second `--reformat` run must be a 0-op (100 % idempotent!)
+        r_ref2 = cal_sync.run_sync(self.brain, provider=self.provider, execute=True, reformat=True, today=self.today)
+        self.assertEqual(r_ref2["pushed_updated"], 0)
 
 
 if __name__ == "__main__":

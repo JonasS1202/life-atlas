@@ -1839,6 +1839,7 @@ def cmd_cal(args):
             push_only=bool(getattr(args, "push_only", False)),
             layer_filter=getattr(args, "layer", None) or "",
             allow_bulk_delete=bool(getattr(args, "allow_bulk_delete", False)),
+            reformat=bool(getattr(args, "reformat", False)),
         )
         if execute and res.get("ok"):
             hk.load_index()
@@ -6514,6 +6515,7 @@ def main():
     p.add_argument("--pull-only", action="store_true", help="only pull remote deltas into Atlas")
     p.add_argument("--push-only", action="store_true", help="only push local Atlas changes to remote calendar")
     p.add_argument("--allow-bulk-delete", action="store_true", help="override bulk-delete circuit breaker (>3 deletes)")
+    p.add_argument("--reformat", action="store_true", help="re-push updated Atlas summary/color formatting for existing synced events")
     p.add_argument("--quiet", action="store_true", help="suppress output on sync")
     p.add_argument("--layer", help="filter or target calendar layer id/file")
     p.add_argument("--calendar-id", help="explicit remote calendarId override for `create`")

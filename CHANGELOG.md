@@ -2,6 +2,13 @@
 
 Written for users: `/atlas-update` shows the sections between the installed and the new version.
 
+## [1.8.1] - 2026-11-25
+
+- **Unmistakable Task Visual Clarity in External Calendars (`cal_sync.py`, `atlas.py`, `calendar.md`):**
+  - **Empty Checkbox (`☐`) vs. Single Green Check (`✅`) + Graphite Mute:** Replaced the ambiguous open-task `☑️` icon (which Android/mobile renders as a bright blue *checked* box) and stacked `✓ ☑️` done prefix with **`☐ <title>`** for open `[todo]` items and **`✅ <title>`** (replacing `☐`, zero double icons) plus muted grey (`colorId: "8"` / Graphite on Google Calendar) for completed `[x]` tasks. Reopening a completed task (`[x]` → `[ ]`) automatically restores the calendar's default color without overwriting custom user colors.
+  - **Two-Way Remote Toggle & Legacy Compatibility:** `parse_gcal_event()` recognizes `✅`, `✓`, and `✔` as done and explicit `☐`/`⬜` edits as reopened, while cleanly stripping legacy `☑️` and `✓ ☑️` prefixes on roundtrip.
+  - **Idempotent `--reformat` Refresh (`atlas.py cal sync --reformat --execute`):** Added `--reformat` to `atlas.py cal sync` so users upgrading from `<= 1.8.0` can upgrade all existing non-recurring synced task summaries and colors in place with a single command.
+
 ## [1.8.0] - 2026-11-25
 
 - **Multi-Provider Calendar Sync — Apple iCloud Calendar & CalDAV (`caldav_provider.py`, `cal_sync.py`, `atlas.py`, `calendar.md`):**

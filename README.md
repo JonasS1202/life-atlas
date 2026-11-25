@@ -135,7 +135,7 @@ test suite (`python -I tests/run.py`) and a separate test Atlas (`python -I dev/
 
 ## Status
 
-Version 1.8.0. Built from a setup in daily professional use, generalised for every part of life. Chat-first by design
+Version 1.8.1. Built from a setup in daily professional use, generalised for every part of life. Chat-first by design
 (native Markdown calendar & to-do hub with optional Google Calendar + Apple iCloud / CalDAV sync; zero local HTML
 dashboards). The Antigravity and Claude Code wiring follows the official docs as of 2026-11-25; open checks are listed
 in [`core/adapters.md`](core/adapters.md).

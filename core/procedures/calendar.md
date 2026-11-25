@@ -150,6 +150,7 @@ python -I <ROOT>/brain/_atlas/tools/atlas.py cal sync --execute
 - **Own events without external attendees:**
   - Edit `brain/calendar/<layer>.md` or run `atlas.py todo add "<text>" --to <date> --time <HH:MM> --kind event [--cal <layer>]` (or `atlas.py cal create --title "..." --date ... --rrule "FREQ=WEEKLY;BYDAY=TH"` for recurring series).
   - The Stop hook automatically pushes changes to Google / Apple iCloud / CalDAV (0 LLM tokens); PreInvocation pulls incremental deltas (`syncToken` / `sync-collection` / `CTag` fast-path) automatically.
+  - **Visual task clarity:** Open `[todo]` items sync with an empty unchecked box (`☐ <title>`); completed `[x]` tasks replace it with a single green checkmark (`✅ <title>`) plus muted grey (`colorId: 8` / Graphite on Google Calendar), and reopening `[ ]` restores the calendar's default color automatically. Run `atlas.py cal sync --reformat --execute` once after upgrading to refresh existing synced task titles/colors in place.
   - Individual per-layer modes (`bidirectional` or `read-only` in `sync.yaml`) plus per-line overrides: add `#local` to keep a specific entry strictly in Atlas (never pushed), or `#sync` to force-sync a local-only kind (e.g. a single `[birthday]`).
 - **External invites, Google Meet creation & RSVP (Strict Safety-Gate):**
   - **NEVER pass `--yes` without first showing the preview and getting explicit user confirmation** (external calendar servers send real invite/RSVP emails to third parties!).

@@ -46,7 +46,10 @@ BRAIN_PATH_TAIL_RX = re.compile(
 FEEDBACK_BLOCK_RX = re.compile(r"\s*\[feedback:\s*(.+?)\]\s*$", re.I)
 WORKOUT_PARENS_RX = re.compile(r"\s*\((\d{1,3})\s*(?:m|min)\s*\|\s*(.+)\)\s*$", re.I)
 DURATION_HINT_RX = re.compile(r"\b(\d{1,3})\s*(?:m|min)\b", re.I)
-LEADING_SYNC_ICON_RX = re.compile(r"^(?:✓\s*)?(?:[🚴🏃🏋️🏊🏆🚫☑️⏳📅🎉🎂❤️]+\s*)+")
+LEADING_SYNC_ICON_RX = re.compile(
+    r"^(?:(?:✓|✔|✅|☐|⬜|☑️?|🚴|🏃|🏋️?|🏊|🏆|🚫|⏳|📅|🎉|🎂|❤️?)\s*)+"
+)
+DONE_TODO_COLOR_ID = "8"  # Google Calendar Graphite (muted grey for completed `[todo]` items)
 CANCELLED_TITLE_RX = re.compile(r"^(?:abgesagt|canceled|cancelled|storniert)\s*[:\-–—]\s*", re.I)
 AUTO_BOOKING_TITLE_RX = re.compile(r"^(?:stay at|übernachtung(?:\s+in|\s+bei)?|hotel\s+reservation|flight\s+to|flug\s+nach)\b", re.I)
 FREEBUSY_EXCLUDE_NAME_RX = re.compile(r"(?:geburtstag|birthday|abfall|müll|muell|waste|trash|bin|feiertag|holiday|ferien)", re.I)
@@ -907,7 +910,7 @@ def _kind_icon(kind: str, subkind: str = "") -> str:
     if kind == "blocked":
         return "🚫"
     if kind == "todo":
-        return "☑️"
+        return "☐"
     if kind == "deadline":
         return "⏳"
     if kind == "birthday":
@@ -920,6 +923,7 @@ def format_atlas_for_gcal(
     atlas_uid: str,
     timezone: str = "UTC",
     existing_description: str = "",
+    existing_color_id: str = "",
 ) -> dict[str, Any]:
     """Smart-Formatter: convert an Atlas item into a clean Google Calendar Event resource."""
     what = str(item.get("what") or "").strip()
@@ -979,12 +983,16 @@ def format_atlas_for_gcal(
                 break
 
     ico = _kind_icon(kind, subkind)
-    prefix = ""
-    if status == "done":
-        prefix += "✓ "
-    if ico:
-        prefix += f"{ico} "
-    summary = f"{prefix}{clean_title}".strip()
+    if kind == "todo":
+        # Unmistakable open (`☐`) vs. done (`✅`) checkbox — never stack two check icons!
+        summary = f"{'✅' if status == 'done' else '☐'} {clean_title}".strip()
+    else:
+        prefix = ""
+        if status == "done":
+            prefix += "✓ "
+        if ico:
+            prefix += f"{ico} "
+        summary = f"{prefix}{clean_title}".strip()
 
     if long_detail:
         desc_parts.append(long_detail)
@@ -1022,6 +1030,12 @@ def format_atlas_for_gcal(
     }
     if description:
         body["description"] = description
+    if kind == "todo":
+        if status == "done":
+            body["colorId"] = DONE_TODO_COLOR_ID
+        elif str(existing_color_id or "") == DONE_TODO_COLOR_ID:
+            # Reopening a previously completed task clears Graphite back to the calendar default
+            body["colorId"] = None
 
     if t_start and t_end:
         sd = dt.date.fromisoformat(start_iso)
@@ -1052,7 +1066,11 @@ def parse_gcal_event(ev: dict[str, Any], default_kind: str = "event") -> dict[st
         priv = {}
 
     raw_summary = str(ev.get("summary") or "(Ohne Titel)").strip()
-    is_done_mark = raw_summary.startswith("✓ ") or priv.get("atlas_status") == "done"
+    explicit_open_mark = raw_summary.startswith(("☐ ", "☐", "⬜ ", "⬜"))
+    is_done_mark = (
+        raw_summary.startswith(("✓ ", "✔ ", "✅ ", "✅"))
+        or (priv.get("atlas_status") == "done" and not explicit_open_mark)
+    )
     clean_title = LEADING_SYNC_ICON_RX.sub("", raw_summary).strip() or raw_summary
     is_cancelled_title = bool(CANCELLED_TITLE_RX.match(clean_title))
 
@@ -1149,6 +1167,7 @@ def parse_gcal_event(ev: dict[str, Any], default_kind: str = "event") -> dict[st
         "organizer": str((ev.get("organizer") or {}).get("email") or ""),
         "organizer_self": bool((ev.get("organizer") or {}).get("self", True)),
         "color_id": str(ev.get("colorId") or ""),
+        "raw_summary": raw_summary,
         "updated": str(ev.get("updated") or ""),
         "recurring_event_id": str(ev.get("recurringEventId") or ""),
     }
@@ -1860,6 +1879,7 @@ def run_sync(
     push_only: bool = False,
     layer_filter: str = "",
     allow_bulk_delete: bool = False,
+    reformat: bool = False,
     today: dt.date | None = None,
     timeout: float = 15.0,
 ) -> dict[str, Any]:
@@ -2343,14 +2363,39 @@ def run_sync(
                         })
                         continue
 
-                    # Case 5: Only Atlas changed -> Push update to Google
-                    if atlas_changed and not g_changed and not pull_only and link["status"] == "active":
-                        prev_meta = json.loads(link["meta_json"] or "{}")
+                    # Case 5: Only Atlas changed (or `--reformat` refresh) -> Push update to remote
+                    prev_meta = json.loads(link["meta_json"] or "{}")
+                    needs_reformat = False
+                    if (
+                        reformat
+                        and not atlas_changed
+                        and not g_changed
+                        and not pull_only
+                        and link["status"] == "active"
+                        and l_item["status"] != "skipped"
+                        and not link["recurring_event_id"]
+                        and prev_meta.get("organizer_self", True)
+                    ):
+                        cand_body = format_atlas_for_gcal(
+                            l_item, uid, timezone=tz,
+                            existing_description=str(prev_meta.get("description") or ""),
+                            existing_color_id=str(prev_meta.get("color_id") or ""),
+                        )
+                        cur_raw_sum = str(prev_meta.get("raw_summary") or "")
+                        cur_col = str(prev_meta.get("color_id") or "")
+                        want_col = str(cand_body.get("colorId") or "") if "colorId" in cand_body else cur_col
+                        if cur_raw_sum != cand_body["summary"] or cur_col != want_col:
+                            needs_reformat = True
+
+                    if (atlas_changed or needs_reformat) and not g_changed and not pull_only and link["status"] == "active":
                         ev_body = format_atlas_for_gcal(
-                            l_item, uid, timezone=tz, existing_description=str(prev_meta.get("description") or "")
+                            l_item, uid, timezone=tz,
+                            existing_description=str(prev_meta.get("description") or ""),
+                            existing_color_id=str(prev_meta.get("color_id") or ""),
                         )
                         report["pushed_updated"] += 1
-                        report["actions"].append(f"[push~] {link['account_id']}: {l_item['start']} {l_item['time']} {ev_body['summary']}".strip())
+                        tag_p = "[reformat~]" if (needs_reformat and not atlas_changed) else "[push~]"
+                        report["actions"].append(f"{tag_p} {link['account_id']}: {l_item['start']} {l_item['time']} {ev_body['summary']}".strip())
                         if execute:
                             try:
                                 updated_ev = prov.upsert_event(
@@ -2460,6 +2505,7 @@ def run_sync(
                                 ev_body = format_atlas_for_gcal(
                                     merged_item, uid, timezone=tz,
                                     existing_description=str((r_ev.get("meta") or {}).get("description") or ""),
+                                    existing_color_id=str((r_ev.get("meta") or {}).get("color_id") or ""),
                                 )
                                 try:
                                     updated_ev = prov.upsert_event(
