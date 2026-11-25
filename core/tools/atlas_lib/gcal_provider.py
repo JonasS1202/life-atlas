@@ -135,6 +135,7 @@ def list_configured_accounts(brain: str) -> list[dict[str, Any]]:
         connected = (has_refresh or (has_access and exp > now_ts)) and err != "refresh_expired"
         out.append({
             "id": aid,
+            "provider": "gcal",
             "email": email,
             "connected": connected,
             "has_refresh_token": has_refresh,
@@ -622,6 +623,17 @@ class CalendarProvider:
     ) -> dict[str, Any]:
         raise NotImplementedError
 
+    def list_event_instances(
+        self,
+        account_id: str,
+        calendar_id: str,
+        event_id: str,
+        time_min: str = "",
+        time_max: str = "",
+    ) -> list[dict[str, Any]]:
+        """Expand a recurring master event into individual instances within `[time_min, time_max]`."""
+        return []
+
     def upsert_event(
         self,
         account_id: str,
@@ -839,6 +851,46 @@ class GoogleCalendarProvider(CalendarProvider):
             "next_sync_token": next_sync_token,
             "full_sync": not used_sync_token,
         }
+
+    def list_event_instances(
+        self,
+        account_id: str,
+        calendar_id: str,
+        event_id: str,
+        time_min: str = "",
+        time_max: str = "",
+    ) -> list[dict[str, Any]]:
+        """Expand a recurring master event via `/calendars/{cal}/events/{id}/instances` (paginated)."""
+        cal_enc = urllib.parse.quote(calendar_id, safe="")
+        ev_enc = urllib.parse.quote(event_id, safe="")
+        instances: list[dict[str, Any]] = []
+        page_token = ""
+        for _ in range(20):
+            params: dict[str, Any] = {"showDeleted": "true", "maxResults": 250}
+            if time_min:
+                params["timeMin"] = time_min
+            if time_max:
+                params["timeMax"] = time_max
+            if page_token:
+                params["pageToken"] = page_token
+            status, data = self._request(
+                account_id, "GET", f"/calendars/{cal_enc}/events/{ev_enc}/instances", params=params
+            )
+            if status in (404, 410):
+                return []
+            if status >= 400:
+                raise CalendarProviderError(
+                    f"list_event_instances failed for {account_id}/{calendar_id}/{event_id} (HTTP {status}): {str(data)[:250]}",
+                    status=status,
+                    code="api_error",
+                )
+            for ev in data.get("items") or []:
+                if isinstance(ev, dict) and ev.get("id"):
+                    instances.append(ev)
+            page_token = str(data.get("nextPageToken") or "")
+            if not page_token:
+                break
+        return instances
 
     def upsert_event(
         self,

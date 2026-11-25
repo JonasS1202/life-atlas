@@ -69,6 +69,7 @@ class FakeGCalAPI:
         }
         # events[(account_id, calendar_id)][event_id] = event_dict
         self.events: dict[tuple[str, str], dict[str, dict]] = {}
+        self.instances: dict[tuple[str, str, str], list[dict]] = {}
         self.deltas: dict[tuple[str, str], list[dict]] = {}
         self.sync_token_counter = 0
         self.expired_sync_tokens: set[str] = set()
@@ -193,6 +194,11 @@ class FakeGCalAPI:
                     ev["hangoutLink"] = f"https://meet.google.com/abc-defg-{self.next_id}"
                 self.events.setdefault((acct, cid), {})[ev["id"]] = ev
                 return 200, ev
+
+            # GET /calendars/{cid}/events/{ev_id}/instances
+            if method == "GET" and len(parts) == 5 and parts[4] == "instances":
+                ev_id = parts[3]
+                return 200, {"items": list(self.instances.get((acct, cid, ev_id), []))}
 
             # GET / PATCH / DELETE /calendars/{cid}/events/{ev_id}
             if len(parts) == 4:
@@ -795,6 +801,97 @@ class CalSyncUnit(unittest.TestCase):
         self.assertNotIn("Stay at Villa Sunny", rm_txt)
         details = cal_sync.find_event_details(self.brain, "Spring Camp")
         self.assertEqual(details[0]["location"], "Main Street 1, 07360 Island")
+
+    def test_v180_rrule_synctoken_expansion_and_layer_freebusy_exclude(self) -> None:
+        # 1. Discover with a read-only waste calendar + birthday calendar -> both auto-get `freebusy: false`
+        self.fake.calendars["personal"].append({
+            "id": "waste_bins@group.calendar.google.com", "summary": "Abfallkalender",
+            "primary": False, "accessRole": "reader", "timeZone": "Europe/Berlin",
+        })
+        self.fake.calendars["personal"].append({
+            "id": "birthdays_custom@group.calendar.google.com", "summary": "Birthdays",
+            "primary": False, "accessRole": "owner", "timeZone": "Europe/Berlin",
+        })
+        disc = cal_sync.discover_calendars(self.brain, provider=self.provider, execute=True)
+        waste_ly = next(ly for ly in disc["layers"] if ly["calendar_id"] == "waste_bins@group.calendar.google.com")
+        bday_ly = next(ly for ly in disc["layers"] if ly["calendar_id"] == "birthdays_custom@group.calendar.google.com")
+        self.assertIs(waste_ly.get("freebusy"), False)
+        self.assertIs(bday_ly.get("freebusy"), False)
+
+        # Initial full sync to establish sync tokens
+        cal_sync.run_sync(self.brain, provider=self.provider, execute=True, today=self.today)
+
+        # 2. Incremental syncToken delta delivers a NEW recurring master event (with `recurrence`, NO `recurringEventId`)
+        master_ev = self.fake.seed_event("personal", "user@example.com", {
+            "id": "rec_master_1",
+            "summary": "Take out bins",
+            "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=TH"],
+            "start": {"dateTime": "2026-11-26T18:00:00+01:00"},
+            "end": {"dateTime": "2026-11-26T18:15:00+01:00"},
+        }, as_delta=True)
+        inst1 = self.fake.seed_event("personal", "user@example.com", {
+            "id": "rec_master_1_20261126",
+            "recurringEventId": master_ev["id"],
+            "summary": "Take out bins",
+            "start": {"dateTime": "2026-11-26T18:00:00+01:00"},
+            "end": {"dateTime": "2026-11-26T18:15:00+01:00"},
+        })
+        inst2 = self.fake.seed_event("personal", "user@example.com", {
+            "id": "rec_master_1_20261203",
+            "recurringEventId": master_ev["id"],
+            "summary": "Take out bins",
+            "start": {"dateTime": "2026-12-03T18:00:00+01:00"},
+            "end": {"dateTime": "2026-12-03T18:15:00+01:00"},
+        })
+        self.fake.instances[("personal", "user@example.com", master_ev["id"])] = [inst1, inst2]
+
+        r_inc = cal_sync.run_sync(self.brain, provider=self.provider, execute=True, today=self.today)
+        self.assertEqual(r_inc["pulled_new"], 2)  # Both expanded instances pulled, NOT the master!
+        readme_p = os.path.join(self.brain, "calendar", "README.md")
+        with open(readme_p, encoding="utf-8") as fh:
+            txt = fh.read()
+        self.assertIn("2026-11-26 18:00-18:15 [event] Take out bins", txt)
+        self.assertIn("2026-12-03 18:00-18:15 [event] Take out bins", txt)
+
+        # Marking only Nov 26 `[x]` patches ONLY `rec_master_1_20261126`, leaving `rec_master_1` untouched!
+        txt_done = txt.replace("- [ ] 2026-11-26 18:00-18:15", "- [x] 2026-11-26 18:00-18:15")
+        _write(readme_p, txt_done)
+        cal_sync.run_sync(self.brain, provider=self.provider, execute=True, today=self.today)
+        self.assertTrue(self.fake.events[("personal", "user@example.com")]["rec_master_1_20261126"]["summary"].startswith("✓ "))
+        self.assertEqual(self.fake.events[("personal", "user@example.com")]["rec_master_1"]["summary"], "Take out bins")
+
+        # Deleting master series in delta cascades cancellation to active instances!
+        master_cancelled = dict(master_ev, status="cancelled")
+        self.fake.deltas.setdefault(("personal", "user@example.com"), []).append(master_cancelled)
+        r_can = cal_sync.run_sync(self.brain, provider=self.provider, execute=True, today=self.today)
+        self.assertGreaterEqual(r_can["pulled_cancelled"], 1)
+        with open(readme_p, encoding="utf-8") as fh:
+            self.assertIn("- [-] 2026-12-03 18:00-18:15 [event] Take out bins", fh.read())
+
+        # 3. `freebusy: false` prevents an opaque full-day event in Abfallkalender from blocking the whole workday!
+        self.fake.seed_event("personal", "waste_bins@group.calendar.google.com", {
+            "summary": "Organic Waste",
+            "transparency": "opaque",
+            "start": {"dateTime": "2026-11-27T00:00:00+01:00"},
+            "end": {"dateTime": "2026-11-27T23:59:00+01:00"},
+        })
+        fb = cal_sync.compute_freebusy(
+            self.brain, days=1, start_date_iso="2026-11-27",
+            work_start_hour=8, work_end_hour=18, min_slot_minutes=30,
+            provider=self.provider, use_remote=True,
+        )
+        self.assertEqual(fb["days"][0]["busy"], [])
+        self.assertEqual(fb["days"][0]["free"][0]["start"], "08:00")
+        self.assertEqual(fb["days"][0]["free"][0]["end"], "18:00")
+
+        # 4. `create_event_guarded` with `recurrence` attaches RRULE cleanly
+        c_rec = cal_sync.create_event_guarded(
+            self.brain, title="Weekly Standup", date_iso="2026-11-30", time_spec="09:00-09:30",
+            account_id="personal", recurrence=["FREQ=WEEKLY;BYDAY=MO"], execute=True, provider=self.provider,
+        )
+        self.assertTrue(c_rec["applied"])
+        created_g = self.fake.events[("personal", "user@example.com")][c_rec["gcal_event_id"]]
+        self.assertEqual(created_g.get("recurrence"), ["RRULE:FREQ=WEEKLY;BYDAY=MO"])
 
 
 if __name__ == "__main__":

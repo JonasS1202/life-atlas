@@ -10,8 +10,8 @@ an external calendar, or invokes `/atlas-calendar`.
 - **`brain/calendar/` is ALWAYS the Source of Truth.** `brain/calendar/README.md` (plus optional layered files
   `brain/calendar/<layer>.md`) works **100 % standalone with zero connectors**, OR synced individually per layer
   (`bidirectional`, `read-only`, or `#local` per-line overrides) with the external calendar app the user prefers on
-  desktop, phone, and watch (currently Google Calendar via `atlas.py cal`; passive `.ics` import/export via
-  `atlas.py calendar --ics` / `--sync-ics`).
+  desktop, phone, and watch (Google Calendar and/or Apple iCloud / CalDAV — Nextcloud, Fastmail, Mailbox.org, Posteo —
+  via `atlas.py cal`; passive `.ics` import/export via `atlas.py calendar --ics` / `--sync-ics`).
 
 ## 2. Viewing the calendar & agenda in chat
 
@@ -77,13 +77,46 @@ For multi-line manual edits in `brain/calendar/README.md`:
 - **Undated tasks** go under `## Open To-Dos`:
   `- [ ] [high|med|low] Task description` (moving to a date via `atlas.py todo move` promotes it to `## Timeline`).
 
-## 4. Optional Bidirectional Google Calendar Sync (`atlas.py cal`)
+## 4. Optional Multi-Provider Bidirectional Calendar Sync (`atlas.py cal`)
 
-Completely opt-in, zero-token multi-account 3-way sync via Google Calendar REST API v3 (`brain/_secrets/gcal.env`,
-`chmod 600`; layer config in `brain/calendar/sync.yaml`; 3-way state & metadata cache in
-`brain/_atlas/cache/cal_sync.sqlite`).
+Completely opt-in, zero-token, multi-provider 3-way sync supporting **Google Calendar** (`brain/_secrets/gcal.env`) and
+**Apple iCloud Calendar / CalDAV** (`brain/_secrets/caldav.env` — Apple iCloud, Nextcloud, Fastmail, Mailbox.org,
+Posteo, GMX, Web.de, or any RFC 4791 CalDAV server), standalone or side-by-side! Credentials are stored strictly
+locally (`chmod 600`, git-ignored); layer configuration lives in `brain/calendar/sync.yaml`; 3-way state & metadata
+cache live in `brain/_atlas/cache/cal_sync.sqlite`.
 
-### 5-Step Google Cloud Setup (once, 0 EUR, no 7-day token expiry)
+### Option A: Apple iCloud Calendar / CalDAV (3 Steps, Zero Developer Portal!)
+
+Works natively on iPhone, iPad, Mac, and Apple Watch (plus Nextcloud / Fastmail / Mailbox.org / Posteo):
+
+1. For **Apple iCloud**, sign in at [account.apple.com](https://account.apple.com) → *Sign-In and Security* →
+   *App-Specific Passwords* → generate a 16-character password (`xxxx-xxxx-xxxx-xxxx`) labeled `Atlas`.
+2. Connect & verify (prefer `--password-stdin` or editing `brain/_secrets/caldav.env` so the password never enters
+   shell history):
+
+```bash
+# Apple iCloud (pass App-Specific Password securely via stdin):
+printf '%s' 'xxxx-xxxx-xxxx-xxxx' | python -I <ROOT>/brain/_atlas/tools/atlas.py cal auth --provider icloud --account icloud --username you@icloud.com --password-stdin
+
+# Or initialize `brain/_secrets/caldav.env` (chmod 600), paste password in the file, and verify:
+python -I <ROOT>/brain/_atlas/tools/atlas.py cal auth --provider icloud --account icloud --init-env
+python -I <ROOT>/brain/_atlas/tools/atlas.py cal auth --provider icloud --account icloud --verify
+
+# Other CalDAV servers (Fastmail / Nextcloud / Mailbox.org / generic CalDAV):
+printf '%s' '<app-pw>' | python -I <ROOT>/brain/_atlas/tools/atlas.py cal auth --provider fastmail --account fastmail --username you@fastmail.com --password-stdin
+printf '%s' '<app-pw>' | python -I <ROOT>/brain/_atlas/tools/atlas.py cal auth --provider nextcloud --account nextcloud --url https://cloud.example.com --username alice --password-stdin
+```
+
+3. Discover calendars across all connected accounts (Google + Apple/CalDAV combined!) and sync:
+
+```bash
+python -I <ROOT>/brain/_atlas/tools/atlas.py cal discover
+python -I <ROOT>/brain/_atlas/tools/atlas.py cal discover --execute
+python -I <ROOT>/brain/_atlas/tools/atlas.py cal sync --dry-run
+python -I <ROOT>/brain/_atlas/tools/atlas.py cal sync --execute
+```
+
+### Option B: Google Calendar (5-Step Google Cloud Setup, 0 EUR, No 7-Day Token Expiry)
 
 1. Open [Google Cloud Console](https://console.cloud.google.com/) and create a **dedicated Calendar project** (tip: do
    **not** mix restricted Google Health scopes into the same project so you can publish cleanly without 7-day token
@@ -110,20 +143,20 @@ python -I <ROOT>/brain/_atlas/tools/atlas.py cal sync --execute
 ### Daily Commands & Safety-Gate Rules
 
 - **Read-Only (always free):**
-  - `atlas.py cal status` — connected accounts, layers, last sync timestamp, open conflicts.
+  - `atlas.py cal status` — connected Google & CalDAV/Apple accounts, layers, `freebusy` flags, last sync timestamp, open conflicts.
   - `atlas.py cal list [--days 30] [--layer <id>] [--query <text>]` — upcoming synced items across all layers.
-  - `atlas.py cal show "<query_or_uid>"` — full Google details (location, Google Meet link, attendees, RSVP, description).
-  - `atlas.py cal freebusy --days 7 [--start-hour 8 --end-hour 20 --min-min 30]` — consolidated free slots across ALL accounts and layers (including read-only mirrors & workouts).
+  - `atlas.py cal show "<query_or_uid>"` — full remote details (location, video/Meet link, attendees, RSVP, description).
+  - `atlas.py cal freebusy --days 7 [--start-hour 8 --end-hour 20 --min-min 30]` — consolidated free slots across ALL FreeBusy-enabled accounts and layers (Google + Apple/CalDAV; set `freebusy: false` on a layer in `sync.yaml` to exclude informational/birthday/waste calendars).
 - **Own events without external attendees:**
-  - Edit `brain/calendar/<layer>.md` or run `atlas.py todo add "<text>" --to <date> --time <HH:MM> --kind event [--cal <layer>]`.
-  - The Stop hook automatically pushes changes to Google (0 LLM tokens); PreInvocation pulls incremental `syncToken` deltas automatically.
+  - Edit `brain/calendar/<layer>.md` or run `atlas.py todo add "<text>" --to <date> --time <HH:MM> --kind event [--cal <layer>]` (or `atlas.py cal create --title "..." --date ... --rrule "FREQ=WEEKLY;BYDAY=TH"` for recurring series).
+  - The Stop hook automatically pushes changes to Google / Apple iCloud / CalDAV (0 LLM tokens); PreInvocation pulls incremental deltas (`syncToken` / `sync-collection` / `CTag` fast-path) automatically.
   - Individual per-layer modes (`bidirectional` or `read-only` in `sync.yaml`) plus per-line overrides: add `#local` to keep a specific entry strictly in Atlas (never pushed), or `#sync` to force-sync a local-only kind (e.g. a single `[birthday]`).
 - **External invites, Google Meet creation & RSVP (Strict Safety-Gate):**
-  - **NEVER pass `--yes` without first showing the preview and getting explicit user confirmation** (Google sends real emails to third parties!).
+  - **NEVER pass `--yes` without first showing the preview and getting explicit user confirmation** (external calendar servers send real invite/RSVP emails to third parties!).
   - Preview first:
-    - `atlas.py cal create --title "Project Kickoff" --date 2026-12-03 --time 10:00-11:00 --account work --attendees "alice@example.com" --meet`
+    - `atlas.py cal create --title "Project Kickoff" --date 2026-12-03 --time 10:00-11:00 --account work --attendees "alice@example.com" --meet` (`--meet` requires a Google account; for CalDAV/Apple omit `--meet` and put a video URL in `--location`)
     - `atlas.py cal rsvp "Project Kickoff" --status accepted`
   - Only after explicit approval, re-run with `--yes`.
 - **Conflicts & Bulk-Delete Protection:**
-  - Uncertain duplicate matches or simultaneous conflicting edits are queued rather than silently duplicated/overwritten: inspect with `atlas.py cal conflicts` and resolve with `--resolve <id> --action link|keep-both|use-atlas|use-google|dismiss`.
+  - Uncertain duplicate matches or simultaneous conflicting edits are queued rather than silently duplicated/overwritten: inspect with `atlas.py cal conflicts` and resolve with `--resolve <id> --action link|keep-both|use-atlas|use-remote|dismiss`.
   - Remote deletes exceeding `bulk_delete_limit` (default `3`) trip the Bulk-Delete Circuit Breaker until explicitly confirmed with `--execute --allow-bulk-delete`.

@@ -27,7 +27,7 @@ agent memories, scattered documents and code repositories included), and ends wi
 - **"Remind me on Friday to call the dentist" / "Continue in the shop app."** Tasks and appointments go straight into
   your native Atlas Markdown calendar (`brain/calendar/README.md`) — works standalone with zero connectors, or syncs
   automatically per layer (bidirectional / read-only / `#local`) with your real external calendar app on desktop, phone,
-  and watch (Google Calendar built in; CalDAV/Apple Calendar next). Project prompts route straight into that repository.
+  and watch (Google Calendar + Apple iCloud / CalDAV built in). Project prompts route straight into that repository.
 - **"Remember: the car insurance can be cancelled until 30 November."** Filed on the right page with a deadline; you
   are reminded in time.
 - **"No, that's wrong."** A correction becomes a lesson Atlas keeps.
@@ -98,7 +98,7 @@ to file what was learned (always after a learning signal, otherwise throttled).
 | In chat | What it does |
 |---|---|
 | `/atlas-brief` | what is due, smart overdue task check-in & free-day suggestions, in 3–6 lines |
-| `/atlas-calendar` | chat-first native Markdown calendar (`brain/calendar/`), atomic to-do triage (`atlas.py todo`), optional multi-account Google Calendar 3-way sync & FreeBusy (`atlas.py cal`) |
+| `/atlas-calendar` | chat-first native Markdown calendar (`brain/calendar/`), atomic to-do triage (`atlas.py todo`), optional multi-provider Google Calendar & Apple iCloud / CalDAV 3-way sync & FreeBusy (`atlas.py cal`) |
 | `/atlas-coach` | adaptive Simple-to-Pro Cycling, Running & Strength coach: macro periodization, 14d workouts, `.zwo`/`.fit` export, `CP/W'`, `W'bal`, `CTL/ATL/TSB`, Strava / Hammerhead / Google Health / Garmin connectors |
 | `/atlas-mail` | multi-account IMAP mail client, header-fast search/audit, `mail ingest` bridge, and safety-gated `move`, `trash`, `flags` & `labels` |
 | `/atlas-sort` | file the inbox (and the cloud inbox), or bring a messy folder into Atlas |
@@ -135,7 +135,7 @@ test suite (`python -I tests/run.py`) and a separate test Atlas (`python -I dev/
 
 ## Status
 
-Version 1.7.0. Built from a setup in daily professional use, generalised for every part of life. Chat-first by design
-(native Markdown calendar & to-do hub with optional external calendar sync; zero local HTML dashboards). The
-Antigravity and Claude Code wiring follows the official docs as of 2026-11-25; open checks are listed in
-[`core/adapters.md`](core/adapters.md).
+Version 1.8.0. Built from a setup in daily professional use, generalised for every part of life. Chat-first by design
+(native Markdown calendar & to-do hub with optional Google Calendar + Apple iCloud / CalDAV sync; zero local HTML
+dashboards). The Antigravity and Claude Code wiring follows the official docs as of 2026-11-25; open checks are listed
+in [`core/adapters.md`](core/adapters.md).

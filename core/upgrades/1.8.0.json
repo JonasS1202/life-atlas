@@ -1,0 +1,5 @@
+{
+  "notes": [
+    "Atlas `1.8.0` adds a pure-stdlib CalDAV Calendar Provider (`caldav_provider.py`, RFC 4791 / RFC 5545 / RFC 6578) for **Apple iCloud Calendar** (iPhone, iPad, Mac, Apple Watch), Nextcloud, Fastmail, Mailbox.org, Posteo, GMX, Web.de, and generic CalDAV servers — running seamlessly standalone or side-by-side with Google Calendar via `CompositeCalendarProvider` (`atlas.py cal auth --provider icloud` -> `atlas.py cal discover --execute` -> `atlas.py cal sync --execute`). Credentials live in git-ignored `brain/_secrets/caldav.env` (`chmod 600`). Also ships four calendar & to-do robustness upgrades: incremental `syncToken` expansion for new `RRULE` recurring series (plus `--rrule` in `atlas.py cal create`), `<!-- g:<uid> -->`-aware Stop-hook calendar safety guard, per-layer `freebusy: false` in `sync.yaml` (auto-applied to birthday/waste/holiday layers), and decentralized checklist deduplication against dated `calendar/README.md` entries plus immediate sync push on `rollover_today`."
+  ]
+}

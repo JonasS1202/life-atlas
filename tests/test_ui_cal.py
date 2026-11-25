@@ -671,6 +671,72 @@ class UiCalUnit(unittest.TestCase):
         prev = subprocess.run(["git", "show", "HEAD~1:calendar/README.md"], cwd=self.brain, capture_output=True, text=True, check=True).stdout
         self.assertIn("Zahnarzt anrufen", prev)
 
+    def test_v180_guard_sync_uid_and_open_todos_dated_dedup_and_rollover_push(self):
+        # 1. Stop-hook safety guard recognizes preserved `<!-- g:<uid> -->` even when simultaneously rescheduled AND reworded!
+        cal_md = os.path.join(self.brain, "calendar", "README.md")
+        _write_file(
+            cal_md,
+            "---\nsummary: Calendar\ntags: [calendar]\n---\n# Calendar\n\n"
+            "## Timeline\n\n"
+            "- [ ] 2026-11-25 [todo] Call bank advisor <!-- g:a1b2c3d4 -->\n"
+            "- [ ] 2026-12-04 [todo] Switch bank statements to paperless electronic inbox (areas/finance/todos.md) <!-- g:f0e1d2c3 -->\n\n"
+            "## Open To-Dos\n\n",
+        )
+        subprocess.run(["git", "init", "-q"], cwd=self.brain, check=True)
+        subprocess.run(["git", "config", "user.name", "Test User"], cwd=self.brain, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=self.brain, check=True)
+        subprocess.run(["git", "add", "calendar/README.md"], cwd=self.brain, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "baseline"], cwd=self.brain, check=True)
+
+        # Reschedule AND completely reword `<!-- g:a1b2c3d4 -->` -> MUST NOT false-positive!
+        _write_file(
+            cal_md,
+            "---\nsummary: Calendar\ntags: [calendar]\n---\n# Calendar\n\n"
+            "## Timeline\n\n"
+            "- [ ] 2026-12-01 [todo] Schedule quarterly portfolio review with specialist <!-- g:a1b2c3d4 -->\n"
+            "- [ ] 2026-12-04 [todo] Switch bank statements to paperless electronic inbox (areas/finance/todos.md) <!-- g:f0e1d2c3 -->\n\n"
+            "## Open To-Dos\n\n",
+        )
+        hk = _load_hook_for_brain(self.brain)
+        self.assertEqual(hk._detect_deleted_open_calendar_tasks(), [])
+
+        # 2. `open_todos()` skips decentralized checklist items already scheduled as future dated `[todo]`s in `calendar/README.md`
+        _write_file(
+            os.path.join(self.brain, "areas", "finance", "todos.md"),
+            "---\nsummary: Finance Checklist\ntags: [finance]\n---\n# Finance Checklist\n\n"
+            "## Offene Punkte\n\n"
+            "- [ ] Switch bank statements to paperless electronic inbox\n"
+            "- [ ] Unscheduled separate finance item\n",
+        )
+        ot = hk.open_todos(include_done=False)
+        ot_whats = [t["what"] for t in ot]
+        self.assertNotIn("Switch bank statements to paperless electronic inbox", ot_whats)
+        self.assertIn("Unscheduled separate finance item", ot_whats)
+
+        # 3. `rollover_today` in `session_text` calls `cal_sync.auto_push_on_stop` immediately when calendar sync is enabled
+        past_d = (dt.date.today() - dt.timedelta(days=2)).isoformat()
+        _write_file(
+            os.path.join(self.brain, "settings.md"),
+            "---\nsummary: Settings\nbriefing: daily\noverdue_todo_policy: rollover_today\n---\n# Settings\n",
+        )
+        _write_file(
+            cal_md,
+            "---\nsummary: Calendar\ntags: [calendar]\n---\n# Calendar\n\n## Timeline\n\n"
+            f"- [ ] {past_d} [todo] Overdue sync rollover task <!-- g:12345678 -->\n",
+        )
+        push_calls = []
+        orig_summary = hk.cal_sync.get_sync_ui_summary
+        orig_push = hk.cal_sync.auto_push_on_stop
+        hk.cal_sync.get_sync_ui_summary = lambda _b: {"enabled": True, "open_conflicts": 0, "auth_warnings": []}
+        hk.cal_sync.auto_push_on_stop = lambda b, timeout=4.0: push_calls.append((b, timeout))
+        try:
+            sess = hk.session_text(self.brain, "sess-rollover-push", skip_pull=True)
+        finally:
+            hk.cal_sync.get_sync_ui_summary = orig_summary
+            hk.cal_sync.auto_push_on_stop = orig_push
+        self.assertIn("Overdue rollover (policy=rollover_today)", sess)
+        self.assertEqual(len(push_calls), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

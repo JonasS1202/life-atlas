@@ -636,6 +636,7 @@ def open_todos(include_done=False):
             "_r": prio_rank.get(prio, 1),
         })
 
+    cal_dated_entries = []
     cal_readme = os.path.join(BRAIN, "calendar", "README.md")
     if os.path.isfile(cal_readme):
         try:
@@ -655,6 +656,16 @@ def open_todos(include_done=False):
                 in_todos = any(w in line.lower() for w in ("to-do", "todo", "aufgaben", "backlog"))
                 continue
             if DATE_ITEM.match(line):
+                dm = DATE_ITEM.match(line)
+                if dm:
+                    d_box = (dm.group(1) or "").strip().lower()
+                    if d_box != "[-]":
+                        rest_d, _uid = cal_sync.strip_sync_comment(dm.group(4))
+                        rest_d = re.sub(r"^\d{1,2}:\d{2}(?:-\d{1,2}:\d{2})?\s+", "", rest_d.strip())
+                        rest_d = re.sub(r"^\[[a-zA-Z0-9_:-]+\]\s*", "", rest_d).strip()
+                        d_clean = _clean_md_inline(rest_d)
+                        if len(d_clean) >= 4:
+                            cal_dated_entries.append((d_clean.lower(), _cal_tokens(d_clean)))
                 continue
             m = TODO_ITEM.match(line)
             if not m:
@@ -669,6 +680,18 @@ def open_todos(include_done=False):
             _add_todo(status, prio, m.group(3).strip(), "calendar/README.md", line_no=idx_ln, can_toggle=True)
 
     # Also harvest open tasks from checklist/todo pages in brain/ so nothing is missed
+    def _already_dated_in_calendar(what_text):
+        wc = _clean_md_inline(what_text).lower()
+        t_c = _cal_tokens(wc)
+        for d_low, t_d in cal_dated_entries:
+            if wc == d_low or (len(wc) >= 10 and (wc in d_low or d_low in wc)):
+                return True
+            if t_c and t_d:
+                ov = len(t_c & t_d)
+                if ov >= 2 and ov / max(min(len(t_c), len(t_d)), 1) >= 0.6:
+                    return True
+        return False
+
     for sub in ("areas", "projects", "self"):
         sdir = os.path.join(BRAIN, sub)
         if not os.path.isdir(sdir):
@@ -712,6 +735,8 @@ def open_todos(include_done=False):
                         raw_w = tm.group(3).strip()
                         if raw_w.startswith("(") or len(raw_w) < 4:
                             continue
+                        if _already_dated_in_calendar(raw_w):
+                            continue
                         _add_todo(status, (tm.group(2) or "med").lower(), raw_w, rel, line_no=idx_ln, can_toggle=True)
                         continue
                     if is_checklist_file and in_open_sec:
@@ -719,6 +744,8 @@ def open_todos(include_done=False):
                         if nm:
                             headline = (nm.group(1) + " " + nm.group(2)).strip()
                             if re.search(r"\b(erledigt|abgeschlossen|done)\b", headline, re.I):
+                                continue
+                            if _already_dated_in_calendar(headline):
                                 continue
                             prio = "high" if re.search(r"\b(phase 5|nachziehen|nachtragen|frist)\b", headline, re.I) else "med"
                             _add_todo("open", prio, headline, rel, line_no=idx_ln, can_toggle=False)
@@ -1908,6 +1935,11 @@ def session_text(cwd, session, skip_pull=False):
                         f"Overdue rollover (policy=rollover_today): moved {len(rr['moved'])} open [todo](s) to {today} "
                         "(original dates kept as `(orig YYYY-MM-DD)`; hard [deadline]s untouched)."
                     )
+                    try:
+                        if cal_sync.get_sync_ui_summary(BRAIN).get("enabled"):
+                            cal_sync.auto_push_on_stop(BRAIN, timeout=4.0)
+                    except Exception as p_exc:
+                        _log_hook_error("session.rollover_push", p_exc)
             except Exception as exc:
                 _log_hook_error("session.rollover_todos", exc)
         tasks = actionable_tasks(idx, include_upcoming_days=0)
@@ -2476,19 +2508,19 @@ def prompt_text(prompt, cwd, session):
             sync_extra = ""
             try:
                 if cal_sync.get_sync_ui_summary(BRAIN).get("enabled"):
-                    sync_extra = f" | Google Sync/FreeBusy/Invites: `{py} -I {tools_py} cal status|freebusy|show|create|rsvp|conflicts|sync`."
+                    sync_extra = f" | Calendar Sync/FreeBusy/Invites: `{py} -I {tools_py} cal status|freebusy|show|create|rsvp|conflicts|sync`."
             except Exception:
                 pass
             lines.append(
                 f"Atlas tasks/calendar -> Use `{py} -I {tools_py} todo` (`list|done|move|unschedule|skip|add \"<text>\" [--to YYYY-MM-DD] [--time HH:MM] [--kind event|todo|deadline|blocked|goal]`) or `{py} -I {tools_py} calendar`.{sync_extra}"
             )
-        # Zero-token incremental Google Calendar auto-pull (TTL 60s on calendar/coach/briefing intent, else 15m; 2s fail-open)
+        # Zero-token incremental external calendar auto-pull (Google + Apple iCloud/CalDAV; TTL 60s urgent, else 15m; 2s fail-open)
         if not PROBE:
             try:
                 is_cal_urgent = bool(
                     c_mode
                     or TODO_RX.search(prompt)
-                    or re.search(r"(?i)\b(kalender|calendar|termin|meeting|frei|freebusy|slot|woche|morgen|heute|briefing|sync|einlad|rsvp|google\s*meet)\b", prompt)
+                    or re.search(r"(?i)\b(kalender|calendar|termin|meeting|frei|freebusy|slot|woche|morgen|heute|briefing|sync|einlad|rsvp|google\s*meet|icloud|apple\s*cal|caldav)\b", prompt)
                 )
                 pull_res = cal_sync.maybe_auto_pull(BRAIN, urgent=is_cal_urgent, timeout=2.0)
                 if pull_res:
@@ -2876,8 +2908,12 @@ def _detect_deleted_open_calendar_tasks():
         cur_lines = []
 
     cur_all = []
+    cur_sync_ids = set()
     for _idx, _box, rest in cal_engine.find_checkbox_lines(cur_lines):
-        n = cal_engine._norm_todo_compare(rest)
+        clean_r, cur_uid = cal_sync.strip_sync_comment(rest)
+        if cur_uid:
+            cur_sync_ids.add(cur_uid)
+        n = cal_engine._norm_todo_compare(clean_r)
         if n:
             cur_all.append((n, _cal_tokens(n)))
 
@@ -2887,7 +2923,10 @@ def _detect_deleted_open_calendar_tasks():
             continue
         if "[workout" in rest.lower():
             continue
-        old_norm = cal_engine._norm_todo_compare(rest)
+        head_clean, head_uid = cal_sync.strip_sync_comment(rest)
+        if head_uid and head_uid in cur_sync_ids:
+            continue
+        old_norm = cal_engine._norm_todo_compare(head_clean)
         if len(old_norm) < 3:
             continue
         old_toks = _cal_tokens(old_norm)
@@ -2902,7 +2941,7 @@ def _detect_deleted_open_calendar_tasks():
                     found = True
                     break
         if not found:
-            deleted.append(rest.strip()[:120])
+            deleted.append(head_clean.strip()[:120])
     return deleted
 
 

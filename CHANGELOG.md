@@ -2,6 +2,18 @@
 
 Written for users: `/atlas-update` shows the sections between the installed and the new version.
 
+## [1.8.0] - 2026-11-25
+
+- **Multi-Provider Calendar Sync — Apple iCloud Calendar & CalDAV (`caldav_provider.py`, `cal_sync.py`, `atlas.py`, `calendar.md`):**
+  - **Pure-Stdlib CalDAV Provider (RFC 4791 / RFC 5545 / RFC 6578):** Zero external dependencies. Supports **Apple iCloud Calendar** (iPhone, iPad, Mac, Apple Watch via App-Specific Passwords), **Fastmail**, **Nextcloud**, **ownCloud**, **Mailbox.org**, **Posteo**, **GMX**, **WEB.DE**, and any generic RFC 4791 CalDAV server.
+  - **Method-Preserving Redirects & Apple iCloud Hardening:** Custom stdlib HTTP transport preserves `PROPFIND`/`REPORT`/`MKCALENDAR`/`PUT`/`DELETE` across Apple partition redirects (`caldav.icloud.com` → `pXX-caldav.icloud.com`) while preventing cross-domain or HTTPS→HTTP credential leaks; filters out `VTODO`-only iCloud Reminders collections automatically; preserves `VALARM` blocks and vendor `X-` properties on roundtrip; supports `X-ATLAS-*` identity properties, CTag fast-path (1 lightweight `PROPFIND` when unchanged), RFC 6578 `sync-collection` + `calendar-multiget` delta pulls, RFC 5545 `RRULE`/`EXDATE`/`RECURRENCE-ID` expansion & single-occurrence overrides/cancellations, FreeBusy, and `PARTSTAT` RSVP updates.
+  - **Side-by-Side Google + Apple / CalDAV Sync (`CompositeCalendarProvider`):** Run Google Calendar (`brain/_secrets/gcal.env`), Apple iCloud / CalDAV (`brain/_secrets/caldav.env`, `chmod 600`), or **both simultaneously** under one unified `brain/calendar/sync.yaml`, `atlas.py cal discover|sync|status|list|show|freebusy|create|rsvp|conflicts`, and zero-token PreInvocation/Stop hooks. Secure CLI auth via `atlas.py cal auth --provider icloud --account icloud --username ... --password-stdin` or `--init-env` + `--verify`.
+- **Calendar & To-Do Robustness Upgrades (`cal_sync.py`, `gcal_provider.py`, `atlas_hook.py`, `atlas.py`):**
+  - **Incremental `syncToken` Expansion for New `RRULE` Series + `--rrule`:** When a Google incremental `syncToken` delta delivers a new recurring master event (`recurrence: [...]`), Atlas automatically expands its instances in the rolling window via `/events/{id}/instances` so checking `[x]` only touches that occurrence (never the whole series); deleting a recurring series cascades cancellation cleanly across linked child instances; `atlas.py cal create` now accepts optional `--rrule`.
+  - **UID-Aware Stop-Hook Calendar Safety Guard:** `_detect_deleted_open_calendar_tasks()` matches `<!-- g:<uid> -->` markers first, preventing false positives when a synced task is simultaneously rescheduled and reworded.
+  - **Per-Layer `freebusy: false` Flag:** Layers in `sync.yaml` now support `freebusy: false` (auto-applied during discovery to birthday, waste-collection, and holiday read-only calendars) so informational all-day opaque events never block the entire workday in `atlas.py cal freebusy`.
+  - **Decentralized Checklist Deduplication & `rollover_today` Push:** `open_todos()` deduplicates checklist items already scheduled as dated entries in `calendar/README.md` (including future dates), and `overdue_todo_policy: rollover_today` immediately pushes rolled-over dates to external calendars after morning rollover.
+
 ## [1.7.0] - 2026-11-25
 
 - **Chat-First Architecture — Removal of `calendar.html` & Headless OAuth Helper (`cal_engine.py`, `atlas_hook.py`, `atlas.py`, `router.md`, `calendar.md`, `brief.md`, `coach.md`):**

@@ -26,6 +26,7 @@ import time
 from typing import Any
 
 from . import cal_engine
+from . import caldav_provider
 from . import gcal_provider
 
 # ---------------------------------------------------------------------------
@@ -48,6 +49,7 @@ DURATION_HINT_RX = re.compile(r"\b(\d{1,3})\s*(?:m|min)\b", re.I)
 LEADING_SYNC_ICON_RX = re.compile(r"^(?:✓\s*)?(?:[🚴🏃🏋️🏊🏆🚫☑️⏳📅🎉🎂❤️]+\s*)+")
 CANCELLED_TITLE_RX = re.compile(r"^(?:abgesagt|canceled|cancelled|storniert)\s*[:\-–—]\s*", re.I)
 AUTO_BOOKING_TITLE_RX = re.compile(r"^(?:stay at|übernachtung(?:\s+in|\s+bei)?|hotel\s+reservation|flight\s+to|flug\s+nach)\b", re.I)
+FREEBUSY_EXCLUDE_NAME_RX = re.compile(r"(?:geburtstag|birthday|abfall|müll|muell|waste|trash|bin|feiertag|holiday|ferien)", re.I)
 
 DATE_LINE_RX = re.compile(
     r"^\s*(?:[-*+]|\d+\.)?\s*(?:(\[[ xX-]\])\s+)?(?:yearly\s+)?"
@@ -380,6 +382,179 @@ def save_sync_config(brain: str, cfg: dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# 1b. Multi-Provider Registry (`GoogleCalendarProvider` + `CalDAVProvider`)
+# ---------------------------------------------------------------------------
+
+def list_all_configured_accounts(brain: str) -> list[dict[str, Any]]:
+    """Return configured calendar accounts across ALL providers (Google Calendar + CalDAV/Apple iCloud)."""
+    out: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for acct in gcal_provider.list_configured_accounts(brain):
+        entry = dict(acct)
+        entry.setdefault("provider", "gcal")
+        key = (entry["provider"], entry["id"])
+        if key not in seen:
+            seen.add(key)
+            out.append(entry)
+    for acct in caldav_provider.list_configured_accounts(brain):
+        entry = dict(acct)
+        entry.setdefault("provider", "caldav")
+        key = (entry["provider"], entry["id"])
+        if key not in seen:
+            seen.add(key)
+            out.append(entry)
+    return out
+
+
+class CompositeCalendarProvider(gcal_provider.CalendarProvider):
+    """Routes calendar operations seamlessly across Google Calendar and CalDAV/Apple iCloud accounts."""
+
+    provider_name = "multi"
+
+    def __init__(
+        self,
+        brain: str,
+        timeout: float = 15.0,
+        gcal: gcal_provider.CalendarProvider | None = None,
+        caldav: gcal_provider.CalendarProvider | None = None,
+    ):
+        self.brain = brain
+        self.timeout = float(timeout)
+        self.gcal: gcal_provider.CalendarProvider = gcal or gcal_provider.GoogleCalendarProvider(brain, timeout=timeout)
+        self.caldav: gcal_provider.CalendarProvider = caldav or caldav_provider.CalDAVProvider(brain, timeout=timeout)
+
+    def _account_provider_map(self) -> dict[str, str]:
+        mapping: dict[str, str] = {}
+        # Check sync.yaml layer hints first so explicit `provider:` always wins
+        cfg = load_sync_config(self.brain)
+        if cfg:
+            for ly in (cfg.get("layers") or []):
+                if isinstance(ly, dict) and ly.get("account") and ly.get("provider"):
+                    pr = str(ly["provider"]).strip().lower()
+                    if pr in ("caldav", "icloud", "apple", "nextcloud", "fastmail"):
+                        mapping[gcal_provider.sanitize_account_id(str(ly["account"]))] = "caldav"
+                    elif pr == "gcal":
+                        mapping[gcal_provider.sanitize_account_id(str(ly["account"]))] = "gcal"
+        for a in self.gcal.list_accounts():
+            mapping.setdefault(a["id"], "gcal")
+        for a in self.caldav.list_accounts():
+            mapping.setdefault(a["id"], "caldav")
+        return mapping
+
+    def provider_name_for_account(self, account_id: str) -> str:
+        aid = gcal_provider.sanitize_account_id(account_id)
+        return self._account_provider_map().get(aid, "gcal")
+
+    def _sub(self, account_id: str) -> gcal_provider.CalendarProvider:
+        return self.caldav if self.provider_name_for_account(account_id) == "caldav" else self.gcal
+
+    def list_accounts(self) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for a in self.gcal.list_accounts():
+            entry = dict(a)
+            entry.setdefault("provider", "gcal")
+            out.append(entry)
+        for a in self.caldav.list_accounts():
+            entry = dict(a)
+            entry.setdefault("provider", "caldav")
+            out.append(entry)
+        return out
+
+    def list_calendars(self, account_id: str) -> list[dict[str, Any]]:
+        return self._sub(account_id).list_calendars(account_id)
+
+    def create_calendar(self, account_id: str, summary: str, time_zone: str = "UTC") -> dict[str, Any]:
+        return self._sub(account_id).create_calendar(account_id, summary, time_zone=time_zone)
+
+    def pull_events(
+        self,
+        account_id: str,
+        calendar_id: str,
+        time_min: str = "",
+        time_max: str = "",
+        sync_token: str = "",
+        single_events: bool = True,
+    ) -> dict[str, Any]:
+        return self._sub(account_id).pull_events(
+            account_id, calendar_id, time_min=time_min, time_max=time_max,
+            sync_token=sync_token, single_events=single_events,
+        )
+
+    def list_event_instances(
+        self,
+        account_id: str,
+        calendar_id: str,
+        event_id: str,
+        time_min: str = "",
+        time_max: str = "",
+    ) -> list[dict[str, Any]]:
+        return self._sub(account_id).list_event_instances(
+            account_id, calendar_id, event_id, time_min=time_min, time_max=time_max
+        )
+
+    def upsert_event(
+        self,
+        account_id: str,
+        calendar_id: str,
+        event_body: dict[str, Any],
+        event_id: str | None = None,
+        send_updates: str = "none",
+        conference_data: bool = False,
+    ) -> dict[str, Any]:
+        return self._sub(account_id).upsert_event(
+            account_id, calendar_id, event_body, event_id=event_id,
+            send_updates=send_updates, conference_data=conference_data,
+        )
+
+    def delete_event(
+        self,
+        account_id: str,
+        calendar_id: str,
+        event_id: str,
+        send_updates: str = "none",
+    ) -> bool:
+        return self._sub(account_id).delete_event(account_id, calendar_id, event_id, send_updates=send_updates)
+
+    def rsvp_event(
+        self,
+        account_id: str,
+        calendar_id: str,
+        event_id: str,
+        response_status: str,
+        send_updates: str = "all",
+    ) -> dict[str, Any]:
+        return self._sub(account_id).rsvp_event(
+            account_id, calendar_id, event_id, response_status, send_updates=send_updates
+        )
+
+    def freebusy(
+        self,
+        account_id: str,
+        calendar_ids: list[str],
+        time_min: str,
+        time_max: str,
+        time_zone: str = "UTC",
+    ) -> dict[str, list[dict[str, str]]]:
+        return self._sub(account_id).freebusy(
+            account_id, calendar_ids, time_min, time_max, time_zone=time_zone
+        )
+
+
+def build_default_provider(brain: str, timeout: float = 15.0) -> CompositeCalendarProvider:
+    """Create the default multi-provider dispatcher covering both Google Calendar and CalDAV/Apple iCloud."""
+    return CompositeCalendarProvider(brain, timeout=timeout)
+
+
+def _layer_freebusy_enabled(layer: dict[str, Any]) -> bool:
+    """Determine whether a calendar layer contributes to `cal freebusy` busy windows."""
+    if "freebusy" in layer and layer["freebusy"] != "":
+        return bool(layer["freebusy"])
+    if str(layer.get("default_kind") or "").lower() == "birthday":
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
 # 2. SQLite 3-Way State & Metadata Store (`brain/_atlas/cache/cal_sync.sqlite`)
 # ---------------------------------------------------------------------------
 
@@ -498,7 +673,8 @@ def load_event_metadata_map(brain: str) -> dict[str, dict[str, Any]]:
 def get_sync_ui_summary(brain: str) -> dict[str, Any]:
     """Return lightweight sync status payload for CLI and session hooks (0 network calls)."""
     cfg = load_sync_config(brain)
-    accounts = gcal_provider.list_configured_accounts(brain)
+    accounts = list_all_configured_accounts(brain)
+    acct_prov = {a["id"]: a.get("provider", "gcal") for a in accounts}
     if not cfg:
         return {
             "configured": False,
@@ -544,6 +720,8 @@ def get_sync_ui_summary(brain: str) -> dict[str, Any]:
             "color": str(ly.get("color") or "#38bdf8"),
             "mode": str(ly.get("mode") or "bidirectional"),
             "account": str(ly.get("account") or ""),
+            "provider": str(ly.get("provider") or acct_prov.get(str(ly.get("account") or ""), "gcal")),
+            "freebusy": _layer_freebusy_enabled(ly),
         }
         for ly in (cfg.get("layers") or [])
         if isinstance(ly, dict) and ly.get("mode") != "ignore"
@@ -1232,14 +1410,17 @@ def discover_calendars(
     provider: gcal_provider.CalendarProvider | None = None,
     execute: bool = False,
 ) -> dict[str, Any]:
-    """Discover calendars across all connected accounts, deduplicate shared `calendarId`s, and build `sync.yaml`."""
-    prov = provider or gcal_provider.GoogleCalendarProvider(brain)
+    """Discover calendars across all connected accounts (Google + CalDAV/Apple), deduplicate, and build `sync.yaml`."""
+    prov = provider or build_default_provider(brain)
     accounts = prov.list_accounts()
     connected = [a for a in accounts if a.get("connected")]
     if not connected:
         return {
             "ok": False,
-            "error": "No connected Google Calendar accounts. Run `atlas.py cal auth --account personal` first.",
+            "error": (
+                "No connected calendar accounts. Run `atlas.py cal auth --account personal` (Google) "
+                "or `atlas.py cal auth --provider icloud --account icloud` (Apple iCloud / CalDAV) first."
+            ),
             "accounts": accounts,
             "layers": [],
         }
@@ -1251,30 +1432,49 @@ def discover_calendars(
 
     # 1. Fetch calendar lists from all connected accounts
     raw_by_acct: dict[str, list[dict[str, Any]]] = {}
+    acct_provider_map: dict[str, str] = {}
+    warnings: list[str] = []
+    default_prov_name = getattr(prov, "provider_name", "gcal")
+    if default_prov_name == "multi":
+        default_prov_name = "gcal"
     for acct in connected:
         aid = acct["id"]
+        acct_provider_map[aid] = str(acct.get("provider") or default_prov_name)
         raw_by_acct[aid] = prov.list_calendars(aid)
 
-    # 2. Deduplicate shared calendarIds across accounts (primary/owner wins over shared reader/writer)
+    # 2. Deduplicate shared calendarIds across accounts within the same provider (primary/owner wins)
     role_rank = {"owner": 3, "writer": 2, "reader": 1, "freeBusyReader": 0}
-    best_owner: dict[str, tuple[int, str, dict[str, Any]]] = {}
+    best_owner: dict[tuple[str, str], tuple[int, str, str, dict[str, Any]]] = {}
     duplicates_skipped: list[dict[str, str]] = []
 
     for acct in connected:
         aid = acct["id"]
+        aprov = acct_provider_map[aid]
         for cal in raw_by_acct.get(aid, []):
             cid = cal["id"]
+            dedup_key = (aprov, cid)
             score = (10 if cal.get("primary") else 0) + role_rank.get(cal.get("access_role", ""), 0)
-            prev = best_owner.get(cid)
+            prev = best_owner.get(dedup_key)
             if prev is None or score > prev[0]:
                 if prev is not None:
                     duplicates_skipped.append({"calendar_id": cid, "skipped_account": prev[1], "owner_account": aid})
-                best_owner[cid] = (score, aid, cal)
+                best_owner[dedup_key] = (score, aid, aprov, cal)
             else:
                 duplicates_skipped.append({"calendar_id": cid, "skipped_account": aid, "owner_account": prev[1]})
 
-    default_aid = connected[0]["id"]
-    # Find or plan creation of `Atlas Training` and `Atlas Tasks & Fristen` on default account
+    # Choose default account: keep existing README.md owner if still connected, else first connected account
+    existing_readme = next(
+        (ly for ly in (existing_cfg.get("layers") or []) if isinstance(ly, dict) and ly.get("file") == "README.md"),
+        None,
+    )
+    connected_ids = {a["id"] for a in connected}
+    default_aid = (
+        str(existing_readme["account"])
+        if existing_readme and str(existing_readme.get("account") or "") in connected_ids
+        else connected[0]["id"]
+    )
+
+    # Find or plan creation of `Atlas Coach` and `Atlas Tasks & Fristen` on default account
     wko_cal_id = ""
     tasks_cal_id = ""
     subcals_to_create: list[str] = []
@@ -1287,14 +1487,20 @@ def discover_calendars(
 
     if not wko_cal_id:
         if execute:
-            created = prov.create_calendar(default_aid, wko_cal_name, time_zone=tz)
-            wko_cal_id = created["id"]
+            try:
+                created = prov.create_calendar(default_aid, wko_cal_name, time_zone=tz)
+                wko_cal_id = created["id"]
+            except gcal_provider.CalendarProviderError as exc:
+                warnings.append(f"Could not create subcalendar '{wko_cal_name}' on {default_aid}: {exc}")
         else:
             subcals_to_create.append(wko_cal_name)
     if not tasks_cal_id:
         if execute:
-            created = prov.create_calendar(default_aid, tasks_cal_name, time_zone=tz)
-            tasks_cal_id = created["id"]
+            try:
+                created = prov.create_calendar(default_aid, tasks_cal_name, time_zone=tz)
+                tasks_cal_id = created["id"]
+            except gcal_provider.CalendarProviderError as exc:
+                warnings.append(f"Could not create subcalendar '{tasks_cal_name}' on {default_aid}: {exc}")
         else:
             subcals_to_create.append(tasks_cal_name)
 
@@ -1306,10 +1512,14 @@ def discover_calendars(
     }
     layers: list[dict[str, Any]] = []
     skipped_freebusy_only: list[dict[str, str]] = []
-    used_files: set[str] = set()
+    used_files: set[str] = {
+        str(ly.get("file") or "")
+        for ly in existing_by_cid.values()
+        if ly.get("file")
+    }
     color_idx = 0
 
-    for cid, (_score, aid, cal) in best_owner.items():
+    for (_aprov_k, cid), (_score, aid, aprov, cal) in best_owner.items():
         # Skip system Google calendars (Contacts/Birthdays & Public Holidays) by default
         if "#contacts@group.v.calendar.google.com" in cid or "#holiday@group.v.calendar.google.com" in cid:
             continue
@@ -1322,13 +1532,14 @@ def discover_calendars(
                 "account": aid,
                 "calendar_id": cid,
                 "summary": str(cal.get("summary") or cid),
-                "hint": "Connect the owning Google account via `atlas.py cal auth` or upgrade calendar sharing to reader/writer.",
+                "hint": "Connect the owning account via `atlas.py cal auth` or upgrade calendar sharing to reader/writer.",
             })
             continue
 
         prev_ly = existing_by_cid.get(cid)
         if prev_ly:
             ly = dict(prev_ly)
+            ly.setdefault("provider", aprov)
             if aid == default_aid and cal.get("primary"):
                 sub = dict(ly.get("subcalendars") or {})
                 if wko_cal_id:
@@ -1340,25 +1551,29 @@ def discover_calendars(
             used_files.add(str(ly.get("file") or ""))
             continue
 
-        is_default_primary = (aid == default_aid and cal.get("primary"))
-        is_birthday_cal = bool(re.search(r"(?:geburtstag|birthday)", str(cal.get("summary") or ""), re.I))
+        is_default_primary = (aid == default_aid and cal.get("primary") and "README.md" not in used_files)
+        cal_summary = str(cal.get("summary") or "")
+        is_birthday_cal = bool(re.search(r"(?:geburtstag|birthday)", cal_summary, re.I))
         if is_default_primary:
             fn = "README.md"
             lid = aid
-            label = "Personal" if aid in ("personal", "privat", "default") else aid.capitalize()
+            label = "Personal" if aid in ("personal", "privat", "default") else (cal_summary or aid.capitalize())
             mode = "bidirectional"
         elif cal.get("primary"):
             lid = aid
             fn = f"{aid}.md"
-            label = cal.get("summary") or aid.capitalize()
-            mode = "bidirectional"
+            if fn in used_files:
+                lid = f"{aprov}-{aid}"
+                fn = f"{lid}.md"
+            label = cal_summary or aid.capitalize()
+            mode = "bidirectional" if cal.get("access_role") != "reader" else "read-only"
         else:
-            lid = _slugify_layer_name(cal.get("summary") or cid.split("@")[0])
+            lid = _slugify_layer_name(cal_summary or cid.split("@")[0])
             fn = f"{lid}.md"
             if fn in used_files:
                 fn = f"{aid}-{lid}.md"
                 lid = f"{aid}-{lid}"
-            label = cal.get("summary") or lid
+            label = cal_summary or lid
             # Secondary calendars default to read-only (safe against external mirror loops); owner birthday calendars can be bidirectional
             mode = "bidirectional" if (is_birthday_cal and cal.get("access_role") == "owner") else "read-only"
 
@@ -1370,12 +1585,16 @@ def discover_calendars(
             "file": fn,
             "label": label,
             "color": color,
+            "provider": aprov,
             "account": aid,
             "calendar_id": cid,
             "mode": mode,
         }
         if is_birthday_cal:
             ly_entry["default_kind"] = "birthday"
+            ly_entry["freebusy"] = False
+        elif mode == "read-only" and FREEBUSY_EXCLUDE_NAME_RX.search(label):
+            ly_entry["freebusy"] = False
         if is_default_primary:
             ly_entry["subcalendars"] = {
                 "workout": wko_cal_id,
@@ -1388,6 +1607,11 @@ def discover_calendars(
     existing_cfg["layers"] = layers
     existing_cfg["timezone"] = tz
     existing_cfg["enabled"] = True
+    prov_set = {str(ly.get("provider") or "gcal") for ly in layers}
+    if len(prov_set) == 1:
+        existing_cfg["provider"] = next(iter(prov_set))
+    elif len(prov_set) > 1:
+        existing_cfg["provider"] = "multi"
 
     created_files: list[str] = []
     saved_cfg_path = ""
@@ -1414,6 +1638,7 @@ def discover_calendars(
         "subcals_to_create": subcals_to_create,
         "duplicates_skipped": duplicates_skipped,
         "skipped_freebusy_only": skipped_freebusy_only,
+        "warnings": warnings,
         "created_files": created_files,
     }
 
@@ -1644,7 +1869,7 @@ def run_sync(
         return {"ok": False, "error": "Calendar sync is not configured or disabled (`brain/calendar/sync.yaml`)."}
 
     today = today or dt.date.today()
-    prov = provider or gcal_provider.GoogleCalendarProvider(brain, timeout=timeout)
+    prov = provider or build_default_provider(brain, timeout=timeout)
     tz = str(cfg.get("timezone") or gcal_provider.local_timezone_name())
     past_days = int(cfg.get("window_past_days") or 14)
     rec_days = int(cfg.get("window_recurring_days") or 90)
@@ -1653,8 +1878,10 @@ def run_sync(
 
     t_min_dt = dt.datetime.combine(today - dt.timedelta(days=past_days), dt.time.min).astimezone()
     t_max_dt = dt.datetime.combine(today + dt.timedelta(days=single_days), dt.time.max).astimezone()
+    rec_t_max_dt = dt.datetime.combine(today + dt.timedelta(days=rec_days), dt.time.max).astimezone()
     time_min = gcal_provider.to_rfc3339(t_min_dt)
     time_max = gcal_provider.to_rfc3339(t_max_dt)
+    rec_time_max = gcal_provider.to_rfc3339(rec_t_max_dt)
 
     layers = [
         ly for ly in (cfg.get("layers") or [])
@@ -1709,13 +1936,57 @@ def run_sync(
                         single_events=True,
                     )
                 except gcal_provider.CalendarProviderError as exc:
-                    if exc.code == "refresh_expired":
+                    if exc.code in ("refresh_expired", "unauthorized"):
                         if account_id not in report["auth_warnings"]:
                             report["auth_warnings"].append(account_id)
                     report["warnings"].append(f"{account_id}/{calendar_id}: {exc}")
                     return None
-                parsed_evs: list[dict[str, Any]] = []
+                is_full = bool(res.get("full_sync"))
+                expanded_raw: list[dict[str, Any]] = []
                 for raw_ev in res.get("events") or []:
+                    st_low = str(raw_ev.get("status") or "").lower()
+                    # Upstream fix: when incremental syncToken delta returns a recurring master event
+                    # (`recurrence: [...]`, no `recurringEventId`), expand instances in the rolling window
+                    # so `[x]`/`[-]` only ever patches individual occurrences instead of the series master!
+                    if (
+                        not is_full
+                        and raw_ev.get("recurrence")
+                        and not raw_ev.get("recurringEventId")
+                        and st_low != "cancelled"
+                    ):
+                        inst_max = time_max if default_kind == "birthday" else rec_time_max
+                        try:
+                            insts = prov.list_event_instances(
+                                account_id, calendar_id, str(raw_ev["id"]),
+                                time_min=time_min, time_max=inst_max,
+                            )
+                        except gcal_provider.CalendarProviderError:
+                            insts = []
+                        if insts:
+                            expanded_raw.extend(insts)
+                            continue
+                    # When a recurring master series is deleted (Google or CalDAV `.ics` 404),
+                    # propagate cancellation to all active linked child instances in SQLite.
+                    if st_low == "cancelled" and raw_ev.get("id"):
+                        child_rows = conn.execute(
+                            "SELECT gcal_event_id, date_start, date_end, last_gcal_snapshot FROM event_links "
+                            "WHERE account_id=? AND calendar_id=? AND recurring_event_id=? AND status='active'",
+                            (account_id, calendar_id, str(raw_ev["id"])),
+                        ).fetchall()
+                        for cr in child_rows:
+                            snap_c = json.loads(cr["last_gcal_snapshot"] or "{}")
+                            expanded_raw.append({
+                                "id": str(cr["gcal_event_id"]),
+                                "status": "cancelled",
+                                "summary": snap_c.get("title", ""),
+                                "recurringEventId": str(raw_ev["id"]),
+                                "start": {"date": str(cr["date_start"])},
+                                "end": {"date": str(cr["date_end"] or cr["date_start"])},
+                            })
+                    expanded_raw.append(raw_ev)
+
+                parsed_evs: list[dict[str, Any]] = []
+                for raw_ev in expanded_raw:
                     pe = parse_gcal_event(raw_ev, default_kind=default_kind)
                     # Enforce rolling window cap: recurring instances capped at +window_recurring_days (full +365d for birthday layers)
                     if pe["status_remote"] != "cancelled" and pe["start"]:
@@ -1723,7 +1994,7 @@ def run_sync(
                         if not _in_window(pe["start"], pe["end"], today, past_days, max_d):
                             continue
                     parsed_evs.append(pe)
-                return parsed_evs, bool(res.get("full_sync")), str(res.get("next_sync_token") or "")
+                return parsed_evs, is_full, str(res.get("next_sync_token") or "")
 
             def _save_cursor(account_id: str, calendar_id: str, next_tok: str, full_sync: bool) -> None:
                 now = time.time()
@@ -2673,11 +2944,12 @@ def resolve_conflict(
     action: str,
     provider: gcal_provider.CalendarProvider | None = None,
 ) -> dict[str, Any]:
-    """Resolve an open conflict (`link`, `keep-both`, `use-atlas`, `use-google`, `dismiss`)."""
-    valid = {"link", "keep-both", "use-atlas", "use-google", "dismiss"}
+    """Resolve an open conflict (`link`, `keep-both`, `use-atlas`, `use-remote`/`use-google`, `dismiss`)."""
+    valid = {"link", "keep-both", "use-atlas", "use-google", "use-remote", "dismiss"}
     act = str(action or "").strip().lower()
     if act not in valid:
         return {"ok": False, "error": f"Invalid action '{action}'; choose from {sorted(valid)}"}
+    eff_act = "use-google" if act == "use-remote" else act
 
     with cal_engine.brain_write_lock(brain):
         conn = _open_db(brain)
@@ -2726,14 +2998,14 @@ def resolve_conflict(
                 conn.commit()
                 return {"ok": True, "id": conflict_id, "action": "link", "atlas_uid": uid}
 
-            if act in ("use-atlas", "use-google") and c["atlas_uid"]:
-                prov = provider or gcal_provider.GoogleCalendarProvider(brain)
+            if eff_act in ("use-atlas", "use-google") and c["atlas_uid"]:
+                prov = provider or build_default_provider(brain)
                 cfg = load_sync_config(brain) or _deep_merge_defaults({})
                 tz = str(cfg.get("timezone") or gcal_provider.local_timezone_name())
                 uid = c["atlas_uid"]
                 _lines, items = parse_calendar_md_items(brain, rel)
                 l_item = next((i for i in items if i["sync_id"] == uid), None)
-                if act == "use-atlas" and l_item:
+                if eff_act == "use-atlas" and l_item:
                     ev_body = format_atlas_for_gcal(l_item, uid, timezone=tz)
                     updated = prov.upsert_event(c["account_id"], c["calendar_id"], ev_body, event_id=c["gcal_event_id"])
                     pe = parse_gcal_event(updated)
@@ -2743,7 +3015,7 @@ def resolve_conflict(
                         "UPDATE event_links SET last_atlas_hash=?, last_gcal_hash=?, last_atlas_snapshot=?, last_gcal_snapshot=?, updated_at=? WHERE atlas_uid=?",
                         (_hash_snapshot(a_snap), _hash_snapshot(g_snap), json.dumps(a_snap), json.dumps(g_snap), time.time(), uid),
                     )
-                elif act == "use-google" and l_item:
+                elif eff_act == "use-google" and l_item:
                     new_ln = render_atlas_line(
                         g_obj.get("start") or l_item["start"],
                         g_obj.get("end") or l_item["end"],
@@ -2841,11 +3113,18 @@ def compute_freebusy(
         (start_d + dt.timedelta(days=i)).isoformat(): [] for i in range(days)
     }
 
-    # 1. Local Atlas calendar items (all layers including read-only mirrors + workouts + blockers)
+    # 1. Local Atlas calendar items (all FreeBusy-enabled layers including read-only mirrors + workouts + blockers)
+    excluded_fb_files: set[str] = set()
+    if cfg:
+        for ly in (cfg.get("layers") or []):
+            if isinstance(ly, dict) and ly.get("file"):
+                if ly.get("mode") == "ignore" or not _layer_freebusy_enabled(ly):
+                    excluded_fb_files.add(str(ly["file"]))
+
     cal_dir = os.path.join(brain, "calendar")
     if os.path.isdir(cal_dir):
         for fn in sorted(os.listdir(cal_dir)):
-            if not fn.lower().endswith(".md"):
+            if not fn.lower().endswith(".md") or fn in excluded_fb_files:
                 continue
             rel = f"calendar/{fn}"
             _lines, items = parse_calendar_md_items(brain, rel)
@@ -2871,13 +3150,13 @@ def compute_freebusy(
                         busy_by_day[cur.isoformat()].append((work_start_hour * 60, work_end_hour * 60, f"[blocked] {it['what']}"))
                         cur += dt.timedelta(days=1)
 
-    # 2. Optional live Google FreeBusy query (catches unpulled changes in real time)
+    # 2. Optional live remote FreeBusy query across Google & CalDAV/Apple (catches unpulled changes in real time)
     remote_checked: list[str] = []
     if use_remote and cfg and cfg.get("enabled", True):
-        prov = provider or gcal_provider.GoogleCalendarProvider(brain, timeout=8.0)
+        prov = provider or build_default_provider(brain, timeout=8.0)
         by_acct: dict[str, list[str]] = {}
         for ly in (cfg.get("layers") or []):
-            if not isinstance(ly, dict) or ly.get("mode") == "ignore":
+            if not isinstance(ly, dict) or ly.get("mode") == "ignore" or not _layer_freebusy_enabled(ly):
                 continue
             aid = str(ly.get("account") or "")
             cid = str(ly.get("calendar_id") or "")
@@ -2906,7 +3185,7 @@ def compute_freebusy(
                             sm = s_loc.hour * 60 + s_loc.minute
                             em = (e_loc.hour * 60 + e_loc.minute) if e_loc.date() == s_loc.date() else 24 * 60
                             if em > sm:
-                                busy_by_day[d_iso].append((sm, em, f"google:{aid}"))
+                                busy_by_day[d_iso].append((sm, em, f"remote:{aid}"))
             except Exception:
                 pass
 
@@ -2967,6 +3246,7 @@ def create_event_guarded(
     description: str = "",
     attendees: list[str] | None = None,
     add_meet: bool = False,
+    recurrence: list[str] | None = None,
     kind: str = "event",
     execute: bool = False,
     provider: gcal_provider.CalendarProvider | None = None,
@@ -2977,9 +3257,14 @@ def create_event_guarded(
         return {"ok": False, "error": "Calendar sync not configured (`brain/calendar/sync.yaml`)."}
 
     clean_attendees = [a.strip() for a in (attendees or []) if a and "@" in a]
+    norm_rrules: list[str] = []
+    for rr in (recurrence or []):
+        rs = str(rr or "").strip()
+        if rs:
+            norm_rrules.append(rs if rs.upper().startswith("RRULE:") else f"RRULE:{rs}")
     needs_gate = bool(clean_attendees or add_meet)
 
-    # Resolve layer & target Google account/calendar
+    # Resolve layer & target account/calendar (Google or CalDAV/Apple)
     layers = [ly for ly in (cfg.get("layers") or []) if isinstance(ly, dict) and ly.get("mode") == "bidirectional"]
     chosen_layer = None
     if layer_id:
@@ -2997,11 +3282,22 @@ def create_event_guarded(
     target_cid = calendar_id or str(chosen_layer["calendar_id"])
     rel = f"calendar/{chosen_layer['file']}"
     tz = str(cfg.get("timezone") or gcal_provider.local_timezone_name())
-    acct_info = next((a for a in gcal_provider.list_configured_accounts(brain) if a["id"] == target_aid), {})
+    acct_info = next((a for a in list_all_configured_accounts(brain) if a["id"] == target_aid), {})
     sender_email = acct_info.get("email") or target_aid
+    target_provider = str(chosen_layer.get("provider") or acct_info.get("provider") or "gcal").lower()
+
+    if add_meet and target_provider == "caldav":
+        return {
+            "ok": False,
+            "error": (
+                f"Account '{target_aid}' is a CalDAV/Apple calendar and cannot auto-generate Google Meet links. "
+                "Target a Google Calendar account (`--account ...`) or omit `--meet` and put a video URL in `--location`."
+            ),
+        }
 
     preview = {
         "account": target_aid,
+        "provider": target_provider,
         "sender": sender_email,
         "calendar_id": target_cid,
         "layer_file": rel,
@@ -3013,6 +3309,7 @@ def create_event_guarded(
         "description": description,
         "attendees": clean_attendees,
         "google_meet": bool(add_meet),
+        "recurrence": norm_rrules,
         "send_updates": "all" if clean_attendees else "none",
     }
 
@@ -3041,8 +3338,10 @@ def create_event_guarded(
         ev_body["location"] = location.strip()
     if clean_attendees:
         ev_body["attendees"] = [{"email": em} for em in clean_attendees]
+    if norm_rrules:
+        ev_body["recurrence"] = norm_rrules
 
-    prov = provider or gcal_provider.GoogleCalendarProvider(brain)
+    prov = provider or build_default_provider(brain)
     created = prov.upsert_event(
         target_aid,
         target_cid,
@@ -3110,7 +3409,7 @@ def rsvp_event_guarded(
     """RSVP (`accepted`, `declined`, `tentative`) to an event with strict Safety-Gate preview (`--yes`)."""
     hits = [h for h in find_event_details(brain, query) if h.get("gcal_event_id")]
     if not hits:
-        return {"ok": False, "error": f"No synced Google Calendar event matching '{query}'."}
+        return {"ok": False, "error": f"No synced calendar event matching '{query}'."}
     ev = hits[0]
     preview = {
         "atlas_uid": ev["atlas_uid"],
@@ -3132,7 +3431,7 @@ def rsvp_event_guarded(
             "message": "Safety-Gate: RSVP notifies the event organizer and requires `--yes` after confirmation.",
         }
 
-    prov = provider or gcal_provider.GoogleCalendarProvider(brain)
+    prov = provider or build_default_provider(brain)
     updated = prov.rsvp_event(ev["account_id"], ev["calendar_id"], ev["gcal_event_id"], response_status)
     pe = parse_gcal_event(updated)
     with cal_engine.brain_write_lock(brain):
@@ -3169,7 +3468,7 @@ def maybe_auto_pull(
     cfg = load_sync_config(brain)
     if not cfg or not cfg.get("enabled", True):
         return None
-    accounts = gcal_provider.list_configured_accounts(brain)
+    accounts = provider.list_accounts() if provider is not None else list_all_configured_accounts(brain)
     if not any(a.get("connected") for a in accounts):
         warns = [a["id"] for a in accounts if a.get("auth_error")]
         return {"ran": False, "auth_warnings": warns, "open_conflicts": 0} if warns else None

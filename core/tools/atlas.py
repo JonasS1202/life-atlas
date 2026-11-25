@@ -63,7 +63,7 @@ DEFAULT_UPSTREAM = "https://github.com/JonasS1202/life-atlas.git"
 TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if TOOLS_DIR not in sys.path:
     sys.path.insert(0, TOOLS_DIR)
-from atlas_lib import cal_engine, cal_sync, coach_connectors, coach_engine, fit_writer, gcal_provider, graph_engine, health_engine
+from atlas_lib import cal_engine, cal_sync, caldav_provider, coach_connectors, coach_engine, fit_writer, gcal_provider, graph_engine, health_engine
 
 INSTALLED_BRAIN = os.path.normpath(os.path.join(TOOLS_DIR, "..", ".."))
 HOOK_FILE = os.path.normpath(os.path.join(TOOLS_DIR, "..", "hooks", "atlas_hook.py"))
@@ -1672,13 +1672,79 @@ def _resolve_todo_target(hk, idx, query, file_rel=None, line_no=None):
 
 
 def cmd_cal(args):
-    """Multi-account Google Calendar 3-way sync, FreeBusy, Meet/invites & RSVP CLI."""
+    """Multi-provider (Google Calendar + Apple iCloud / CalDAV) 3-way sync, FreeBusy, invites & RSVP CLI."""
     _root, brain = paths(args)
     hk = hook_module(brain)
     action = (getattr(args, "action", None) or "status").lower()
     as_json = bool(getattr(args, "json", False))
 
     if action == "auth":
+        raw_prov = (getattr(args, "provider", None) or "").strip().lower()
+        has_dav_flags = any(
+            getattr(args, k, None)
+            for k in ("url", "username", "password", "password_stdin", "verify", "init_env")
+        )
+        is_caldav = (
+            raw_prov in ("icloud", "apple", "caldav", "nextcloud", "owncloud", "fastmail", "mailbox", "posteo", "gmx", "webde")
+            or (not raw_prov and has_dav_flags)
+        )
+        if is_caldav:
+            preset = raw_prov or ("caldav" if getattr(args, "url", None) else "icloud")
+            if preset == "apple":
+                preset = "icloud"
+            default_acct = preset if preset != "caldav" else "caldav"
+            acct = gcal_provider.sanitize_account_id(getattr(args, "account", None) or default_acct)
+            url_arg = (getattr(args, "url", None) or "").strip()
+            user_arg = (getattr(args, "username", None) or "").strip()
+            pw_arg = (getattr(args, "password", None) or "").strip()
+            if getattr(args, "password_stdin", False):
+                pw_arg = sys.stdin.read().strip()
+            elif not pw_arg and user_arg:
+                pw_arg = (os.environ.get("ATLAS_CALDAV_PASSWORD") or "").strip()
+
+            p_info = caldav_provider.CALDAV_PRESETS.get(preset, caldav_provider.CALDAV_PRESETS["caldav"])
+            if getattr(args, "init_env", False) or (not getattr(args, "verify", False) and not (user_arg and pw_arg)):
+                tpl_path = caldav_provider.init_caldav_env_template(
+                    brain, account_id=acct, preset=preset, url=url_arg, username=user_arg
+                )
+                say(f"{p_info['label']} (CalDAV) setup for account '{acct}':")
+                say(f"  {p_info['help']}")
+                say(f"  Secrets file (chmod 600, git-ignored): {tpl_path}")
+                say("  Option A (pass credentials directly, stdin keeps password out of shell history):")
+                url_bit = f" --url {url_arg or 'https://cloud.example.com'}" if preset in ("nextcloud", "owncloud", "caldav") else ""
+                say(f"    printf '%s' '<app-password>' | atlas.py cal auth --provider {preset} --account {acct}{url_bit} --username you@example.com --password-stdin")
+                say("  Option B (edit `brain/_secrets/caldav.env` directly and verify):")
+                say(f"    atlas.py cal auth --provider {preset} --account {acct} --verify")
+                return
+
+            if user_arg or pw_arg or url_arg:
+                _pr, resolved_u = caldav_provider.resolve_preset_url(preset, url=url_arg, username=user_arg)
+                if not resolved_u:
+                    sys.exit(f"cal auth ({preset}): pass `--url https://...` for this CalDAV server.")
+                if not user_arg or not pw_arg:
+                    sys.exit(f"cal auth ({preset}): pass both `--username` and `--password` (or `--password-stdin`).")
+                saved_p = caldav_provider.save_caldav_account(
+                    brain, acct, preset=preset, url=url_arg, username=user_arg, password=pw_arg
+                )
+                if getattr(args, "skip_verify", False):
+                    say(f"Saved {p_info['label']} credentials for '{acct}' into {saved_p} (verification skipped).")
+                    return
+
+            dav_prov = caldav_provider.CalDAVProvider(brain)
+            try:
+                v_res = dav_prov.verify_account(acct)
+            except gcal_provider.CalendarProviderError as exc:
+                sys.exit(f"cal auth ({preset}) verification failed: {exc}")
+            if as_json:
+                say(json.dumps(v_res, ensure_ascii=False, indent=2))
+                return
+            say(f"{p_info['label']} account '{acct}' connected ({v_res['email']}): {v_res['calendars_found']} calendar(s) found.")
+            for c in v_res.get("calendars", [])[:12]:
+                p_tag = " [primary]" if c.get("primary") else ""
+                say(f"  - {c['summary']} ({c['access_role']}){p_tag}")
+            say("Next: run `atlas.py cal discover` (dry-run) then `atlas.py cal discover --execute`.")
+            return
+
         acct = gcal_provider.sanitize_account_id(getattr(args, "account", None) or "personal")
         if getattr(args, "client_json", None):
             ok, msg = gcal_provider.import_client_json(brain, args.client_json)
@@ -1746,7 +1812,9 @@ def cmd_cal(args):
             sys.exit(f"cal discover: {res.get('error')}")
         say(f"cal discover ({'applied' if res['applied'] else 'dry-run'}): {len(res['layers'])} layer(s) across {', '.join(res['accounts'])}")
         for ly in res["layers"]:
-            say(f"  [{ly['mode']:13s}] calendar/{ly['file']:16s}  <- {ly['account']}:{ly['label']} ({ly['calendar_id']})")
+            prov_tag = str(ly.get("provider") or "gcal")
+            fb_tag = " [freebusy=off]" if ly.get("freebusy") is False else ""
+            say(f"  [{ly['mode']:13s}] [{prov_tag:6s}] calendar/{ly['file']:16s}  <- {ly['account']}:{ly['label']} ({ly['calendar_id']}){fb_tag}")
         subs = res.get("subcalendars_created_or_planned") or {}
         say(f"  Subcalendars: workout={subs.get('workout')} | tasks={subs.get('tasks')}")
         if res.get("duplicates_skipped"):
@@ -1754,6 +1822,8 @@ def cmd_cal(args):
         if res.get("skipped_freebusy_only"):
             for fb_cal in res["skipped_freebusy_only"]:
                 say(f"  [!] Skipped freeBusy-only calendar '{fb_cal['summary']}' ({fb_cal['calendar_id']}) in '{fb_cal['account']}' — {fb_cal['hint']}")
+        for w in res.get("warnings", []):
+            say(f"  [!] {w}")
         if not res["applied"]:
             say("Re-run with `--execute` to write `brain/calendar/sync.yaml` and create layer files + subcalendars.")
         else:
@@ -1805,11 +1875,13 @@ def cmd_cal(args):
         if st["accounts"]:
             for a in st["accounts"]:
                 s_tag = "connected" if a["connected"] else (a["auth_error"] or "disconnected")
-                say(f"  Account {a['id']}: {a['email'] or '(no email)'} [{s_tag}]")
+                p_lbl = f"caldav/{a['preset']}" if a.get("provider") == "caldav" and a.get("preset") else (a.get("provider") or "gcal")
+                say(f"  Account {a['id']} [{p_lbl}]: {a['email'] or '(no email)'} [{s_tag}]")
         else:
-            say("  Accounts: none (run `atlas.py cal auth --account personal`)")
+            say("  Accounts: none (run `atlas.py cal auth --account personal` for Google or `atlas.py cal auth --provider icloud` for Apple iCloud)")
         for ly in st["layers"]:
-            say(f"  Layer {ly['id']} ({ly['mode']}): {ly['file']} [{ly['label']}]")
+            fb_bit = " [freebusy=off]" if ly.get("freebusy") is False else ""
+            say(f"  Layer {ly['id']} ({ly['mode']}, {ly.get('provider', 'gcal')}): {ly['file']} [{ly['label']}]{fb_bit}")
         if st["last_pull_iso"]:
             say(f"  Last pull: {st['last_pull_iso']} | Open conflicts: {st['open_conflicts']}")
         if st["auth_warnings"]:
@@ -1866,11 +1938,11 @@ def cmd_cal(args):
             say(f"=== {h['start']}{'..' + h['end'] if h['end'] != h['start'] else ''} {h['time']} [{h['kind']}] {h['what']} ===")
             say(f"  Source: {h['rel']}:{h['line']} | UID: {h['atlas_uid'] or '(local only)'} | Status: {h['status']}")
             if h["account_id"]:
-                say(f"  Google: account={h['account_id']} calendar={h['calendar_id']}")
+                say(f"  Remote: account={h['account_id']} calendar={h['calendar_id']}")
             if h["location"]:
                 say(f"  Location: {h['location']}")
             if h["meet_link"]:
-                say(f"  Google Meet: {h['meet_link']}")
+                say(f"  Video/Meet: {h['meet_link']}")
             if h["organizer"]:
                 say(f"  Organizer: {h['organizer']} | My RSVP: {h['self_rsvp'] or '—'}")
             if h["attendees"]:
@@ -1908,6 +1980,7 @@ def cmd_cal(args):
         target_iso = cal_engine.parse_target_date(date_s)
         raw_atts = getattr(args, "attendees", None) or ""
         att_list = [x.strip() for x in raw_atts.split(",") if x.strip()]
+        rrule_arg = (getattr(args, "rrule", None) or "").strip()
         res = cal_sync.create_event_guarded(
             brain,
             title=title,
@@ -1920,6 +1993,7 @@ def cmd_cal(args):
             description=getattr(args, "description", None) or "",
             attendees=att_list,
             add_meet=bool(getattr(args, "meet", False)),
+            recurrence=[rrule_arg] if rrule_arg else None,
             kind=getattr(args, "kind", None) or "event",
             execute=bool(getattr(args, "yes", False) or getattr(args, "execute", False)),
         )
@@ -1931,8 +2005,10 @@ def cmd_cal(args):
         if res.get("dry_run"):
             p = res["preview"]
             say("SAFETY-GATE PREVIEW (not sent yet — pass `--yes` after user approval):")
-            say(f"  Sender/Account: {p['sender']} ({p['account']}) -> {p['layer_file']}")
+            say(f"  Sender/Account: {p['sender']} ({p['account']}, {p.get('provider', 'gcal')}) -> {p['layer_file']}")
             say(f"  Event: {p['date']} {p['time']} {p['title']}")
+            if p.get("recurrence"):
+                say(f"  Recurrence: {', '.join(p['recurrence'])}")
             if p["attendees"]:
                 say(f"  Attendees (email invites): {', '.join(p['attendees'])}")
             if p["google_meet"]:
@@ -1975,7 +2051,7 @@ def cmd_cal(args):
         if getattr(args, "resolve", None):
             act = getattr(args, "resolve_action", None) or ""
             if not act:
-                sys.exit("cal conflicts --resolve <id>: pass `--action link|keep-both|use-atlas|use-google|dismiss`.")
+                sys.exit("cal conflicts --resolve <id>: pass `--action link|keep-both|use-atlas|use-remote|use-google|dismiss`.")
             res = cal_sync.resolve_conflict(brain, args.resolve, act)
             if as_json:
                 say(json.dumps(res, ensure_ascii=False, indent=2))
@@ -1994,7 +2070,7 @@ def cmd_cal(args):
             return
         for c in confs:
             say(f"  [{c['id']}] ({c['kind']}, score={c['score']:.2f}) {c['date_iso']} {c['layer_file']}: {c['summary']}")
-        say("Resolve with: `atlas.py cal conflicts --resolve <id> --action link|keep-both|use-atlas|use-google|dismiss`")
+        say("Resolve with: `atlas.py cal conflicts --resolve <id> --action link|keep-both|use-atlas|use-remote|dismiss`")
         return
 
     sys.exit(f"cal: unknown action '{action}'.")
@@ -6396,12 +6472,12 @@ def main():
     p.add_argument("--for", dest="for_role", choices=("coach",), help="filtered view for a specific role (e.g. coach)")
     p.add_argument("--init", action="store_true", help="harvest existing dates, birthdays and open to-dos into calendar/README.md")
     p.add_argument("--ics", help="export calendar timeline to an .ics file")
-    p.add_argument("--sync", action="store_true", help="run bidirectional Google Calendar sync before listing")
+    p.add_argument("--sync", action="store_true", help="run bidirectional external calendar sync (Google/CalDAV) before listing")
     p.add_argument("--sync-ics", action="store_true", help="merge upcoming events from settings.md calendar_ics or --ics-source")
     p.add_argument("--ics-source", help="URL or file path of an .ics feed")
     p.add_argument("--execute", action="store_true")
 
-    p = sub.add_parser("cal", help="multi-account Google Calendar sync, FreeBusy, Meet/invites & RSVP")
+    p = sub.add_parser("cal", help="multi-provider (Google Calendar + Apple iCloud / CalDAV) sync, FreeBusy, invites & RSVP")
     p.add_argument(
         "action",
         nargs="?",
@@ -6410,7 +6486,19 @@ def main():
         help="calendar sync action (default: status)",
     )
     p.add_argument("target", nargs="*", help="query, event uid, or title text")
-    p.add_argument("--account", "-a", help="account id (e.g. personal, work)")
+    p.add_argument("--account", "-a", help="account id (e.g. personal, work, icloud, nextcloud)")
+    p.add_argument(
+        "--provider",
+        choices=("gcal", "google", "icloud", "apple", "caldav", "nextcloud", "owncloud", "fastmail", "mailbox", "posteo", "gmx", "webde"),
+        help="calendar provider/preset for `auth` (default: gcal; use `icloud`/`caldav`/`nextcloud`/`fastmail` for CalDAV)",
+    )
+    p.add_argument("--url", help="CalDAV server URL (for nextcloud, owncloud, or generic caldav)")
+    p.add_argument("--username", "-u", help="Apple ID or CalDAV username for `auth`")
+    p.add_argument("--password", help="App-Specific Password or CalDAV password (prefer `--password-stdin` or `brain/_secrets/caldav.env`)")
+    p.add_argument("--password-stdin", action="store_true", help="read CalDAV password securely from stdin")
+    p.add_argument("--verify", action="store_true", help="verify stored CalDAV credentials in `brain/_secrets/caldav.env`")
+    p.add_argument("--skip-verify", action="store_true", help="save CalDAV credentials without immediate network probe")
+    p.add_argument("--init-env", action="store_true", help="create commented `brain/_secrets/caldav.env` template (chmod 600)")
     p.add_argument("--client-json", help="path to Google Cloud OAuth Desktop-App client_secret_*.json")
     p.add_argument("--client-id", help="Google OAuth client ID")
     p.add_argument("--client-secret", help="Google OAuth client secret")
@@ -6424,11 +6512,11 @@ def main():
     p.add_argument("--execute", action="store_true", help="apply changes")
     p.add_argument("--yes", action="store_true", help="explicitly confirm safety-gated invite/Meet/RSVP actions")
     p.add_argument("--pull-only", action="store_true", help="only pull remote deltas into Atlas")
-    p.add_argument("--push-only", action="store_true", help="only push local Atlas changes to Google")
+    p.add_argument("--push-only", action="store_true", help="only push local Atlas changes to remote calendar")
     p.add_argument("--allow-bulk-delete", action="store_true", help="override bulk-delete circuit breaker (>3 deletes)")
     p.add_argument("--quiet", action="store_true", help="suppress output on sync")
     p.add_argument("--layer", help="filter or target calendar layer id/file")
-    p.add_argument("--calendar-id", help="explicit Google calendarId override for `create`")
+    p.add_argument("--calendar-id", help="explicit remote calendarId override for `create`")
     p.add_argument("--query", "-q", help="search filter for `list`/`show`/`rsvp`")
     p.add_argument("--days", type=int, default=30, help="horizon in days (default: 30; 7 for freebusy)")
     p.add_argument("--past", type=int, default=0, help="include past N days in `list`")
@@ -6439,7 +6527,8 @@ def main():
     p.add_argument("--location", help="event location for `create`")
     p.add_argument("--description", help="event description for `create`")
     p.add_argument("--attendees", help="comma-separated attendee emails for `create` (triggers Safety-Gate)")
-    p.add_argument("--meet", action="store_true", help="generate Google Meet link for `create` (triggers Safety-Gate)")
+    p.add_argument("--meet", action="store_true", help="generate Google Meet link for `create` (Google accounts only; triggers Safety-Gate)")
+    p.add_argument("--rrule", help="optional RFC 5545 RRULE for `create` (e.g. `FREQ=WEEKLY;BYDAY=TH`)")
     p.add_argument("--kind", default="event", help="Atlas kind for `create` (default: event)")
     p.add_argument("--status", choices=("accepted", "declined", "tentative"), help="RSVP response status")
     p.add_argument("--start-hour", type=int, default=8, help="freebusy day window start hour (default: 8)")
@@ -6447,7 +6536,7 @@ def main():
     p.add_argument("--min-min", type=int, default=30, help="minimum free slot duration in minutes (default: 30)")
     p.add_argument("--local-only", action="store_true", help="compute freebusy strictly from local Brain layers without remote API call")
     p.add_argument("--resolve", help="conflict ID to resolve")
-    p.add_argument("--action", dest="resolve_action", choices=("link", "keep-both", "use-atlas", "use-google", "dismiss"), help="conflict resolution action")
+    p.add_argument("--action", dest="resolve_action", choices=("link", "keep-both", "use-atlas", "use-remote", "use-google", "dismiss"), help="conflict resolution action")
     p.add_argument("--json", action="store_true", help="machine-readable JSON output")
 
     p = sub.add_parser("todo", help="quick task triage: list, done, skip, reopen, move, unschedule, add")
